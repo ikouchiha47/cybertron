@@ -1,0 +1,20 @@
+[project]
+name = "wristturn"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "ikouchiha47", email = "princeofpersiaa3.ag@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "bleak>=3.0.1",
+    "pyautogui>=0.9.54",
+]
+
+[project.scripts]
+wristturn = "wristturn:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

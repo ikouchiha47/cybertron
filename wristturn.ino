@@ -18,6 +18,7 @@
 #include <Wire.h>
 #include <SparkFun_BNO08x_Arduino_Library.h>
 #include <bluefruit.h>
+#include "log.h"
 
 // ── BLE setup (Bluefruit / Adafruit nRF52 stack) ─────────────────────────────
 BLEService     wristService("19B10000-E8F2-537E-4F6C-D104768A1214");
@@ -61,7 +62,7 @@ float quaternionToYaw(float w, float x, float y, float z) {
 
 void enableRotationVector() {
   if (!imu.enableRotationVector()) {
-    Serial.println("BNO085: could not enable Rotation Vector");
+    LOG_E("BNO085: could not enable Rotation Vector");
   }
 }
 
@@ -73,30 +74,27 @@ void setup() {
 
   // ── IMU init ──
   Wire.begin();
-  Serial.println("Scanning I2C bus...");
+  LOG_D("Scanning I2C bus...");
   int found = 0;
   for (byte addr = 8; addr < 120; addr++) {
     Wire.beginTransmission(addr);
     byte err = Wire.endTransmission();
     if (err == 0) {
-      Serial.print("  Found device at 0x");
-      Serial.println(addr, HEX);
+      LOG_D("  Found device at 0x%02X", addr);
       found++;
     } else if (err == 4) {
-      Serial.print("  Unknown error at 0x");
-      Serial.println(addr, HEX);
+      LOG_E("  I2C error at 0x%02X", addr);
     }
   }
-  if (found == 0) Serial.println("  No devices found.");
-  Serial.println("I2C scan done.");
+  if (found == 0) LOG_E("I2C: no devices found.");
+  LOG_D("I2C scan done.");
 
   if (!imu.begin(0x4B, Wire) && !imu.begin(0x4A, Wire)) {
-    Serial.println("BNO085 not found – check wiring!");
+    LOG_E("BNO085 not found - check wiring!");
     while (true) { delay(100); }
   }
-  Serial.println("BNO085 found!");
+  LOG_I("BNO085 ready.");
   enableRotationVector();
-  Serial.println("BNO085 ready.");
 
   // ── BLE init ──
   Bluefruit.begin();
@@ -116,7 +114,7 @@ void setup() {
   Bluefruit.ScanResponse.addName();
   Bluefruit.Advertising.restartOnDisconnect(true);
   Bluefruit.Advertising.start(0);
-  Serial.println("BLE advertising as 'WristTurn'.");
+  LOG_I("BLE advertising as 'WristTurn'.");
 }
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
@@ -141,19 +139,13 @@ void loop() {
       float delta = roll - baseRoll;
       unsigned long now = millis();
 
-      // Continuous debug output (all axes in degrees)
-      Serial.print("roll=");   Serial.print(roll  * 57.296f, 1);
-      Serial.print("  pitch="); Serial.print(pitch * 57.296f, 1);
-      Serial.print("  yaw=");   Serial.print(yaw   * 57.296f, 1);
-      Serial.print("  delta="); Serial.println(delta * 57.296f, 1);
+      LOG_D("roll=%.1f  pitch=%.1f  yaw=%.1f  delta=%.1f",
+            roll * 57.296f, pitch * 57.296f, yaw * 57.296f, delta * 57.296f);
 
       if (fabsf(delta) > TURN_THRESHOLD && (now - lastGestureMs) > DEBOUNCE_MS) {
         const char* gesture = (delta > 0) ? "turn_right" : "turn_left";
 
-        Serial.print("Gesture: ");
-        Serial.print(gesture);
-        Serial.print("  delta=");
-        Serial.println(delta, 3);
+        LOG_I("%s", gesture);
 
         // Pad to fixed 20 bytes
         char buf[20] = {};
@@ -169,7 +161,7 @@ void loop() {
 
   // If IMU reset, re-enable report
   if (imu.wasReset()) {
-    Serial.println("BNO085 reset – re-enabling reports.");
+    LOG_E("BNO085 reset - re-enabling reports.");
     enableRotationVector();
   }
 }
