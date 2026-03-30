@@ -19,7 +19,6 @@
 #include <SparkFun_BNO08x_Arduino_Library.h>
 #include <bluefruit.h>
 #include "log.h"
-#include "shake_detector.h"
 
 // ── BLE setup (Bluefruit / Adafruit nRF52 stack) ─────────────────────────────
 BLEService     wristService("19B10000-E8F2-537E-4F6C-D104768A1214");
@@ -37,11 +36,8 @@ const unsigned long DEBOUNCE_MS = 600;
 
 // ── State ────────────────────────────────────────────────────────────────────
 float   baseRoll       = 0.0f;
-float   basePitch      = 0.0f;
-float   baseYaw        = 0.0f;
 bool    baseSet        = false;
 unsigned long lastGestureMs = 0;
-ShakeDetector shake;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 // Convert quaternion to roll (rotation around forearm axis).
@@ -64,26 +60,13 @@ float quaternionToYaw(float w, float x, float y, float z) {
   return atan2f(siny, cosy);
 }
 
-// Feature flags — comment out to disable
-#define ENABLE_TAP
-// #define ENABLE_SHAKE      // uses linear accelerometer
-// #define ENABLE_STEP
-
 void enableReports() {
   if (!imu.enableRotationVector())
     LOG_E("BNO085: could not enable Rotation Vector");
-#ifdef ENABLE_SHAKE
-  if (!imu.enableLinearAccelerometer())
-    LOG_E("BNO085: could not enable Linear Accelerometer");
-#endif
-#ifdef ENABLE_TAP
-  if (!imu.enableTapDetector(100))
+  if (!imu.enableTapDetector())
     LOG_E("BNO085: could not enable Tap Detector");
-#endif
-#ifdef ENABLE_STEP
-  if (!imu.enableStepCounter(1000))
+  if (!imu.enableStepCounter())
     LOG_E("BNO085: could not enable Step Counter");
-#endif
 }
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
@@ -142,36 +125,20 @@ void loop() {
   if (!imu.wasReset() && imu.getSensorEvent()) {
     uint8_t eventId = imu.getSensorEventID();
 
-#ifdef ENABLE_SHAKE
-    if (eventId == SENSOR_REPORTID_LINEAR_ACCELERATION) {
-      float ax = imu.getLinAccelX();
-      float ay = imu.getLinAccelY();
-      float az = imu.getLinAccelZ();
-      if (shake.update(ax, ay, az)) {
-        char buf[40] = {};
-        snprintf(buf, sizeof(buf), "shake");
-        LOG_I("%s", buf);
-        gestureChar.notify(buf, 40);
-      }
-    }
-#endif
-#ifdef ENABLE_TAP
     if (eventId == SENSOR_REPORTID_TAP_DETECTOR) {
       char buf[40] = {};
       snprintf(buf, sizeof(buf), "tap");
       LOG_I("%s", buf);
       gestureChar.notify(buf, 40);
     }
-#endif
-#ifdef ENABLE_STEP
-    if (eventId == SENSOR_REPORTID_STEP_COUNTER) {
+
+    else if (eventId == SENSOR_REPORTID_STEP_COUNTER) {
       uint16_t steps = imu.getStepCount();
       char buf[40] = {};
       snprintf(buf, sizeof(buf), "step|%u", steps);
       LOG_I("%s", buf);
       gestureChar.notify(buf, 40);
     }
-#endif
 
     else if (eventId == SENSOR_REPORTID_ROTATION_VECTOR) {
       float w = imu.getQuatReal();
@@ -185,43 +152,33 @@ void loop() {
 
       // Initialise baseline on first good reading
       if (!baseSet) {
-        baseRoll  = roll;
-        basePitch = pitch;
-        baseYaw   = yaw;
-        baseSet   = true;
+        baseRoll = roll;
+        baseSet  = true;
       }
 
-      float dRoll  = roll  - baseRoll;
-      float dPitch = pitch - basePitch;
-      float dYaw   = yaw   - baseYaw;
+      float delta = roll - baseRoll;
       unsigned long now = millis();
 
-      LOG_D("roll=%.1f  pitch=%.1f  yaw=%.1f  dR=%.1f  dP=%.1f  dY=%.1f",
-            roll * 57.296f, pitch * 57.296f, yaw * 57.296f,
-            dRoll * 57.296f, dPitch * 57.296f, dYaw * 57.296f);
+      LOG_D("roll=%.1f  pitch=%.1f  yaw=%.1f  delta=%.1f",
+            roll * 57.296f, pitch * 57.296f, yaw * 57.296f, delta * 57.296f);
 
-      if ((now - lastGestureMs) > DEBOUNCE_MS) {
-        const char* gesture = nullptr;
+      if (fabsf(delta) > TURN_THRESHOLD && (now - lastGestureMs) > DEBOUNCE_MS) {
+        const char* gesture = (delta > 0) ? "turn_right" : "turn_left";
 
-        if (fabsf(dRoll) > TURN_THRESHOLD) {
-          gesture = (dRoll > 0) ? "turn_right" : "turn_left";
-          baseRoll = roll;
-        } else if (fabsf(dPitch) > TURN_THRESHOLD) {
-          gesture = (dPitch > 0) ? "pitch_up" : "pitch_down";
-          basePitch = pitch;
-        } else if (fabsf(dYaw) > TURN_THRESHOLD) {
-          gesture = (dYaw > 0) ? "yaw_right" : "yaw_left";
-          baseYaw = yaw;
-        }
+        // Pack gesture|roll|pitch|yaw into payload
+        char buf[40] = {};
+        snprintf(buf, sizeof(buf), "%s|%.1f|%.1f|%.1f",
+                 gesture,
+                 roll  * 57.296f,
+                 pitch * 57.296f,
+                 yaw   * 57.296f);
 
-        if (gesture) {
-          char buf[40] = {};
-          snprintf(buf, sizeof(buf), "%s|%.1f|%.1f|%.1f",
-                   gesture, roll * 57.296f, pitch * 57.296f, yaw * 57.296f);
-          LOG_I("%s", buf);
-          gestureChar.notify(buf, 40);
-          lastGestureMs = now;
-        }
+        LOG_I("%s", buf);
+        gestureChar.notify(buf, 40);
+        lastGestureMs = now;
+
+        // Reset baseline so next gesture is relative to current position
+        baseRoll = roll;
       }
     }
   }

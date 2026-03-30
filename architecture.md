@@ -177,12 +177,64 @@ Physical motion (wrist twist)
 
 ---
 
-## Axes available from BNO085
+## What is a quaternion?
 
-The firmware currently uses only roll. All three are computed and logged:
+A quaternion is a set of 4 numbers `(w, x, y, z)` that represent a 3D rotation
+without any of the problems that come with plain angles.
 
-| Axis | Body motion | Formula |
-|---|---|---|
-| Roll | Wrist twist (supination / pronation) | `atan2(2(wx+yz), 1-2(x²+y²))` |
-| Pitch | Wrist flex / extend | `asin(2(wy-zx))` |
-| Yaw | Forearm swing left / right | `atan2(2(wz+xy), 1-2(y²+z²))` |
+The naive way to represent orientation is three angles: roll, pitch, yaw. The
+problem is called **gimbal lock** — when two axes line up, you lose a degree of
+freedom and rotations become ambiguous. Quaternions avoid this entirely.
+
+You can think of a quaternion as:
+- `w` — how much "no rotation" there is (1 = identity, pointing straight)
+- `x, y, z` — the axis of rotation, scaled by how far you've rotated
+
+The BNO085's onboard fusion processor outputs a quaternion ~100 times per second.
+To get a single human-readable angle (e.g. "how far has the wrist twisted"), you
+project it onto one axis using trig. There is no simpler way — the formulas are
+the standard conversion from quaternion to Euler angles:
+
+```
+roll  = atan2( 2(wx + yz),  1 - 2(x² + y²) )
+pitch = asin(  2(wy - zx) )
+yaw   = atan2( 2(wz + xy),  1 - 2(y² + z²) )
+```
+
+`atan2` and `asin` are just inverses of sin/cos — they turn a ratio back into an
+angle. The 2× terms come from the quaternion multiplication rules.
+
+---
+
+## Motion types supported by BNO085
+
+| Motion | Report ID | Gesture strings | Notes |
+|---|---|---|---|
+| Roll | `ROTATION_VECTOR` | `turn_left`, `turn_right` | Wrist twist, active |
+| Pitch | `ROTATION_VECTOR` | `pitch_up`, `pitch_down` | Wrist flex/extend, active |
+| Yaw | `ROTATION_VECTOR` | `yaw_left`, `yaw_right` | Forearm swing, active |
+| Tap | `TAP_DETECTOR` | `tap` | Sharp tap on board, active |
+| Step count | `STEP_COUNTER` | `step` | Walking steps, active |
+| Shake | `SHAKE_DETECTOR` | — | Not in SparkFun library, unavailable |
+| Stability | `STABILITY_CLASSIFIER` | — | On table / in hand / moving, planned |
+| Linear accel | `LINEAR_ACCELERATION` | — | Movement with gravity removed, planned |
+
+---
+
+## Roadmap / Vision
+
+WristTurn is intended to grow into a full wrist-worn controller. Planned additions:
+
+**Sensors**
+- LiDAR — distance/proximity detection (e.g. finger pointing at surface)
+- GPS — location context for gesture actions
+- Heart rate / SpO2
+
+**Gestures**
+- Tap and double-tap via `TAP_DETECTOR`
+- Combo gestures — sequences of up to 3 motions within a time window (implemented on Python side)
+
+**Platform**
+- Custom PCB with all components (no perfboard)
+- LiPo battery + TP4056 charging
+- Wireless OTA firmware updates
