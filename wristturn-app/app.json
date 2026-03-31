@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "WristTurn",
-    "slug": "wristturn-app",
+    "name": "Psytrix",
+    "slug": "psytrix",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -15,8 +15,8 @@
     "ios": {
       "supportsTablet": true,
       "infoPlist": {
-        "NSBluetoothAlwaysUsageDescription": "WristTurn needs Bluetooth to receive gestures from the wrist device.",
-        "NSBluetoothPeripheralUsageDescription": "WristTurn needs Bluetooth to receive gestures from the wrist device."
+        "NSBluetoothAlwaysUsageDescription": "Psytrix needs Bluetooth to receive gestures from the wrist device.",
+        "NSBluetoothPeripheralUsageDescription": "Psytrix needs Bluetooth to receive gestures from the wrist device."
       }
     },
     "android": {
@@ -38,7 +38,7 @@
       ],
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
-      "package": "com.anonymous.wristturnapp"
+      "package": "com.psytrix.app"
     },
     "web": {
       "favicon": "./assets/favicon.png"

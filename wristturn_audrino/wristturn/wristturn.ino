@@ -300,14 +300,14 @@ void loop() {
       bool allArmed = rollArmed && pitchArmed && yawArmed;
       bool holdoffPassed = (now - lastGestureMs) > STABILITY_REBASE_HOLDOFF_MS;
 
-      LOG_I("[Stability] class=%u armed=%d%d%d holdoff=%d",
+      LOG_D("[Stability] class=%u armed=%d%d%d holdoff=%d",
             stability, rollArmed, pitchArmed, yawArmed, holdoffPassed);
       if ((stability == STABILITY_ON_TABLE || stability == STABILITY_STATIONARY || stability == STABILITY_STABLE)
           && allArmed && holdoffPassed && baseSet) {
         baseRoll  = lastRoll;
         basePitch = lastPitch;
         baseYaw   = lastYaw;
-        LOG_I("[Stability] rebase: roll=%.1f  pitch=%.1f  yaw=%.1f",
+        LOG_D("[Stability] rebase: roll=%.1f  pitch=%.1f  yaw=%.1f",
               baseRoll, basePitch, baseYaw);
       }
     }
