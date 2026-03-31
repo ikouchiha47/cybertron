@@ -22,32 +22,54 @@
 #include "shake_detector.h"
 
 // ── BLE setup (Bluefruit / Adafruit nRF52 stack) ─────────────────────────────
-BLEService     wristService("19B10000-E8F2-537E-4F6C-D104768A1214");
+BLEService        wristService("19B10000-E8F2-537E-4F6C-D104768A1214");
 BLECharacteristic gestureChar("19B10001-E8F2-537E-4F6C-D104768A1214",
                                BLERead | BLENotify, 20);
+
+// Settings service — writable from app
+// thresholdChar: float, gesture trigger angle in degrees
+// debounceChar:  uint32, minimum ms between gestures
+// deadzoneChar:  float, return-to-neutral zone in degrees before re-arm
+BLEService        settingsService("19B10010-E8F2-537E-4F6C-D104768A1214");
+BLECharacteristic thresholdChar("19B10011-E8F2-537E-4F6C-D104768A1214",
+                                 BLERead | BLEWrite, 4);
+BLECharacteristic debounceChar("19B10012-E8F2-537E-4F6C-D104768A1214",
+                                BLERead | BLEWrite, 4);
+BLECharacteristic deadzoneChar("19B10013-E8F2-537E-4F6C-D104768A1214",
+                                BLERead | BLEWrite, 4);
 
 // ── IMU ──────────────────────────────────────────────────────────────────────
 BNO08x imu;
 
-// ── Thresholds ───────────────────────────────────────────────────────────────
-// Roll change (radians) required to trigger a gesture
-const float TURN_THRESHOLD   = 0.70f;  // ~40°
-// Minimum ms between gestures (debounce)
-const unsigned long DEBOUNCE_MS = 600;
+// ── Thresholds — tunable via BLE ─────────────────────────────────────────────
+float         turnThreshold = 15.0f;  // degrees to trigger gesture
+float         deadzoneDegs  =  5.0f;  // degrees to return within before re-arm
+unsigned long debounceMs    =  200;   // min ms between gestures
 
 // ── State ────────────────────────────────────────────────────────────────────
 float   baseRoll       = 0.0f;
 float   basePitch      = 0.0f;
 float   baseYaw        = 0.0f;
 bool    baseSet        = false;
+
+// Per-axis armed flag — set false after gesture fires, true again once
+// wrist returns within deadzone of that axis base
+bool    rollArmed      = true;
+bool    pitchArmed     = true;
+bool    yawArmed       = true;
+
 unsigned long lastGestureMs  = 0;
 unsigned long lastPingMs     = 0;
 const unsigned long PING_INTERVAL_MS = 3000;
 ShakeDetector shake;
 
+// Last known orientation — updated every rotation vector event
+// Used by stability classifier to rebase when wrist is still
+float lastRoll  = 0.0f;
+float lastPitch = 0.0f;
+float lastYaw   = 0.0f;
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
-// Convert quaternion to roll (rotation around forearm axis).
-// BNO085 convention: i=x, j=y, k=z, r=w
 float quaternionToRoll(float w, float x, float y, float z) {
   float sinr = 2.0f * (w * x + y * z);
   float cosr = 1.0f - 2.0f * (x * x + y * y);
@@ -71,9 +93,21 @@ float quaternionToYaw(float w, float x, float y, float z) {
 // #define ENABLE_SHAKE      // uses linear accelerometer
 // #define ENABLE_STEP
 
+// Stability classifier values from BNO085 SHTP protocol spec
+// 0=unknown, 1=on_table, 2=stationary, 3=stable (held still), 4=motion
+#define STABILITY_ON_TABLE   1
+#define STABILITY_STATIONARY 2
+#define STABILITY_STABLE     3
+
+// Min ms after last gesture before stability can update base
+const unsigned long STABILITY_REBASE_HOLDOFF_MS = 1500;
+
+
 void enableReports() {
   if (!imu.enableRotationVector())
     LOG_E("BNO085: could not enable Rotation Vector");
+  if (!imu.enableStabilityClassifier(500))  // 500ms interval
+    LOG_E("BNO085: could not enable Stability Classifier");
 #ifdef ENABLE_SHAKE
   if (!imu.enableLinearAccelerometer())
     LOG_E("BNO085: could not enable Linear Accelerometer");
@@ -88,9 +122,52 @@ void enableReports() {
 #endif
 }
 
+// ── BLE write callbacks ───────────────────────────────────────────────────────
+void onThresholdWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
+  if (len == 4) {
+    float val;
+    memcpy(&val, data, 4);
+    if (val > 0.0f && val < 90.0f) {
+      turnThreshold = val;
+      LOG_I("[Settings] threshold updated: %.1f deg", turnThreshold);
+    } else {
+      LOG_E("[Settings] threshold out of range: %.1f (must be 0-90)", val);
+    }
+  }
+}
+
+void onDebounceWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
+  if (len == 4) {
+    uint32_t val;
+    memcpy(&val, data, 4);
+    if (val >= 50 && val <= 2000) {
+      debounceMs = val;
+      LOG_I("[Settings] debounce updated: %lu ms", debounceMs);
+    } else {
+      LOG_E("[Settings] debounce out of range: %lu (must be 50-2000)", val);
+    }
+  }
+}
+
+void onDeadzoneWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
+  if (len == 4) {
+    float val;
+    memcpy(&val, data, 4);
+    if (val >= 0.0f && val < turnThreshold) {
+      deadzoneDegs = val;
+      LOG_I("[Settings] deadzone updated: %.1f deg", deadzoneDegs);
+    } else {
+      LOG_E("[Settings] deadzone out of range: %.1f (must be 0 to threshold)", val);
+    }
+  }
+}
+
 // ── BLE callbacks ─────────────────────────────────────────────────────────────
 void onConnect(uint16_t conn_hdl) {
   LOG_I("BLE connected. conn_hdl=%u peers=%u", conn_hdl, Bluefruit.Periph.connected());
+  // Send current settings to app on connect
+  LOG_I("[Settings] current: threshold=%.1f deg  debounce=%lu ms  deadzone=%.1f deg",
+        turnThreshold, debounceMs, deadzoneDegs);
 }
 
 void onDisconnect(uint16_t conn_hdl, uint8_t reason) {
@@ -102,8 +179,6 @@ void onDisconnect(uint16_t conn_hdl, uint8_t reason) {
 // ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  // Give serial monitor time to connect (skip delay in production)
-  // while (!Serial) { delay(10); }  // only needed when Serial Monitor is attached
 
   // ── IMU init ──
   Wire.begin();
@@ -133,18 +208,42 @@ void setup() {
   LOG_I("BLE init...");
   Bluefruit.begin();
   Bluefruit.setName("WristTurn");
-  // Short supervision timeout — detects dead connections (e.g. app force-killed) within ~2s
-  Bluefruit.Periph.setConnInterval(6, 12);       // 7.5ms–15ms connection interval
-  Bluefruit.Periph.setConnSupervisionTimeout(200); // 2000ms = 2s
+  Bluefruit.Periph.setConnInterval(6, 12);
+  Bluefruit.Periph.setConnSupervisionTimeout(200);
   LOG_I("BLE supervision timeout set to 2s.");
 
+  // Gesture service
   wristService.begin();
-
   gestureChar.setProperties(CHR_PROPS_READ | CHR_PROPS_NOTIFY);
   gestureChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
   gestureChar.setFixedLen(40);
   gestureChar.begin();
   gestureChar.write("idle                                   ", 40);
+
+  // Settings service
+  settingsService.begin();
+
+  thresholdChar.setProperties(CHR_PROPS_READ | CHR_PROPS_WRITE);
+  thresholdChar.setPermission(SECMODE_OPEN, SECMODE_OPEN);
+  thresholdChar.setFixedLen(4);
+  thresholdChar.setWriteCallback(onThresholdWrite);
+  thresholdChar.begin();
+  thresholdChar.write(&turnThreshold, 4);
+
+  debounceChar.setProperties(CHR_PROPS_READ | CHR_PROPS_WRITE);
+  debounceChar.setPermission(SECMODE_OPEN, SECMODE_OPEN);
+  debounceChar.setFixedLen(4);
+  debounceChar.setWriteCallback(onDebounceWrite);
+  debounceChar.begin();
+  uint32_t dms = (uint32_t)debounceMs;
+  debounceChar.write(&dms, 4);
+
+  deadzoneChar.setProperties(CHR_PROPS_READ | CHR_PROPS_WRITE);
+  deadzoneChar.setPermission(SECMODE_OPEN, SECMODE_OPEN);
+  deadzoneChar.setFixedLen(4);
+  deadzoneChar.setWriteCallback(onDeadzoneWrite);
+  deadzoneChar.begin();
+  deadzoneChar.write(&deadzoneDegs, 4);
 
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
   Bluefruit.Advertising.addTxPower();
@@ -155,6 +254,8 @@ void setup() {
   Bluefruit.Advertising.restartOnDisconnect(true);
   Bluefruit.Advertising.start(0);
   LOG_I("BLE advertising as 'WristTurn'.");
+  LOG_I("[Settings] defaults: threshold=%.1f deg  debounce=%lu ms  deadzone=%.1f deg",
+        turnThreshold, debounceMs, deadzoneDegs);
 }
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
@@ -193,15 +294,37 @@ void loop() {
     }
 #endif
 
+    if (eventId == SENSOR_REPORTID_STABILITY_CLASSIFIER) {
+      uint8_t stability = imu.getStabilityClassifier();
+      unsigned long now = millis();
+      bool allArmed = rollArmed && pitchArmed && yawArmed;
+      bool holdoffPassed = (now - lastGestureMs) > STABILITY_REBASE_HOLDOFF_MS;
+
+      LOG_I("[Stability] class=%u armed=%d%d%d holdoff=%d",
+            stability, rollArmed, pitchArmed, yawArmed, holdoffPassed);
+      if ((stability == STABILITY_ON_TABLE || stability == STABILITY_STATIONARY || stability == STABILITY_STABLE)
+          && allArmed && holdoffPassed && baseSet) {
+        baseRoll  = lastRoll;
+        basePitch = lastPitch;
+        baseYaw   = lastYaw;
+        LOG_I("[Stability] rebase: roll=%.1f  pitch=%.1f  yaw=%.1f",
+              baseRoll, basePitch, baseYaw);
+      }
+    }
+
     else if (eventId == SENSOR_REPORTID_ROTATION_VECTOR) {
       float w = imu.getQuatReal();
       float x = imu.getQuatI();
       float y = imu.getQuatJ();
       float z = imu.getQuatK();
 
-      float roll  = quaternionToRoll(w, x, y, z);
-      float pitch = quaternionToPitch(w, x, y, z);
-      float yaw   = quaternionToYaw(w, x, y, z);
+      float roll  = quaternionToRoll(w, x, y, z)  * 57.296f;
+      float pitch = quaternionToPitch(w, x, y, z) * 57.296f;
+      float yaw   = quaternionToYaw(w, x, y, z)   * 57.296f;
+
+      lastRoll  = roll;
+      lastPitch = pitch;
+      lastYaw   = yaw;
 
       // Initialise baseline on first good reading
       if (!baseSet) {
@@ -209,6 +332,7 @@ void loop() {
         basePitch = pitch;
         baseYaw   = yaw;
         baseSet   = true;
+        LOG_I("[IMU] baseline set: roll=%.1f  pitch=%.1f  yaw=%.1f", baseRoll, basePitch, baseYaw);
       }
 
       float dRoll  = roll  - baseRoll;
@@ -216,29 +340,47 @@ void loop() {
       float dYaw   = yaw   - baseYaw;
       unsigned long now = millis();
 
-      LOG_D("roll=%.1f  pitch=%.1f  yaw=%.1f  dR=%.1f  dP=%.1f  dY=%.1f",
-            roll * 57.296f, pitch * 57.296f, yaw * 57.296f,
-            dRoll * 57.296f, dPitch * 57.296f, dYaw * 57.296f);
+      LOG_D("[IMU] roll=%.1f  pitch=%.1f  yaw=%.1f  dR=%.1f  dP=%.1f  dY=%.1f  armed=%d%d%d",
+            roll, pitch, yaw, dRoll, dPitch, dYaw,
+            rollArmed, pitchArmed, yawArmed);
 
-      if ((now - lastGestureMs) > DEBOUNCE_MS) {
+      // ── Deadzone re-arm check ─────────────────────────────────────────────
+      // Once a gesture fires on an axis, the axis is disarmed.
+      // It re-arms when the wrist returns within deadzoneDegs of that axis base.
+      if (!rollArmed && fabsf(dRoll) <= deadzoneDegs) {
+        rollArmed = true;
+        LOG_I("[Deadzone] roll re-armed dRoll=%.1f deg (base stays at %.1f)", dRoll, baseRoll);
+      }
+      if (!pitchArmed && fabsf(dPitch) <= deadzoneDegs) {
+        pitchArmed = true;
+        LOG_I("[Deadzone] pitch re-armed dPitch=%.1f deg (base stays at %.1f)", dPitch, basePitch);
+      }
+      if (!yawArmed && fabsf(dYaw) <= deadzoneDegs) {
+        yawArmed = true;
+        LOG_I("[Deadzone] yaw re-armed dYaw=%.1f deg (base stays at %.1f)", dYaw, baseYaw);
+      }
+
+      // ── Gesture detection ─────────────────────────────────────────────────
+      if ((now - lastGestureMs) > debounceMs) {
         const char* gesture = nullptr;
 
-        if (fabsf(dRoll) > TURN_THRESHOLD) {
-          gesture = (dRoll > 0) ? "turn_right" : "turn_left";
-          baseRoll = roll;
-        } else if (fabsf(dPitch) > TURN_THRESHOLD) {
-          gesture = (dPitch > 0) ? "pitch_up" : "pitch_down";
-          basePitch = pitch;
-        } else if (fabsf(dYaw) > TURN_THRESHOLD) {
-          gesture = (dYaw > 0) ? "yaw_right" : "yaw_left";
-          baseYaw = yaw;
+        if (rollArmed && fabsf(dRoll) > turnThreshold) {
+          gesture   = (dRoll > 0) ? "turn_right" : "turn_left";
+          rollArmed = false;
+          LOG_I("[Gesture] %s  dRoll=%.1f deg  (disarmed roll)", gesture, dRoll);
+        } else if (pitchArmed && fabsf(dPitch) > turnThreshold) {
+          gesture    = (dPitch > 0) ? "pitch_up" : "pitch_down";
+          pitchArmed = false;
+          LOG_I("[Gesture] %s  dPitch=%.1f deg  (disarmed pitch)", gesture, dPitch);
+        } else if (yawArmed && fabsf(dYaw) > turnThreshold) {
+          gesture  = (dYaw > 0) ? "yaw_right" : "yaw_left";
+          yawArmed = false;
+          LOG_I("[Gesture] %s  dYaw=%.1f deg  (disarmed yaw)", gesture, dYaw);
         }
 
         if (gesture) {
           char buf[40] = {};
-          snprintf(buf, sizeof(buf), "%s|%.1f|%.1f|%.1f",
-                   gesture, roll * 57.296f, pitch * 57.296f, yaw * 57.296f);
-          LOG_I("%s", buf);
+          snprintf(buf, sizeof(buf), "%s|%.1f|%.1f|%.1f", gesture, roll, pitch, yaw);
           gestureChar.notify(buf, 40);
           lastGestureMs = now;
         }
@@ -246,14 +388,13 @@ void loop() {
     }
   }
 
-  // If IMU reset, re-enable report
+  // If IMU reset, re-enable reports
   if (imu.wasReset()) {
     LOG_E("BNO085 reset - re-enabling reports.");
     enableReports();
   }
 
-  // Keepalive ping — forces Android to close zombie GATT connections
-  // when the app is dead (Android can't deliver the notify → fires disconnect)
+  // Keepalive ping
   if (Bluefruit.Periph.connected()) {
     unsigned long now = millis();
     if (now - lastPingMs > PING_INTERVAL_MS) {

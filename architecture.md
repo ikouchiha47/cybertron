@@ -301,6 +301,47 @@ angle. The 2× terms come from the quaternion multiplication rules.
 
 ---
 
+---
+
+## Changelog
+
+### 2026-04-01 — Gesture detection overhaul
+
+#### Problem: gestures stopped firing after many repeated turns (base drift)
+
+The original firmware reset `baseRoll = roll` every time a gesture fired. This meant the new baseline was wherever the wrist landed after completing the gesture — not the neutral resting position. Repeated turns in one direction caused the baseline to creep, until the delta never reached threshold again.
+
+#### Problem: idle rebase silently breaking detection
+
+A second mechanism was added to compensate — an "idle rebase" that updated the base if no gesture had fired for 2000ms:
+
+```cpp
+if ((now - lastGestureMs) > IDLE_REBASE_MS) {
+    if (fabsf(roll - baseRoll) > 0.5f)
+        baseRoll = roll;
+}
+```
+
+This was intended to absorb slow positional drift. It was a mistake.
+
+`lastGestureMs` initialises to 0. The condition `now - 0 > 2000ms` becomes permanently true after 2 seconds from boot. From that point, `baseRoll` was updated to the current `roll` on every single IMU frame (~100Hz). The base tracked the wrist in real time, so `dRoll = roll - baseRoll` was always approximately the per-frame delta (~2°), never the cumulative delta from a stable resting position. The 15° threshold was never reached. Gestures appeared to be completely broken.
+
+The log evidence was clear — `dR=0.0` throughout the entire session even while `roll` went from 6° to 48°.
+
+**Why this was not caught earlier:** the idle rebase and the base-reset-on-gesture were added in separate sessions without a full end-to-end trace of what `dRoll` would actually look like at gesture time.
+
+#### Fix
+
+- Removed idle rebase entirely.
+- Removed base reset on gesture fire (base stays at original neutral position; deadzone re-arm handles the next gesture without moving the reference).
+- The BNO085 rotation vector output is already sensor-fused against gravity and magnetic north — it has very low long-term drift by design. A separate idle rebase mechanism was unnecessary.
+
+#### Note on the BNO085 stability classifier
+
+The `enableStabilityClassifier()` function in the SparkFun library has a default `timeBetweenReports = 10` (milliseconds), which the library converts to microseconds internally. This causes ~100Hz stability reports by default — **not** state-change-only behaviour as the hardware spec suggests. Passing `enableStabilityClassifier(500)` gives a 500ms interval. When the classifier reports class 1/2/3 (on table / stationary / stable), the firmware rebases to the current position. This is the only rebase mechanism now in use.
+
+---
+
 ## Roadmap / Vision
 
 WristTurn is intended to grow into a full wrist-worn controller. Planned additions:
