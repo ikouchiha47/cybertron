@@ -1,0 +1,9 @@
+{
+  "platforms": ["apple", "android", "web"],
+  "apple": {
+    "modules": ["AndroidtvModule"]
+  },
+  "android": {
+    "modules": ["expo.modules.androidtv.AndroidtvModule"]
+  }
+}

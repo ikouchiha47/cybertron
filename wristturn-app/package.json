@@ -1,0 +1,33 @@
+{
+  "name": "wristturn-app",
+  "version": "1.0.0",
+  "main": "index.ts",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
+    "web": "expo start --web"
+  },
+  "dependencies": {
+    "@react-native-async-storage/async-storage": "2.2.0",
+    "@react-navigation/native": "^7.2.2",
+    "@react-navigation/stack": "^7.8.9",
+    "androidtv-remote": "^1.0.10",
+    "expo": "~54.0.33",
+    "expo-status-bar": "~3.0.9",
+    "protobufjs": "^8.0.0",
+    "react": "19.1.0",
+    "react-native": "0.81.5",
+    "react-native-ble-plx": "^3.5.1",
+    "react-native-gesture-handler": "~2.28.0",
+    "react-native-safe-area-context": "^5.7.0",
+    "react-native-screens": "^4.24.0",
+    "react-native-tcp-socket": "^6.4.1",
+    "react-native-zeroconf": "^0.14.0"
+  },
+  "devDependencies": {
+    "@types/react": "~19.1.0",
+    "typescript": "~5.9.2"
+  },
+  "private": true
+}
