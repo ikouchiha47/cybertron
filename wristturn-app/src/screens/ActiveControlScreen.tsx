@@ -1,10 +1,11 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
-  View, Text, TouchableOpacity, StyleSheet, Animated,
+  View, Text, TouchableOpacity, StyleSheet, Animated, ScrollView,
 } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { StackScreenProps } from "@react-navigation/stack";
 import type { RootStackParams } from "../navigation/AppNavigator";
-import { useBLE } from "../ble/useBLE";
+import { useBLE, setActiveComboMap } from "../ble/useBLE";
 import { registry } from "../devices/registry/DeviceRegistry";
 import { MappingStore } from "../mapping/MappingStore";
 import type { ComboMap } from "../types";
@@ -16,22 +17,32 @@ export function ActiveControlScreen({ route, navigation }: Props) {
   const meta          = registry.get(deviceId);
   const proxy         = registry.getProxy(deviceId);
   const [map, setMap] = useState<ComboMap>({});
+  const mapRef = useRef<ComboMap>({});
+  const [deviceConnected, setDeviceConnected] = useState(false);
   const [lastCmd, setLastCmd] = useState("");
+  const [activeCombo, setActiveCombo] = useState("");
+  const insets = useSafeAreaInsets();
 
   const opacity = useRef(new Animated.Value(0)).current;
   const scale   = useRef(new Animated.Value(0.8)).current;
 
   useEffect(() => {
-    if (!meta) return;
-    MappingStore.get(deviceId, meta.transport).then(setMap);
-    proxy?.connect().catch(console.error);
-    return () => { proxy?.disconnect(); };
+    if (!meta || !proxy) return;
+    MappingStore.get(deviceId, proxy.defaultMapping()).then((m) => {
+      setMap(m);
+      mapRef.current = m;
+      setActiveComboMap(Object.keys(m));
+    });
+    proxy.connect().then(() => setDeviceConnected(true)).catch(console.error);
+    return () => { proxy.disconnect(); setDeviceConnected(false); };
   }, [deviceId]);
 
   function animateGesture() {
+    scale.setValue(0.8);
+    opacity.setValue(0);
     Animated.sequence([
       Animated.parallel([
-        Animated.spring(scale,   { toValue: 1,   useNativeDriver: true }),
+        Animated.spring(scale,   { toValue: 1, useNativeDriver: true }),
         Animated.timing(opacity, { toValue: 1, duration: 100, useNativeDriver: true }),
       ]),
       Animated.delay(1200),
@@ -41,69 +52,116 @@ export function ActiveControlScreen({ route, navigation }: Props) {
 
   const { connected, lastGesture, lastCombo } = useBLE({
     onCombo: async (combo) => {
+      console.log("[ActiveControl] onCombo", combo, "map=", JSON.stringify(mapRef.current), "proxy=", !!proxy, "connected=", proxy?.isConnected());
+      setActiveCombo(combo);
       animateGesture();
-      const commandId = map[combo];
+      const commandId = mapRef.current[combo];
+      console.log("[ActiveControl] commandId=", commandId, "availableCommands=", meta?.availableCommands?.length);
       if (!commandId || !proxy || !meta) return;
+      if (commandId.startsWith("deeplink:")) {
+        const url = commandId.slice("deeplink:".length);
+        setLastCmd(url);
+        await proxy.sendCommand({ id: commandId, label: url, payload: { link: url } });
+        return;
+      }
       const cmd = meta.availableCommands.find((c) => c.id === commandId);
       if (!cmd) return;
       setLastCmd(cmd.label);
-      await proxy.sendCommand(cmd);
+      const t0 = Date.now();
+      console.log("[ActiveControl] sendCommand", cmd.id, "payload=", cmd.payload, "t=", t0);
+      try {
+        await proxy.sendCommand(cmd);
+        console.log("[ActiveControl] sendCommand ok jsLatency=", Date.now() - t0, "ms");
+      } catch (e) {
+        console.error("[ActiveControl] sendCommand error:", e);
+      }
     },
   });
 
   if (!meta) return <View style={s.container}><Text style={s.empty}>Device not found</Text></View>;
 
+  const entries = Object.entries(map);
+
+  function actionLabel(commandId: string) {
+    if (!commandId) return "(none)";
+    if (commandId.startsWith("deeplink:")) return commandId.slice("deeplink:".length);
+    return meta?.availableCommands.find((c) => c.id === commandId)?.label ?? commandId;
+  }
+
   return (
-    <View style={s.container}>
+    <View style={[s.container, { paddingBottom: insets.bottom + 16 }]}>
       {/* Header */}
       <View style={s.header}>
         <Text style={s.deviceName}>{meta.name}</Text>
-        <View style={[s.pill, proxy?.isConnected() ? s.pillOn : s.pillOff]}>
-          <Text style={s.pillText}>{proxy?.isConnected() ? "Ready" : "Connecting..."}</Text>
+        <View style={[s.pill, deviceConnected ? s.pillOn : s.pillOff]}>
+          <Text style={s.pillText}>{deviceConnected ? "Ready" : "Connecting..."}</Text>
         </View>
       </View>
 
-      {/* Gesture display */}
-      <View style={s.gestureArea}>
-        <Animated.View style={{ opacity, transform: [{ scale }] }}>
-          <Text style={s.gestureText}>{lastGesture}</Text>
-          {lastCombo !== lastGesture && (
-            <Text style={s.comboText}>{lastCombo.replace(/,/g, " → ")}</Text>
-          )}
-        </Animated.View>
+      {/* Gesture flash overlay */}
+      <Animated.View style={[s.gestureFlash, { opacity }]} pointerEvents="none">
+        <Animated.Text style={[s.gestureText, { transform: [{ scale }] }]}>
+          {lastGesture}
+        </Animated.Text>
+        {lastCombo !== lastGesture && (
+          <Text style={s.comboText}>{lastCombo.replace(/,/g, " → ")}</Text>
+        )}
         {lastCmd ? <Text style={s.cmdText}>{lastCmd}</Text> : null}
-      </View>
+      </Animated.View>
 
-      {/* Wrist BLE status */}
-      <View style={[s.pill, connected ? s.pillOn : s.pillOff, s.wristPill]}>
-        <Text style={s.pillText}>{connected ? "Wrist connected" : "Wrist scanning..."}</Text>
-      </View>
+      {/* Mapping list */}
+      <ScrollView style={s.mapList} showsVerticalScrollIndicator={false}>
+        <Text style={s.sectionLabel}>Active Mappings</Text>
+        {entries.length === 0 && (
+          <Text style={s.empty}>No mappings — tap Remap to add some</Text>
+        )}
+        {entries.map(([combo, cmdId]) => (
+          <View key={combo} style={[s.mapRow, activeCombo === combo && s.mapRowActive]}>
+            <Text style={s.mapCombo}>{combo.replace(/,/g, " → ")}</Text>
+            <Text style={s.mapAction} numberOfLines={1}>{actionLabel(cmdId)}</Text>
+          </View>
+        ))}
+      </ScrollView>
 
-      {/* Remap button */}
-      <TouchableOpacity
-        style={s.remapBtn}
-        onPress={() => navigation.navigate("GestureMapping", { deviceId })}
-      >
-        <Text style={s.remapBtnText}>Remap Gestures</Text>
-      </TouchableOpacity>
+      {/* Footer */}
+      <View style={s.footer}>
+        <View style={[s.pill, connected ? s.pillOn : s.pillOff]}>
+          <Text style={s.pillText}>{connected ? "Wrist connected" : "Wrist scanning..."}</Text>
+        </View>
+        <TouchableOpacity
+          style={s.remapBtn}
+          onPress={() => navigation.navigate("GestureMapping", { deviceId })}
+        >
+          <Text style={s.remapBtnText}>Remap</Text>
+        </TouchableOpacity>
+      </View>
     </View>
   );
 }
 
 const s = StyleSheet.create({
-  container:   { flex: 1, backgroundColor: "#0f0f0f", padding: 20 },
-  header:      { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 40 },
-  deviceName:  { fontSize: 22, color: "#fff", fontWeight: "600" },
-  pill:        { paddingHorizontal: 10, paddingVertical: 3, borderRadius: 10 },
-  pillOn:      { backgroundColor: "#1a7f4b" },
-  pillOff:     { backgroundColor: "#333" },
-  pillText:    { color: "#fff", fontSize: 12 },
-  gestureArea: { flex: 1, justifyContent: "center", alignItems: "center" },
-  gestureText: { fontSize: 48, color: "#fff", fontWeight: "700", textAlign: "center" },
-  comboText:   { fontSize: 18, color: "#888", textAlign: "center", marginTop: 8 },
-  cmdText:     { fontSize: 14, color: "#4a9eff", marginTop: 24 },
-  wristPill:   { alignSelf: "center", marginBottom: 16 },
-  remapBtn:    { backgroundColor: "#1c1c1c", borderRadius: 10, padding: 14, alignItems: "center" },
-  remapBtnText:{ color: "#888", fontSize: 15 },
-  empty:       { color: "#555" },
+  container:      { flex: 1, backgroundColor: "#0f0f0f", padding: 20 },
+  header:         { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 16 },
+  deviceName:     { fontSize: 22, color: "#fff", fontWeight: "600" },
+  pill:           { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 10 },
+  pillOn:         { backgroundColor: "#1a7f4b" },
+  pillOff:        { backgroundColor: "#333" },
+  pillText:       { color: "#fff", fontSize: 12 },
+
+  gestureFlash:   { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, justifyContent: "center", alignItems: "center", zIndex: 10 },
+  gestureText:    { fontSize: 52, color: "#fff", fontWeight: "700", textAlign: "center" },
+  comboText:      { fontSize: 18, color: "#888", textAlign: "center", marginTop: 8 },
+  cmdText:        { fontSize: 16, color: "#4a9eff", marginTop: 16, textAlign: "center" },
+
+  sectionLabel:   { fontSize: 11, color: "#444", textTransform: "uppercase", letterSpacing: 1, marginBottom: 10 },
+  mapList:        { flex: 1 },
+  mapRow:         { flexDirection: "row", justifyContent: "space-between", alignItems: "center", backgroundColor: "#1c1c1c", borderRadius: 8, paddingHorizontal: 14, paddingVertical: 10, marginBottom: 6 },
+  mapRowActive:   { backgroundColor: "#1a3a2a", borderColor: "#1a7f4b", borderWidth: 1 },
+  mapCombo:       { fontSize: 13, color: "#aaa" },
+  mapAction:      { fontSize: 13, color: "#4a9eff", maxWidth: "55%" },
+
+  footer:         { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingTop: 12 },
+  remapBtn:       { backgroundColor: "#1c1c1c", borderRadius: 10, paddingHorizontal: 20, paddingVertical: 10 },
+  remapBtnText:   { color: "#888", fontSize: 14 },
+  empty:          { color: "#444", fontSize: 13 },
 });

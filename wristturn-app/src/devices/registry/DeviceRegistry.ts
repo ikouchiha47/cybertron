@@ -25,7 +25,7 @@ class DeviceRegistry {
     const raw = await AsyncStorage.getItem(STORAGE_KEY);
     if (raw) {
       const entries: DeviceMetadata[] = JSON.parse(raw);
-      entries.forEach((d) => this.devices.set(d.id, d));
+      entries.forEach((d) => this.devices.set(d.id, this.rehydrate(d)));
     }
     this.loaded = true;
   }
@@ -68,6 +68,14 @@ class DeviceRegistry {
       this.proxies.set(id, new DeviceProxy(adapter));
     }
     return this.proxies.get(id)!;
+  }
+
+  private rehydrate(meta: DeviceMetadata): DeviceMetadata {
+    switch (meta.transport as TransportType) {
+      case "androidtv": return { ...meta, availableCommands: ANDROIDTV_COMMANDS };
+      case "macdaemon": return { ...meta, availableCommands: MACDAEMON_COMMANDS };
+      default:          return meta;
+    }
   }
 
   private buildAdapter(meta: DeviceMetadata): IDeviceAdapter | null {

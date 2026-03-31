@@ -177,6 +177,86 @@ Physical motion (wrist twist)
 
 ---
 
+## BLE Protocol Stack (GATT)
+
+BLE communication is layered. From bottom to top:
+
+```
+Physical Radio (2.4GHz)
+  → Link Layer       — connection intervals, supervision timeout
+    → L2CAP          — logical channels
+      → ATT           — Attribute Protocol (read/write raw attributes)
+        → GATT        — Generic Attribute Profile (structure on top of ATT)
+          → Application (gesture strings)
+```
+
+**GATT** defines how data is organised between a server and a client:
+
+- **Server** = the nRF52840. Exposes a tree of **Services** → **Characteristics**.
+  - `Service 19B10000-...` — the WristTurn service namespace
+  - `Characteristic 19B10001-...` — the gesture value. Supports `READ` (pull) and `NOTIFY` (push).
+- **Client** = the Android app. Subscribes to notifications on the characteristic via a GATT connection.
+
+**NOTIFY** is how gestures are pushed: the nRF calls `gestureChar.notify(buf, 40)` and the phone's callback fires instantly — no polling.
+
+### Connection lifecycle
+
+```
+nRF advertising  ←──── phone scans ────── connects ──── subscribes to NOTIFY
+                                              │
+                                         GATT connection open
+                                              │
+                                    phone sends connection events
+                                    every 7.5–15ms (conn interval)
+                                              │
+                           app force-killed ──┘
+                                              │
+                          Android OS holds GATT connection open
+                          (does NOT send disconnect to nRF)
+                                              │
+                          supervision timeout expires (2s)
+                                              │
+                          nRF declares connection dead → onDisconnect()
+                          → Bluefruit.Advertising.start(0)
+                          → nRF visible to scanners again
+```
+
+### Why Android holds the GATT connection after force-kill
+
+Android's Bluetooth stack runs in a system service (`bluetooth.default`), separate from the app process. When the app is force-killed from recents, the GATT connection is owned by the system process and **stays open indefinitely** — Android continues sending BLE link-layer keepalive packets on behalf of the dead app. The nRF52840 never sees a disconnect event.
+
+This means:
+- The supervision timeout on the nRF never fires (the connection looks healthy from the hardware's view)
+- The nRF never restarts advertising
+- When the app relaunches and scans, it finds nothing — the device is "connected" to a zombie
+
+**How WristTurn solves this — two-layer fix:**
+
+**Layer 1 — Firmware keepalive ping (nRF side)**
+
+Every 3 seconds while connected, the firmware sends a `"ping"` BLE notify:
+```cpp
+if (Bluefruit.Periph.connected() && millis() - lastPingMs > 3000) {
+  lastPingMs = millis();
+  gestureChar.notify("ping", 4);
+}
+```
+When the app is dead, Android's BLE stack cannot deliver the notification to any callback. After a few failed deliveries, the OS drops the GATT connection — the nRF fires `onDisconnect` (reason `0x13` = remote user terminated) and immediately restarts advertising. In testing this resolves the zombie connection within ~8 seconds of the app being force-killed.
+
+**Layer 2 — Direct reconnect by cached MAC (app side)**
+
+On relaunch, instead of scanning (which would find nothing if the nRF is still in zombie-connected state), the app tries to connect directly using the last known device MAC address stored in `AsyncStorage`:
+```ts
+const lastId = await AsyncStorage.getItem("@wristturn/lastDeviceId");
+await manager.cancelDeviceConnection(lastId);   // evict zombie
+const d = await manager.connectToDevice(lastId, { timeout: 5000 });
+await d.discoverAllServicesAndCharacteristics();
+monitorDevice(d);
+```
+`connectToDevice` by MAC bypasses scanning — Android attaches to the existing or newly advertised GATT connection for that address. `cancelDeviceConnection` first evicts any zombie handle. If direct connect fails (new device, first boot), it falls back to a normal scan.
+
+---
+
 ## What is a quaternion?
 
 A quaternion is a set of 4 numbers `(w, x, y, z)` that represent a 3D rotation

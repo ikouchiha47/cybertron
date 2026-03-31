@@ -1,6 +1,6 @@
 import { AndroidTV, KeyCode, AppLink } from "../../../modules/androidtv";
 import type { IDeviceAdapter } from "./IDeviceAdapter";
-import type { Command, DeviceMetadata } from "../../types";
+import type { Command, ComboMap, DeviceMetadata } from "../../types";
 
 export const ANDROIDTV_COMMANDS: Command[] = [
   { id: "dpad_right",      label: "Right",          payload: KeyCode.DPAD_RIGHT },
@@ -29,12 +29,36 @@ export const ANDROIDTV_COMMANDS: Command[] = [
 export class AndroidTVAdapter implements IDeviceAdapter {
   readonly meta: DeviceMetadata;
   private _connected = false;
+  private _readySub: { remove(): void } | null = null;
+  private _disconnSub: { remove(): void } | null = null;
 
   constructor(meta: DeviceMetadata) {
     this.meta = meta;
+    // Track connection state from native events regardless of who called connect()
+    this._readySub = AndroidTV.onReady(() => { console.log("[AndroidTV] onReady"); this._connected = true; });
+    this._disconnSub = AndroidTV.onError((e) => { console.log("[AndroidTV] onError", e?.message ?? e); this._connected = false; });
+  }
+
+  defaultMapping(): ComboMap {
+    return {
+      // Single gestures — fire immediately
+      "turn_right":            "dpad_right",
+      "turn_left":             "dpad_left",
+      "pitch_up":              "dpad_up",
+      "pitch_down":            "dpad_down",
+      "tap":                   "dpad_center",
+      // Combos — buffer until timeout
+      "turn_right,turn_right": "ff",
+      "turn_left,turn_left":   "rewind",
+      "turn_right,turn_left":  "back",
+      "tap,tap":               "open_netflix",
+      "tap,tap,tap":           "open_prime",
+    };
   }
 
   async connect(): Promise<void> {
+    console.log("[AndroidTV] connect() _connected=", this._connected);
+    if (this._connected) return;
     return new Promise((resolve, reject) => {
       let done = false;
       const timeout = setTimeout(() => {
@@ -79,9 +103,15 @@ export class AndroidTVAdapter implements IDeviceAdapter {
   }
 
   async sendCommand(command: Command): Promise<void> {
+    // User-defined deep link stored as "deeplink:<url>" in the command id
+    if (command.id.startsWith("deeplink:")) {
+      await AndroidTV.sendAppLink(command.id.slice("deeplink:".length));
+      return;
+    }
+
     const payload = command.payload;
 
-    // App deep link
+    // App deep link (preset commands)
     if (payload && typeof payload === "object" && "link" in (payload as object)) {
       await AndroidTV.sendAppLink((payload as { link: string }).link);
       return;
@@ -89,6 +119,7 @@ export class AndroidTVAdapter implements IDeviceAdapter {
 
     // Keycode
     if (typeof payload === "number") {
+      console.log("[AndroidTV] sendKey", payload, "_connected=", this._connected);
       await AndroidTV.sendKey(payload);
     }
   }

@@ -5,7 +5,7 @@ import type { DiscoveredDevice, TransportType } from "../types";
 const SERVICE_TYPES: Array<{ service: string; transport: TransportType }> = [
   { service: "googlecast",       transport: "androidtv" },
   { service: "androidtvremote2", transport: "androidtv" },
-  { service: "wristturn-daemon", transport: "macdaemon" },
+  { service: "wt-daemon",        transport: "macdaemon" },
   { service: "http",             transport: "http"       },
 ];
 
@@ -38,7 +38,7 @@ export function useMDNSDiscovery() {
   function inferTransport(service: any): TransportType {
     const full = String(service?.fullName ?? "").toLowerCase();
     if (full.includes("._googlecast._tcp.") || full.includes("._androidtvremote2._tcp.")) return "androidtv";
-    if (full.includes("._wristturn-daemon._tcp.")) return "macdaemon";
+    if (full.includes("._wt-daemon._tcp.")) return "macdaemon";
     if (full.includes("._http._tcp.")) return "http";
     // Fallback: currently scanned service type
     return activeTransport.current;
@@ -117,8 +117,8 @@ export function useMDNSDiscovery() {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const onResolved = (service: any) => {
       const transport = inferTransport(service);
-      const ip = Array.isArray(service.addresses) && service.addresses.length > 0
-        ? String(service.addresses[0])
+      const ip = Array.isArray(service.addresses)
+        ? service.addresses.map(String).find((a) => !a.startsWith("127.") && a !== "::1")
         : undefined;
       const rawHost = service.host ? String(service.host) : undefined;
       const host = ip ?? rawHost;

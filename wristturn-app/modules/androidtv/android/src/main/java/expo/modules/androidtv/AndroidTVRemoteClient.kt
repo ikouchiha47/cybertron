@@ -149,15 +149,24 @@ internal fun computeSecret(
 // ── Remote messages ───────────────────────────────────────────────────────────
 
 fun keyEventMessage(keyCode: Int, direction: Int): ByteArray {
-    // direction: 0=START_LONG, 1=END_LONG, 2=SHORT
+    // RemoteMessage field 10 = remote_key_inject { key_code(1), direction(2) }
+    // direction: SHORT=3, START_LONG=1, END_LONG=2
     val keyEvent = int32Field(1, keyCode) + int32Field(2, direction)
-    val outer    = lengthDelimited(3, keyEvent)
+    val outer    = lengthDelimited(10, keyEvent)
+    return frameMessage(outer)
+}
+
+fun configurMessage(features: Int): ByteArray {
+    // RemoteMessage field 1 = remote_configure { code1(1), device_info(2) { unknown1(3)=1 } }
+    val deviceInfo = int32Field(3, 1) // unknown1 = 1
+    val configure  = int32Field(1, features) + lengthDelimited(2, deviceInfo)
+    val outer      = lengthDelimited(1, configure)
     return frameMessage(outer)
 }
 
 fun appLinkMessage(appLink: String): ByteArray {
     val linkMsg = stringField(1, appLink)
-    val outer   = lengthDelimited(9, linkMsg)
+    val outer   = lengthDelimited(90, linkMsg) // field 90 = remote_app_link_launch_request
     return frameMessage(outer)
 }
 

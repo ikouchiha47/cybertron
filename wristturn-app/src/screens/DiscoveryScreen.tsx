@@ -12,7 +12,7 @@ import type { DeviceMetadata } from "../types";
 type Props = StackScreenProps<RootStackParams, "Discovery">;
 
 export function DiscoveryScreen({ navigation }: Props) {
-  const { connected, wristName, lastGesture } = useBLE();
+  const { connected, wristName, wristAddress } = useBLE();
   const [devices, setDevices] = useState<DeviceMetadata[]>([]);
   const connectingRef = useRef(false);
 
@@ -65,10 +65,15 @@ export function DiscoveryScreen({ navigation }: Props) {
       {/* Wrist device status */}
       <View style={s.section}>
         <Text style={s.label}>Wrist Device</Text>
-        <View style={[s.pill, connected ? s.pillOn : s.pillOff]}>
-          <Text style={s.pillText}>{connected ? (wristName || "Connected") : "Scanning..."}</Text>
+        <View style={s.row}>
+          <View>
+            <Text style={s.rowName}>{connected ? (wristName || "WristTurn") : "WristTurn"}</Text>
+            {wristAddress ? <Text style={s.rowSub}>{wristAddress}</Text> : <Text style={s.rowSub}>BLE</Text>}
+          </View>
+          <View style={[s.pill, connected ? s.pillOn : s.pillOff]}>
+            <Text style={s.pillText}>{connected ? "Connected" : "Scanning..."}</Text>
+          </View>
         </View>
-        {lastGesture ? <Text style={s.gesture}>{lastGesture}</Text> : null}
       </View>
 
       {/* Saved devices */}

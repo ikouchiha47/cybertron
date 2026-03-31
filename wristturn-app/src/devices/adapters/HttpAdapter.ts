@@ -1,5 +1,5 @@
 import type { IDeviceAdapter } from "./IDeviceAdapter";
-import type { Command, DeviceMetadata } from "../../types";
+import type { Command, ComboMap, DeviceMetadata } from "../../types";
 
 interface HttpPayload {
   method: "GET" | "POST" | "PUT";
@@ -36,5 +36,9 @@ export class HttpAdapter implements IDeviceAdapter {
 
   isConnected(): boolean {
     return this._connected;
+  }
+
+  defaultMapping(): ComboMap {
+    return {};
   }
 }

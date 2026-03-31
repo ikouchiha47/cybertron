@@ -40,7 +40,9 @@ float   baseRoll       = 0.0f;
 float   basePitch      = 0.0f;
 float   baseYaw        = 0.0f;
 bool    baseSet        = false;
-unsigned long lastGestureMs = 0;
+unsigned long lastGestureMs  = 0;
+unsigned long lastPingMs     = 0;
+const unsigned long PING_INTERVAL_MS = 3000;
 ShakeDetector shake;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -86,11 +88,22 @@ void enableReports() {
 #endif
 }
 
+// ── BLE callbacks ─────────────────────────────────────────────────────────────
+void onConnect(uint16_t conn_hdl) {
+  LOG_I("BLE connected. conn_hdl=%u peers=%u", conn_hdl, Bluefruit.Periph.connected());
+}
+
+void onDisconnect(uint16_t conn_hdl, uint8_t reason) {
+  LOG_I("BLE disconnected. conn_hdl=%u reason=0x%02X", conn_hdl, reason);
+  Bluefruit.Advertising.start(0);
+  LOG_I("BLE advertising restarted.");
+}
+
 // ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
   // Give serial monitor time to connect (skip delay in production)
-  while (!Serial) { delay(10); }  // wait until Serial Monitor is open
+  // while (!Serial) { delay(10); }  // only needed when Serial Monitor is attached
 
   // ── IMU init ──
   Wire.begin();
@@ -117,8 +130,13 @@ void setup() {
   enableReports();
 
   // ── BLE init ──
+  LOG_I("BLE init...");
   Bluefruit.begin();
   Bluefruit.setName("WristTurn");
+  // Short supervision timeout — detects dead connections (e.g. app force-killed) within ~2s
+  Bluefruit.Periph.setConnInterval(6, 12);       // 7.5ms–15ms connection interval
+  Bluefruit.Periph.setConnSupervisionTimeout(200); // 2000ms = 2s
+  LOG_I("BLE supervision timeout set to 2s.");
 
   wristService.begin();
 
@@ -132,6 +150,8 @@ void setup() {
   Bluefruit.Advertising.addTxPower();
   Bluefruit.Advertising.addService(wristService);
   Bluefruit.ScanResponse.addName();
+  Bluefruit.Periph.setConnectCallback(onConnect);
+  Bluefruit.Periph.setDisconnectCallback(onDisconnect);
   Bluefruit.Advertising.restartOnDisconnect(true);
   Bluefruit.Advertising.start(0);
   LOG_I("BLE advertising as 'WristTurn'.");
@@ -230,5 +250,15 @@ void loop() {
   if (imu.wasReset()) {
     LOG_E("BNO085 reset - re-enabling reports.");
     enableReports();
+  }
+
+  // Keepalive ping — forces Android to close zombie GATT connections
+  // when the app is dead (Android can't deliver the notify → fires disconnect)
+  if (Bluefruit.Periph.connected()) {
+    unsigned long now = millis();
+    if (now - lastPingMs > PING_INTERVAL_MS) {
+      lastPingMs = now;
+      gestureChar.notify("ping", 4);
+    }
   }
 }

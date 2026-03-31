@@ -7,6 +7,8 @@ import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 import java.net.InetSocketAddress
 import java.security.cert.X509Certificate
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLContext
 import kotlin.concurrent.thread
@@ -19,6 +21,7 @@ class AndroidtvModule : Module() {
 
     private var pairingSocket: SSLSocket? = null
     private var remoteSocket: SSLSocket? = null
+    private val commandQueue = LinkedBlockingQueue<Pair<ByteArray, Long>>(64)
     private var clientCert: X509Certificate? = null
     private var clientPrivateKey: java.security.PrivateKey? = null
     private var serverCert: X509Certificate? = null
@@ -151,27 +154,17 @@ class AndroidtvModule : Module() {
         }
 
         AsyncFunction("sendKey") { keyCode: Int ->
-            try {
-                val os = remoteSocket?.outputStream ?: throw Exception("Not connected")
-                os.write(keyEventMessage(keyCode, 2))
-                os.flush()
-            } catch (e: Exception) {
-                val msg = e.message ?: "send key failed"
-                Log.e(TAG, "sendKey failed: $msg", e)
-                throw Exception(msg, e)
-            }
+            if (remoteSocket == null) throw Exception("Not connected")
+            val enqueuedAt = System.currentTimeMillis()
+            Log.d(TAG, "sendKey enqueue keyCode=$keyCode t=${enqueuedAt}")
+            commandQueue.offer(Pair(keyEventMessage(keyCode, 3), enqueuedAt))
         }
 
         AsyncFunction("sendAppLink") { url: String ->
-            try {
-                val os = remoteSocket?.outputStream ?: throw Exception("Not connected")
-                os.write(appLinkMessage(url))
-                os.flush()
-            } catch (e: Exception) {
-                val msg = e.message ?: "send app link failed"
-                Log.e(TAG, "sendAppLink failed: $msg", e)
-                throw Exception(msg, e)
-            }
+            if (remoteSocket == null) throw Exception("Not connected")
+            val enqueuedAt = System.currentTimeMillis()
+            Log.d(TAG, "sendAppLink enqueue url=$url t=${enqueuedAt}")
+            commandQueue.offer(Pair(appLinkMessage(url), enqueuedAt))
         }
 
         AsyncFunction("disconnect") {
@@ -211,19 +204,92 @@ class AndroidtvModule : Module() {
 
         sendEvent("onReady", mapOf<String, Any>())
 
+        // Writer thread — drains commandQueue serially, measures enqueue→send latency
+        commandQueue.clear()
+        thread {
+            try {
+                val os = sock.outputStream
+                while (!sock.isClosed) {
+                    val item = commandQueue.poll(5, TimeUnit.SECONDS) ?: continue
+                    val (msg, enqueuedAt) = item
+                    val sentAt = System.currentTimeMillis()
+                    os.write(msg)
+                    os.flush()
+                    Log.d(TAG, "sendKey sent queueLatency=${sentAt - enqueuedAt}ms")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "writer thread exit: ${e.message}")
+            }
+        }
+
+        // Reader thread — handles pings and TV-initiated frames
         thread {
             try {
                 val ins = sock.inputStream
+                sock.soTimeout = 0
                 while (!sock.isClosed) {
                     val frame = readFrame(ins) ?: break
-                    handleRemoteFrame(frame)
+                    handleRemoteFrame(sock, frame)
                 }
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                Log.w(TAG, "remote reader exit: ${e.message}")
+            }
+            remoteSocket = null
+            commandQueue.clear()
+            sendEvent("onError", mapOf("message" to "disconnected"))
         }
     }
 
-    private fun handleRemoteFrame(frame: ByteArray) {
-        // Field 7 = volume event, field 10 = current_app — stubbed for now
+    private fun handleRemoteFrame(sock: SSLSocket, frame: ByteArray) {
+        if (frame.isEmpty()) return
+        val tag = frame[0].toInt() and 0xFF
+        val fieldNumber = tag ushr 3
+        Log.d(TAG, "handleRemoteFrame field=$fieldNumber frameLen=${frame.size}")
+
+        when (fieldNumber) {
+            1 -> {
+                // remote_configure — TV sends its features, we reply with ours
+                // Features: PING=1, KEY=2, POWER=32, VOLUME=64, APP_LINK=512 → 611
+                val features = 1 or 2 or 32 or 64 or 512
+                try {
+                    sock.outputStream.write(configurMessage(features))
+                    sock.outputStream.flush()
+                    Log.d(TAG, "remote_configure reply sent features=$features")
+                } catch (e: Exception) {
+                    Log.w(TAG, "configure reply failed: ${e.message}")
+                }
+            }
+            8 -> {
+                // remote_ping_request (field 8) — extract val1 and echo as remote_ping_response (field 9)
+                try {
+                    // frame = [tag] [len_varint] [inner: field1=val1, field2=val2]
+                    // Extract val1 from inner — first field (tag=0x08, then varint)
+                    var i = 1
+                    // skip length varint of field 8
+                    while (i < frame.size && (frame[i].toInt() and 0x80) != 0) i++
+                    i++ // past last byte of length varint
+                    // now at inner payload; read first field tag + val1
+                    var val1 = 0
+                    if (i < frame.size) {
+                        i++ // skip inner tag (0x08 = field1, varint)
+                        var shift = 0
+                        while (i < frame.size) {
+                            val b = frame[i++].toInt() and 0xFF
+                            val1 = val1 or ((b and 0x7F) shl shift); shift += 7
+                            if ((b and 0x80) == 0) break
+                        }
+                    }
+                    // Build response: RemoteMessage { remote_ping_response(9) { val1(1) = val1 } }
+                    val inner = int32Field(1, val1)
+                    val pong  = frameMessage(lengthDelimited(9, inner))
+                    sock.outputStream.write(pong)
+                    sock.outputStream.flush()
+                    Log.d(TAG, "pong sent val1=$val1")
+                } catch (e: Exception) {
+                    Log.w(TAG, "pong failed: ${e.message}")
+                }
+            }
+        }
     }
 
     private fun readFrame(ins: java.io.InputStream): ByteArray? {
@@ -291,9 +357,10 @@ class AndroidtvModule : Module() {
 
     private fun createTimedTlsSocket(ctx: SSLContext, host: String, port: Int): SSLSocket {
         val socket = ctx.socketFactory.createSocket() as SSLSocket
-        socket.soTimeout = IO_TIMEOUT_MS
         socket.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
+        socket.soTimeout = IO_TIMEOUT_MS // only for handshake
         socket.startHandshake()
+        socket.soTimeout = 0 // no timeout after handshake
         return socket
     }
 }

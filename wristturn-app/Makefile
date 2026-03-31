@@ -6,7 +6,7 @@ APK          := android/app/build/outputs/apk/debug/app-debug.apk
 export ANDROID_HOME
 export JAVA_HOME
 
-.PHONY: build install run prebuild clean logs start
+.PHONY: build install run prebuild clean logs start launch metro tunnel
 
 # Full rebuild + install
 all: build install
@@ -25,6 +25,24 @@ install:
 
 # Build + install in one shot
 deploy: build install
+
+# Re-establish adb reverse tunnel (run if Metro says "No apps connected")
+tunnel:
+	adb start-server
+	adb reverse tcp:8081 tcp:8081
+	@echo "Tunnel ready"
+
+# Launch app on connected device + set up Metro tunnel
+launch:
+	adb start-server
+	adb shell am start -n com.anonymous.wristturnapp/.MainActivity
+	adb reverse tcp:8081 tcp:8081
+
+# Start Metro bundler (background) + tunnel
+metro:
+	npx expo start --port 8081 &
+	sleep 6
+	adb reverse tcp:8081 tcp:8081
 
 # Start Metro bundler
 start:
