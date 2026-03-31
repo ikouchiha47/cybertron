@@ -20,6 +20,7 @@ class AndroidtvModule : Module() {
     private var pairingSocket: SSLSocket? = null
     private var remoteSocket: SSLSocket? = null
     private var clientCert: X509Certificate? = null
+    private var clientPrivateKey: java.security.PrivateKey? = null
     private var serverCert: X509Certificate? = null
     private var multicastLock: WifiManager.MulticastLock? = null
     private var trustManager: TrustManager? = null
@@ -30,7 +31,6 @@ class AndroidtvModule : Module() {
 
         Events("onSecret", "onReady", "onError", "onVolume", "onCurrentApp")
 
-        // Acquire multicast lock so mDNS works on Android
         OnCreate {
             val wifiManager = appContext.reactContext
                 ?.getSystemService(Context.WIFI_SERVICE) as? WifiManager
@@ -52,17 +52,18 @@ class AndroidtvModule : Module() {
                 val tm = TrustManager()
                 this@AndroidtvModule.trustManager = tm
 
-                // Build TLS context with client key material + trust manager.
-                val (ctx, _) = createSSLContext(tm)
-                val sock = createTimedTlsSocket(ctx, host, 6467)
+                val filesDir = appContext.reactContext?.filesDir
+                    ?: throw Exception("No files dir")
 
+                // Always generate fresh identity for pairing
+                val (ctx, privateKey, cert) = createSSLContext(tm)
+                clientPrivateKey = privateKey
+
+                val sock = createTimedTlsSocket(ctx, host, 6467)
                 pairingSocket = sock
                 clientCert = (sock.session.localCertificates?.firstOrNull()) as? X509Certificate
                 serverCert = tm.serverCert
-                Log.d(
-                    TAG,
-                    "startPairing handshake done clientCert=${clientCert != null} serverCert=${serverCert != null}"
-                )
+                Log.d(TAG, "startPairing handshake done clientCert=${clientCert != null} serverCert=${serverCert != null}")
 
                 val os = sock.outputStream
                 val ins = sock.inputStream
@@ -102,6 +103,7 @@ class AndroidtvModule : Module() {
                 val sock = pairingSocket ?: throw Exception("Not pairing")
                 val cc   = clientCert   ?: throw Exception("No client cert")
                 val sc   = serverCert   ?: throw Exception("No server cert")
+                val pk   = clientPrivateKey ?: throw Exception("No client key")
 
                 val os = sock.outputStream
                 val ins = sock.inputStream
@@ -118,6 +120,12 @@ class AndroidtvModule : Module() {
                 sock.close()
                 pairingSocket = null
 
+                // Pairing succeeded — persist the client identity so reconnects skip pairing
+                val filesDir = appContext.reactContext?.filesDir
+                if (filesDir != null) {
+                    saveClientIdentity(filesDir, this@AndroidtvModule.host, pk, cc)
+                }
+
                 connectRemote()
             } catch (e: Exception) {
                 val root = generateSequence(e as Throwable?) { it.cause }.lastOrNull()
@@ -128,7 +136,7 @@ class AndroidtvModule : Module() {
             }
         }
 
-        // Connect to already-paired TV (after pairing is done)
+        // Connect to already-paired TV (skips pairing if identity is saved)
         AsyncFunction("connect") { host: String ->
             this@AndroidtvModule.host = host
             try {
@@ -142,7 +150,6 @@ class AndroidtvModule : Module() {
             }
         }
 
-        // Send a keycode (SHORT press)
         AsyncFunction("sendKey") { keyCode: Int ->
             try {
                 val os = remoteSocket?.outputStream ?: throw Exception("Not connected")
@@ -155,7 +162,6 @@ class AndroidtvModule : Module() {
             }
         }
 
-        // Launch an app by deep link URL
         AsyncFunction("sendAppLink") { url: String ->
             try {
                 val os = remoteSocket?.outputStream ?: throw Exception("Not connected")
@@ -173,6 +179,14 @@ class AndroidtvModule : Module() {
             remoteSocket = null
             Log.d(TAG, "disconnect complete")
         }
+
+        // Call this to force re-pairing for a specific host (clears saved identity)
+        AsyncFunction("forgetPairing") { host: String ->
+            val filesDir = appContext.reactContext?.filesDir
+            if (filesDir != null) {
+                forgetClientIdentity(filesDir, host)
+            }
+        }
     }
 
     private fun connectRemote() {
@@ -185,7 +199,11 @@ class AndroidtvModule : Module() {
 
         Log.d(TAG, "connectRemote begin host=$host")
         val tm = TrustManager()
-        val (ctx, _) = createSSLContext(tm)
+
+        // Use saved identity if available (prevents need to re-pair)
+        val filesDir = appContext.reactContext?.filesDir
+        val savedIdentity = if (filesDir != null) loadClientIdentity(filesDir, host) else null
+        val (ctx, _, _) = createSSLContext(tm, savedIdentity)
 
         val sock = createTimedTlsSocket(ctx, host, 6466)
         remoteSocket = sock
@@ -193,7 +211,6 @@ class AndroidtvModule : Module() {
 
         sendEvent("onReady", mapOf<String, Any>())
 
-        // Read incoming events (volume, current app) in background
         thread {
             try {
                 val ins = sock.inputStream
@@ -206,14 +223,11 @@ class AndroidtvModule : Module() {
     }
 
     private fun handleRemoteFrame(frame: ByteArray) {
-        // Parse top-level RemoteMessage fields
-        // Field 7 = volume event, field 10 = current_app
-        // Minimal parse: just emit raw for now
+        // Field 7 = volume event, field 10 = current_app — stubbed for now
     }
 
     private fun readFrame(ins: java.io.InputStream): ByteArray? {
         val len = readVarint(ins) ?: return null
-
         val payload = ByteArray(len)
         var read = 0
         while (read < len) {

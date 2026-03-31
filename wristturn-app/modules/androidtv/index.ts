@@ -33,12 +33,13 @@ export const AppLink = {
 } as const;
 
 export const AndroidTV = {
-  startPairing: (host: string)    => native.startPairing(host),
-  sendCode:     (code: string)    => native.sendCode(code),
-  connect:      (host: string)    => native.connect(host),
-  disconnect:   ()                => native.disconnect(),
-  sendKey:      (keyCode: number) => native.sendKey(keyCode),
-  sendAppLink:  (url: string)     => native.sendAppLink(url),
+  startPairing:  (host: string)    => native.startPairing(host),
+  sendCode:      (code: string)    => native.sendCode(code),
+  connect:       (host: string)    => native.connect(host),
+  disconnect:    ()                => native.disconnect(),
+  sendKey:       (keyCode: number) => native.sendKey(keyCode),
+  sendAppLink:   (url: string)     => native.sendAppLink(url),
+  forgetPairing: (host: string)    => native.forgetPairing(host),
 
   onSecret: (cb: () => void)                        => emitter.addListener("onSecret", cb),
   onReady:  (cb: () => void)                        => emitter.addListener("onReady", cb),

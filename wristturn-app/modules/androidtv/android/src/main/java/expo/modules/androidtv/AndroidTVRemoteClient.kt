@@ -169,25 +169,65 @@ internal fun frameMessage(payload: ByteArray): ByteArray {
 // ── TLS helpers ───────────────────────────────────────────────────────────────
 
 fun createSSLContext(
-    trustManager: javax.net.ssl.X509TrustManager = TrustManager()
-): Pair<SSLContext, java.security.PrivateKey> {
-    val kpg  = KeyPairGenerator.getInstance("RSA")
-    kpg.initialize(2048)
-    val kp   = kpg.generateKeyPair()
-
-    // Self-signed cert via Android's BouncyCastle
-    val cert = generateSelfSignedCert(kp)
+    trustManager: javax.net.ssl.X509TrustManager = TrustManager(),
+    existingIdentity: Pair<java.security.PrivateKey, X509Certificate>? = null
+): Triple<SSLContext, java.security.PrivateKey, X509Certificate> {
+    val (privateKey, cert) = existingIdentity ?: run {
+        val kpg = KeyPairGenerator.getInstance("RSA")
+        kpg.initialize(2048)
+        val kp  = kpg.generateKeyPair()
+        kp.private to generateSelfSignedCert(kp)
+    }
 
     val ks = KeyStore.getInstance("PKCS12")
     ks.load(null, null)
-    ks.setKeyEntry("client", kp.private, null, arrayOf(cert))
+    ks.setKeyEntry("client", privateKey, null, arrayOf(cert))
 
     val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
     kmf.init(ks, null)
 
     val ctx = SSLContext.getInstance("TLS")
     ctx.init(kmf.keyManagers, arrayOf(trustManager), null)
-    return ctx to kp.private
+    return Triple(ctx, privateKey, cert)
+}
+
+// ── Persistent client identity ────────────────────────────────────────────────
+
+private fun hostKey(host: String) = host.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+
+fun saveClientIdentity(filesDir: java.io.File, host: String, privateKey: java.security.PrivateKey, cert: X509Certificate) {
+    val k = hostKey(host)
+    java.io.File(filesDir, "atv_${k}.key").writeBytes(privateKey.encoded)
+    java.io.File(filesDir, "atv_${k}.crt").writeBytes(cert.encoded)
+    Log.d(TAG, "saveClientIdentity saved key+cert for host=$host")
+}
+
+fun loadClientIdentity(filesDir: java.io.File, host: String): Pair<java.security.PrivateKey, X509Certificate>? {
+    val k = hostKey(host)
+    val keyFile = java.io.File(filesDir, "atv_${k}.key")
+    val crtFile = java.io.File(filesDir, "atv_${k}.crt")
+    if (!keyFile.exists() || !crtFile.exists()) {
+        Log.d(TAG, "loadClientIdentity no saved identity for host=$host")
+        return null
+    }
+    return try {
+        val keySpec = java.security.spec.PKCS8EncodedKeySpec(keyFile.readBytes())
+        val privateKey = java.security.KeyFactory.getInstance("RSA").generatePrivate(keySpec)
+        val cert = java.security.cert.CertificateFactory.getInstance("X.509")
+            .generateCertificate(crtFile.inputStream()) as X509Certificate
+        Log.d(TAG, "loadClientIdentity loaded saved identity for host=$host")
+        privateKey to cert
+    } catch (e: Exception) {
+        Log.w(TAG, "loadClientIdentity failed to load for host=$host, will regenerate", e)
+        null
+    }
+}
+
+fun forgetClientIdentity(filesDir: java.io.File, host: String) {
+    val k = hostKey(host)
+    java.io.File(filesDir, "atv_${k}.key").delete()
+    java.io.File(filesDir, "atv_${k}.crt").delete()
+    Log.d(TAG, "forgetClientIdentity cleared identity for host=$host")
 }
 
 internal fun generateSelfSignedCert(kp: java.security.KeyPair): X509Certificate {
