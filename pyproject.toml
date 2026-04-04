@@ -1,0 +1,26 @@
+[project]
+name = "doorcam-model-export"
+version = "0.1.0"
+description = "Model export scripts for DoorCam TFLite models"
+requires-python = ">=3.10"
+dependencies = [
+    "ultralytics>=8.4",
+    "onnx>=1.14",
+    "onnxruntime>=1.17",
+    "onnx2tf>=1.20",
+    # tensorflow not listed — no macOS ARM pip package.
+    # onnx2tf bundles its own TFLite flatbuffer writer so tensorflow is not
+    # required for the ONNX → TFLite conversion path used here.
+]
+
+[project.optional-dependencies]
+dev = [
+    "ipython",
+]
+
+[tool.uv]
+dev-dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -6,7 +6,7 @@ export const EMPTY_FRAMES_BEFORE_RESET = 3;
 export const NOTIFICATION_COOLDOWN_MS = 120000; // 2 minutes
 
 // Polling interval
-export const DETECTION_INTERVAL_MS = 2000;
+export const DETECTION_INTERVAL_MS = 1000;
 
 // Proximity thresholds (normalized bounding box height)
 export const NEARNESS_VERY_CLOSE = 0.7;

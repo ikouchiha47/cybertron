@@ -51,3 +51,8 @@ modules/*/ios/Pods/
 
 # package-lock (use yarn or let CI manage)
 # package-lock.json
+datasets/
+*.onnx
+*.pt
+yolov8n_saved_model/
+calibration_image_sample_data_*.npy
