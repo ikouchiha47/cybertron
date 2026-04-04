@@ -98,6 +98,7 @@ float quaternionToYaw(float w, float x, float y, float z) {
 #define ENABLE_TAP
 // #define ENABLE_SHAKE      // uses linear accelerometer
 // #define ENABLE_STEP
+#define ENABLE_GRYO
 
 // Stability classifier values from BNO085 SHTP protocol spec
 // 0=unknown, 1=on_table, 2=stationary, 3=stable (held still), 4=motion
@@ -125,6 +126,10 @@ void enableReports() {
 #ifdef ENABLE_STEP
   if (!imu.enableStepCounter(1000))
     LOG_E("BNO085: could not enable Step Counter");
+#endif
+#ifdef ENABLE_GRYO
+  if(!imu.enableGyro())
+    LOG_E("BN0085: could not enable gyro");
 #endif
 }
 
@@ -332,6 +337,19 @@ void loop() {
               baseRoll, basePitch, baseYaw);
       }
     }
+
+#ifdef ENABLE_GRYO
+    else if (eventId == SENSOR_REPORTID_GYROSCOPE_CALIBRATED) {
+      if (rawMode && Bluefruit.Periph.connected()) {
+        float gx = imu.getGyroX();  // rad/s
+        float gy = imu.getGyroY();
+        float gz = imu.getGyroZ();
+        char buf[40] = {};
+        snprintf(buf, sizeof(buf), "gyr|%.3f|%.3f|%.3f", gx, gy, gz);
+        gestureChar.notify(buf, 40);
+      }
+    }
+#endif
 
     else if (eventId == SENSOR_REPORTID_ROTATION_VECTOR) {
       float w = imu.getQuatReal();

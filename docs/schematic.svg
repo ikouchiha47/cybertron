@@ -1,0 +1,153 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 620" width="900" height="620" style="background:#0e1117;font-family:ui-monospace,monospace">
+
+  <!-- ── title ── -->
+  <text x="20" y="28" fill="#e2e8f0" font-size="14" font-weight="bold">WristTurn — Modular Carrier Schematic</text>
+  <text x="20" y="46" fill="#8b949e" font-size="10">I2C bus · LiPo power · Qwiic expansion</text>
+
+  <!-- ══════════════════════════════════════════
+       XIAO nRF52840
+  ══════════════════════════════════════════ -->
+  <rect x="320" y="70" width="120" height="220" rx="6" fill="#1f2937" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="380" y="90" fill="#58a6ff" font-size="10" font-weight="bold" text-anchor="middle">XIAO</text>
+  <text x="380" y="103" fill="#58a6ff" font-size="9" text-anchor="middle">nRF52840</text>
+
+  <!-- left pins -->
+  <text x="315" y="125" fill="#8b949e" font-size="8" text-anchor="end">3V3</text>
+  <line x1="316" y1="122" x2="320" y2="122" stroke="#34d399" stroke-width="1.5"/>
+
+  <text x="315" y="145" fill="#8b949e" font-size="8" text-anchor="end">GND</text>
+  <line x1="316" y1="142" x2="320" y2="142" stroke="#6b7280" stroke-width="1.5"/>
+
+  <text x="315" y="165" fill="#8b949e" font-size="8" text-anchor="end">SDA (D4)</text>
+  <line x1="316" y1="162" x2="320" y2="162" stroke="#fbbf24" stroke-width="1.5"/>
+
+  <text x="315" y="185" fill="#8b949e" font-size="8" text-anchor="end">SCL (D5)</text>
+  <line x1="316" y1="182" x2="320" y2="182" stroke="#f87171" stroke-width="1.5"/>
+
+  <text x="315" y="205" fill="#8b949e" font-size="8" text-anchor="end">D0 (A0)</text>
+  <line x1="316" y1="202" x2="320" y2="202" stroke="#818cf8" stroke-width="1.5"/>
+
+  <!-- right pins -->
+  <text x="445" y="125" fill="#8b949e" font-size="8">VIN (5V)</text>
+  <line x1="440" y1="122" x2="444" y2="122" stroke="#f97316" stroke-width="1.5"/>
+
+  <text x="445" y="145" fill="#8b949e" font-size="8">GND</text>
+  <line x1="440" y1="142" x2="444" y2="142" stroke="#6b7280" stroke-width="1.5"/>
+
+  <!-- bottom battery pads -->
+  <text x="340" y="302" fill="#8b949e" font-size="8">BAT+</text>
+  <line x1="350" y1="290" x2="350" y2="294" stroke="#f97316" stroke-width="1.5"/>
+  <text x="375" y="302" fill="#8b949e" font-size="8">BAT-</text>
+  <line x1="385" y1="290" x2="385" y2="294" stroke="#6b7280" stroke-width="1.5"/>
+
+  <!-- USB-C symbol -->
+  <rect x="368" y="272" width="24" height="10" rx="3" fill="none" stroke="#60a5fa" stroke-width="1"/>
+  <text x="380" y="281" fill="#60a5fa" font-size="7" text-anchor="middle">USB-C</text>
+
+  <!-- ══════════════════════════════════════════
+       BNO085
+  ══════════════════════════════════════════ -->
+  <rect x="100" y="130" width="110" height="110" rx="6" fill="#1f2937" stroke="#34d399" stroke-width="1.5"/>
+  <text x="155" y="150" fill="#34d399" font-size="10" font-weight="bold" text-anchor="middle">BNO085</text>
+  <text x="155" y="163" fill="#8b949e" font-size="8" text-anchor="middle">IMU · I2C 0x4A/4B</text>
+
+  <text x="215" y="175" fill="#8b949e" font-size="8">SDA</text>
+  <line x1="210" y1="172" x2="214" y2="172" stroke="#fbbf24" stroke-width="1.5"/>
+  <text x="215" y="193" fill="#8b949e" font-size="8">SCL</text>
+  <line x1="210" y1="190" x2="214" y2="190" stroke="#f87171" stroke-width="1.5"/>
+  <text x="215" y="211" fill="#8b949e" font-size="8">VCC</text>
+  <line x1="210" y1="208" x2="214" y2="208" stroke="#34d399" stroke-width="1.5"/>
+  <text x="215" y="229" fill="#8b949e" font-size="8">GND</text>
+  <line x1="210" y1="226" x2="214" y2="226" stroke="#6b7280" stroke-width="1.5"/>
+
+  <!-- I2C wires BNO085 → XIAO -->
+  <!-- SDA -->
+  <polyline points="214,172 260,172 260,162 316,162" fill="none" stroke="#fbbf24" stroke-width="1.5" stroke-dasharray="4,2"/>
+  <!-- SCL -->
+  <polyline points="214,190 264,190 264,182 316,182" fill="none" stroke="#f87171" stroke-width="1.5" stroke-dasharray="4,2"/>
+  <!-- VCC 3V3 -->
+  <polyline points="214,208 268,208 268,122 316,122" fill="none" stroke="#34d399" stroke-width="1.5"/>
+  <!-- GND -->
+  <polyline points="214,226 272,226 272,142 316,142" fill="none" stroke="#6b7280" stroke-width="1.5"/>
+
+  <!-- ══════════════════════════════════════════
+       LiPo Battery
+  ══════════════════════════════════════════ -->
+  <rect x="320" y="340" width="120" height="70" rx="6" fill="#1f2937" stroke="#f97316" stroke-width="1.5"/>
+  <text x="380" y="362" fill="#f97316" font-size="10" font-weight="bold" text-anchor="middle">LiPo</text>
+  <text x="380" y="376" fill="#8b949e" font-size="8" text-anchor="middle">3.7V · 150mAh</text>
+  <text x="380" y="390" fill="#8b949e" font-size="8" text-anchor="middle">JST PH 2.0</text>
+
+  <!-- BAT+ wire -->
+  <line x1="350" y1="340" x2="350" y2="294" stroke="#f97316" stroke-width="1.5"/>
+  <!-- BAT- wire -->
+  <line x1="385" y1="340" x2="385" y2="294" stroke="#6b7280" stroke-width="1.5"/>
+
+  <!-- ══════════════════════════════════════════
+       Qwiic connector (expansion)
+  ══════════════════════════════════════════ -->
+  <rect x="520" y="130" width="130" height="90" rx="6" fill="#1f2937" stroke="#818cf8" stroke-width="1.5" stroke-dasharray="6,3"/>
+  <text x="585" y="150" fill="#818cf8" font-size="10" font-weight="bold" text-anchor="middle">Qwiic / STEMMA QT</text>
+  <text x="585" y="163" fill="#8b949e" font-size="8" text-anchor="middle">JST SH 4-pin</text>
+  <text x="585" y="178" fill="#8b949e" font-size="8" text-anchor="middle">plug any I2C sensor</text>
+  <text x="585" y="193" fill="#34d399" font-size="8" text-anchor="middle">GND · 3V3 · SDA · SCL</text>
+  <text x="585" y="208" fill="#8b949e" font-size="8" text-anchor="middle">(shares same I2C bus)</text>
+
+  <!-- Qwiic wires from XIAO -->
+  <polyline points="440,162 480,162 480,185 520,185" fill="none" stroke="#fbbf24" stroke-width="1" stroke-dasharray="3,2"/>
+  <polyline points="440,182 484,182 484,193 520,193" fill="none" stroke="#f87171" stroke-width="1" stroke-dasharray="3,2"/>
+  <polyline points="444,122 500,122 500,172 520,172" fill="none" stroke="#34d399" stroke-width="1" stroke-dasharray="3,2"/>
+  <polyline points="444,142 504,142 504,180 520,180" fill="none" stroke="#6b7280" stroke-width="1" stroke-dasharray="3,2"/>
+
+  <!-- ══════════════════════════════════════════
+       FSR / Pinch trigger (optional)
+  ══════════════════════════════════════════ -->
+  <rect x="520" y="250" width="130" height="70" rx="6" fill="#1f2937" stroke="#a78bfa" stroke-width="1.5" stroke-dasharray="6,3"/>
+  <text x="585" y="270" fill="#a78bfa" font-size="10" font-weight="bold" text-anchor="middle">FSR Pad</text>
+  <text x="585" y="284" fill="#8b949e" font-size="8" text-anchor="middle">force sensitive resistor</text>
+  <text x="585" y="298" fill="#8b949e" font-size="8" text-anchor="middle">finger pinch → capture gate</text>
+  <text x="585" y="312" fill="#818cf8" font-size="8" text-anchor="middle">→ XIAO D0 (analog)</text>
+
+  <!-- FSR wire -->
+  <polyline points="440,202 490,202 490,285 520,285" fill="none" stroke="#818cf8" stroke-width="1" stroke-dasharray="3,2"/>
+
+  <!-- ══════════════════════════════════════════
+       I2C bus label
+  ══════════════════════════════════════════ -->
+  <rect x="248" y="155" width="6" height="42" rx="2" fill="#fbbf24" opacity="0.3"/>
+  <text x="242" y="145" fill="#fbbf24" font-size="8" text-anchor="middle">I2C</text>
+  <text x="242" y="155" fill="#fbbf24" font-size="8" text-anchor="middle">bus</text>
+
+  <!-- ══════════════════════════════════════════
+       JUGAAD NOTES
+  ══════════════════════════════════════════ -->
+  <rect x="20" y="440" width="860" height="160" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+  <text x="36" y="460" fill="#e2e8f0" font-size="11" font-weight="bold">Jugaad options (no custom PCB needed)</text>
+
+  <text x="36" y="482" fill="#34d399" font-size="10" font-weight="bold">① Qwiic chain</text>
+  <text x="36" y="496" fill="#8b949e" font-size="9">BNO085 Qwiic → short cable → XIAO Qwiic breakout. Zero soldering. Plug/unplug any sensor.</text>
+
+  <text x="36" y="516" fill="#f97316" font-size="10" font-weight="bold">② Magnet wire + Kapton</text>
+  <text x="36" y="530" fill="#8b949e" font-size="9">Wind 0.1mm enameled wire between pads. Kapton tape as substrate on watch strap. Flat, flexible, ~0.5mm thick.</text>
+
+  <text x="36" y="550" fill="#818cf8" font-size="10" font-weight="bold">③ Repurposed watch strap</text>
+  <text x="36" y="564" fill="#8b949e" font-size="9">Apple Watch/Mi Band replacement strap (~₹100). Cut a slot for XIAO + BNO085 near the buckle end. Hot glue to secure.</text>
+
+  <text x="36" y="584" fill="#fbbf24" font-size="10" font-weight="bold">④ JLCPCB carrier (next step)</text>
+  <text x="36" y="598" fill="#8b949e" font-size="9">Carrier PCB: XIAO castellated footprint + JST + Qwiic header. 5 boards ~₹500 shipped. KiCad → gerber → order.</text>
+
+  <!-- legend -->
+  <line x1="680" y1="460" x2="700" y2="460" stroke="#fbbf24" stroke-width="1.5" stroke-dasharray="4,2"/>
+  <text x="705" y="463" fill="#8b949e" font-size="8">SDA</text>
+  <line x1="680" y1="475" x2="700" y2="475" stroke="#f87171" stroke-width="1.5" stroke-dasharray="4,2"/>
+  <text x="705" y="478" fill="#8b949e" font-size="8">SCL</text>
+  <line x1="680" y1="490" x2="700" y2="490" stroke="#34d399" stroke-width="1.5"/>
+  <text x="705" y="493" fill="#8b949e" font-size="8">3V3</text>
+  <line x1="680" y1="505" x2="700" y2="505" stroke="#6b7280" stroke-width="1.5"/>
+  <text x="705" y="508" fill="#8b949e" font-size="8">GND</text>
+  <line x1="680" y1="520" x2="700" y2="520" stroke="#f97316" stroke-width="1.5"/>
+  <text x="705" y="523" fill="#8b949e" font-size="8">BAT+</text>
+  <rect x="678" y="530" width="22" height="10" rx="2" fill="none" stroke="#818cf8" stroke-width="1" stroke-dasharray="4,2"/>
+  <text x="705" y="538" fill="#8b949e" font-size="8">optional</text>
+
+</svg>

@@ -116,8 +116,15 @@ async def _flush(meta: dict, samples: list[dict]):
 
 
 # ── BLE ───────────────────────────────────────────────────────────────────────
-def parse_ble_payload(data: bytearray) -> Optional[tuple[float, float, float]]:
-    """Return (roll, pitch, yaw) from ASCII payload, or None."""
+def parse_ble_payload(data: bytearray) -> Optional[dict]:
+    """
+    Parse BLE notification. Returns dict with 'kind' and values, or None.
+
+    Formats:
+      raw|roll|pitch|yaw      → {kind:"imu", roll, pitch, yaw}
+      gyr|x|y|z               → {kind:"gyro", x, y, z}  (rad/s)
+      <gesture>|roll|pitch|yaw → treated same as raw
+    """
     try:
         raw = data.decode("utf-8", errors="ignore").strip().rstrip("\x00")
     except Exception:
@@ -125,12 +132,16 @@ def parse_ble_payload(data: bytearray) -> Optional[tuple[float, float, float]]:
     if not raw or raw in ("ping", "idle"):
         return None
     parts = raw.split("|")
-    if len(parts) == 4:
-        try:
-            return (float(parts[1]), float(parts[2]), float(parts[3]))
-        except ValueError:
-            pass
-    return None
+    if len(parts) != 4:
+        return None
+    try:
+        a, b, c = float(parts[1]), float(parts[2]), float(parts[3])
+    except ValueError:
+        return None
+
+    if parts[0] == "gyr":
+        return {"kind": "gyro", "x": a, "y": b, "z": c}
+    return {"kind": "imu", "roll": a, "pitch": b, "yaw": c}
 
 
 async def on_ble_notify(_sender, data: bytearray):
@@ -140,15 +151,24 @@ async def on_ble_notify(_sender, data: bytearray):
     if parsed is None:
         return
 
-    roll, pitch, yaw = parsed
-    await broadcast({"type": "sample", "roll": roll, "pitch": pitch, "yaw": yaw})
+    t_ms = int((time.monotonic() - rec_start_t) * 1000)
 
-    if rec_state == "recording":
-        rec_sample_count += 1
-        t_ms = int((time.monotonic() - rec_start_t) * 1000)
-        save_queue.put_nowait({"t": t_ms, "roll": roll, "pitch": pitch, "yaw": yaw})
-        if rec_sample_count % 50 == 0:
-            await broadcast({"type": "rec_progress", "samples": rec_sample_count, "elapsed_ms": t_ms})
+    if parsed["kind"] == "gyro":
+        await broadcast({"type": "gyro", "x": parsed["x"], "y": parsed["y"], "z": parsed["z"]})
+        if rec_state == "recording":
+            rec_sample_count += 1
+            save_queue.put_nowait({"t": t_ms, "kind": "gyro",
+                                   "x": parsed["x"], "y": parsed["y"], "z": parsed["z"]})
+    else:
+        await broadcast({"type": "sample", "roll": parsed["roll"],
+                         "pitch": parsed["pitch"], "yaw": parsed["yaw"]})
+        if rec_state == "recording":
+            rec_sample_count += 1
+            save_queue.put_nowait({"t": t_ms, "kind": "imu",
+                                   "roll": parsed["roll"], "pitch": parsed["pitch"], "yaw": parsed["yaw"]})
+
+    if rec_state == "recording" and rec_sample_count % 50 == 0:
+        await broadcast({"type": "rec_progress", "samples": rec_sample_count, "elapsed_ms": t_ms})
 
 
 async def ble_loop():
@@ -199,11 +219,16 @@ async def ble_loop():
 
 
 # ── WebSocket + HTTP ──────────────────────────────────────────────────────────
-HTML_PATH = Path(__file__).parent / "index.html"
+HTML_PATH       = Path(__file__).parent / "index.html"
+DASHBOARD_PATH  = Path(__file__).parent / "dashboard.html"
 
 
 async def handle_index(request):
     return web.FileResponse(HTML_PATH)
+
+
+async def handle_dashboard(request):
+    return web.FileResponse(DASHBOARD_PATH)
 
 
 async def handle_ws(request):
@@ -307,6 +332,41 @@ async def handle_captures(request):
     return web.json_response(result)
 
 
+async def handle_browse(request):
+    """
+    GET /browse?dir=v3
+    Returns one level of label dirs under captures/<dir>, with all session
+    samples inline. Only dirs that directly contain .json files are included
+    (no recursion into subdirs).
+    """
+    rel = request.rel_url.query.get("dir", "").strip().lstrip("/")
+    root = (CAPTURES_DIR / rel).resolve()
+
+    # Safety: must stay inside CAPTURES_DIR
+    if not str(root).startswith(str(CAPTURES_DIR.resolve())):
+        return web.Response(status=403)
+    if not root.is_dir():
+        return web.Response(status=404)
+
+    result = {}
+    for label_dir in sorted(root.iterdir()):
+        if not label_dir.is_dir():
+            continue
+        json_files = sorted(label_dir.glob("*.json"))
+        if not json_files:
+            continue  # skip dirs that have no sessions (e.g. nested v1/v2)
+        sessions = []
+        for f in json_files:
+            try:
+                sessions.append(json.loads(f.read_text()))
+            except Exception:
+                pass
+        if sessions:
+            result[label_dir.name] = sessions
+
+    return web.json_response(result)
+
+
 async def handle_session(request):
     """Return samples for a single recording session by id."""
     session_id = request.match_info["id"]
@@ -321,8 +381,10 @@ async def main():
 
     app = web.Application()
     app.router.add_get("/",               handle_index)
+    app.router.add_get("/dashboard",      handle_dashboard)
     app.router.add_get("/ws",             handle_ws)
     app.router.add_get("/captures",       handle_captures)
+    app.router.add_get("/browse",         handle_browse)
     app.router.add_get("/session/{id}",   handle_session)
 
     runner = web.AppRunner(app)

@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>WristTurn Dashboard</title>
+<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: ui-monospace, monospace;
+  background: #0e1117;
+  color: #e2e8f0;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 20px;
+  background: #161b22;
+  border-bottom: 1px solid #30363d;
+  flex-shrink: 0;
+}
+header h1 { font-size: 14px; font-weight: 600; }
+
+#controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 20px;
+  background: #161b22;
+  border-bottom: 1px solid #30363d;
+  flex-shrink: 0;
+}
+#dir-input {
+  background: #0e1117;
+  border: 1px solid #30363d;
+  border-radius: 5px;
+  color: #e2e8f0;
+  font-family: inherit;
+  font-size: 12px;
+  padding: 5px 10px;
+  width: 240px;
+  outline: none;
+}
+#dir-input:focus { border-color: #58a6ff; }
+#load-btn {
+  background: #238636;
+  border: none;
+  border-radius: 5px;
+  color: #fff;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  padding: 5px 14px;
+}
+#load-btn:hover { background: #2ea043; }
+#status { font-size: 11px; color: #8b949e; }
+
+#grid-wrap {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 20px;
+}
+
+/* Each label = one row */
+.label-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid #21262d;
+  padding-bottom: 12px;
+}
+.label-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: #e2e8f0;
+  width: 36px;
+  flex-shrink: 0;
+  padding-top: 6px;
+  text-align: center;
+}
+.sessions-row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.session-cell {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  overflow: hidden;
+  width: 200px;
+  flex-shrink: 0;
+}
+.session-cell .cell-header {
+  font-size: 9px;
+  color: #8b949e;
+  padding: 3px 6px;
+  border-bottom: 1px solid #21262d;
+}
+.session-plot { height: 140px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>WristTurn Dashboard</h1>
+</header>
+
+<div id="controls">
+  <input id="dir-input" type="text" placeholder="directory (e.g. v3, v2, or leave empty for root)">
+  <button id="load-btn">Load</button>
+  <span id="status"></span>
+</div>
+
+<div id="grid-wrap"></div>
+
+<script>
+const CELL_W = 200;
+const CELL_H = 140;
+
+const plotLayout = (hasGyro) => ({
+  paper_bgcolor: "transparent",
+  plot_bgcolor:  "#0e1117",
+  font:    { color: "#8b949e", size: 8 },
+  margin:  { t: 2, r: 2, b: 2, l: 28 },
+  showlegend: false,
+  ...(hasGyro ? {
+    grid:   { rows: 2, columns: 1, pattern: "independent" },
+    xaxis:  { showgrid: false, zeroline: false, showticklabels: false },
+    yaxis:  { gridcolor: "#21262d", domain: [0.52, 1] },
+    xaxis2: { showgrid: false, zeroline: false, showticklabels: false },
+    yaxis2: { gridcolor: "#21262d", zeroline: true, zerolinecolor: "#30363d", domain: [0, 0.48] },
+  } : {
+    xaxis: { showgrid: false, zeroline: false, showticklabels: false },
+    yaxis: { gridcolor: "#21262d" },
+  }),
+});
+
+function buildTraces(samples) {
+  const imu  = samples.filter(s => s.kind === "imu"  || (s.roll  !== undefined && s.kind !== "gyro"));
+  const gyro = samples.filter(s => s.kind === "gyro" || (s.x     !== undefined && s.kind !== "imu"));
+  const hasGyro = gyro.length > 0;
+  const traces = [];
+
+  if (imu.length) {
+    traces.push(
+      { x: imu.map(s=>s.t), y: imu.map(s=>s.roll),  mode:"lines", line:{color:"#f87171",width:1}, xaxis:"x",  yaxis:"y"  },
+      { x: imu.map(s=>s.t), y: imu.map(s=>s.pitch), mode:"lines", line:{color:"#34d399",width:1}, xaxis:"x",  yaxis:"y"  },
+      { x: imu.map(s=>s.t), y: imu.map(s=>s.yaw),   mode:"lines", line:{color:"#60a5fa",width:1}, xaxis:"x",  yaxis:"y"  },
+    );
+  }
+  if (hasGyro) {
+    const ax = hasGyro && imu.length ? "x2" : "x";
+    const ay = hasGyro && imu.length ? "y2" : "y";
+    traces.push(
+      { x: gyro.map(s=>s.t), y: gyro.map(s=>s.x), mode:"lines", line:{color:"#f97316",width:1,dash:"dot"}, xaxis:ax, yaxis:ay },
+      { x: gyro.map(s=>s.t), y: gyro.map(s=>s.y), mode:"lines", line:{color:"#a3e635",width:1,dash:"dot"}, xaxis:ax, yaxis:ay },
+      { x: gyro.map(s=>s.t), y: gyro.map(s=>s.z), mode:"lines", line:{color:"#818cf8",width:1,dash:"dot"}, xaxis:ax, yaxis:ay },
+    );
+  }
+  return { traces, hasGyro };
+}
+
+let plotSeq = 0;
+
+async function load() {
+  const dir = document.getElementById("dir-input").value.trim();
+  const status = document.getElementById("status");
+  const grid = document.getElementById("grid-wrap");
+
+  status.textContent = "loading...";
+  grid.innerHTML = "";
+
+  const url = `/browse?dir=${encodeURIComponent(dir)}`;
+  let data;
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) { status.textContent = `error ${resp.status}`; return; }
+    data = await resp.json();
+  } catch(e) {
+    status.textContent = `fetch error: ${e}`;
+    return;
+  }
+
+  const labels = Object.keys(data).sort();
+  if (!labels.length) { status.textContent = "no sessions found"; return; }
+
+  status.textContent = `${labels.length} labels`;
+
+  for (const label of labels) {
+    const sessions = data[label];
+
+    const row = document.createElement("div");
+    row.className = "label-row";
+
+    const nameEl = document.createElement("div");
+    nameEl.className = "label-name";
+    nameEl.textContent = label;
+    row.appendChild(nameEl);
+
+    const sessRow = document.createElement("div");
+    sessRow.className = "sessions-row";
+
+    for (const sess of sessions) {
+      const cell = document.createElement("div");
+      cell.className = "session-cell";
+
+      const hdr = document.createElement("div");
+      hdr.className = "cell-header";
+      hdr.textContent = `${sess.samples?.length ?? 0} samples`;
+      cell.appendChild(hdr);
+
+      const plotDiv = document.createElement("div");
+      plotDiv.className = "session-plot";
+      const plotId = `p${++plotSeq}`;
+      plotDiv.id = plotId;
+      cell.appendChild(plotDiv);
+      sessRow.appendChild(cell);
+
+      // Defer plot rendering so DOM is attached first
+      const s = sess.samples || [];
+      setTimeout(() => {
+        const { traces, hasGyro } = buildTraces(s);
+        Plotly.newPlot(plotId, traces, plotLayout(hasGyro),
+          { responsive: false, displayModeBar: false, staticPlot: true });
+      }, 0);
+    }
+
+    row.appendChild(sessRow);
+    grid.appendChild(row);
+  }
+}
+
+document.getElementById("load-btn").onclick = load;
+document.getElementById("dir-input").addEventListener("keydown", e => {
+  if (e.key === "Enter") load();
+});
+
+// Auto-load if ?dir= in URL
+const urlDir = new URLSearchParams(location.search).get("dir");
+if (urlDir !== null) {
+  document.getElementById("dir-input").value = urlDir;
+  load();
+}
+</script>
+</body>
+</html>

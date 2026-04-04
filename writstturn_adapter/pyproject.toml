@@ -12,6 +12,7 @@ dependencies = [
     "pyautogui>=0.9.54",
     "aiohttp>=3.9",
     "zeroconf>=0.131",
+    "numpy>=1.26",
     "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
     "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
 ]
