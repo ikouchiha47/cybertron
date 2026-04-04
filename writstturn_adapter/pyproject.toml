@@ -18,6 +18,7 @@ dependencies = [
 
 [project.scripts]
 wristturn = "wristturn:main"
+wristturn-collect = "wristturn.collector.server:run"
 
 [build-system]
 requires = ["hatchling"]

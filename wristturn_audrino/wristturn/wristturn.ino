@@ -30,6 +30,7 @@ BLECharacteristic gestureChar("19B10001-E8F2-537E-4F6C-D104768A1214",
 // thresholdChar: float, gesture trigger angle in degrees
 // debounceChar:  uint32, minimum ms between gestures
 // deadzoneChar:  float, return-to-neutral zone in degrees before re-arm
+// rawModeChar:   uint8, 0=gesture-only (default), 1=stream raw IMU on every rotation vector event
 BLEService        settingsService("19B10010-E8F2-537E-4F6C-D104768A1214");
 BLECharacteristic thresholdChar("19B10011-E8F2-537E-4F6C-D104768A1214",
                                  BLERead | BLEWrite, 4);
@@ -37,6 +38,8 @@ BLECharacteristic debounceChar("19B10012-E8F2-537E-4F6C-D104768A1214",
                                 BLERead | BLEWrite, 4);
 BLECharacteristic deadzoneChar("19B10013-E8F2-537E-4F6C-D104768A1214",
                                 BLERead | BLEWrite, 4);
+BLECharacteristic rawModeChar("19B10014-E8F2-537E-4F6C-D104768A1214",
+                               BLERead | BLEWrite, 1);
 
 // ── IMU ──────────────────────────────────────────────────────────────────────
 BNO08x imu;
@@ -47,6 +50,9 @@ float         deadzoneDegs  =  5.0f;  // degrees to return within before re-arm
 unsigned long debounceMs    =  200;   // min ms between gestures
 
 // ── State ────────────────────────────────────────────────────────────────────
+bool    rawMode        = false; // stream raw IMU on every rotation vector event
+
+
 float   baseRoll       = 0.0f;
 float   basePitch      = 0.0f;
 float   baseYaw        = 0.0f;
@@ -149,6 +155,13 @@ void onDebounceWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, u
   }
 }
 
+void onRawModeWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
+  if (len == 1) {
+    rawMode = (data[0] != 0);
+    LOG_I("[Settings] rawMode=%d", rawMode);
+  }
+}
+
 void onDeadzoneWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
   if (len == 4) {
     float val;
@@ -244,6 +257,14 @@ void setup() {
   deadzoneChar.setWriteCallback(onDeadzoneWrite);
   deadzoneChar.begin();
   deadzoneChar.write(&deadzoneDegs, 4);
+
+  rawModeChar.setProperties(CHR_PROPS_READ | CHR_PROPS_WRITE);
+  rawModeChar.setPermission(SECMODE_OPEN, SECMODE_OPEN);
+  rawModeChar.setFixedLen(1);
+  rawModeChar.setWriteCallback(onRawModeWrite);
+  rawModeChar.begin();
+  uint8_t rm = 0;
+  rawModeChar.write(&rm, 1);
 
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
   Bluefruit.Advertising.addTxPower();
@@ -343,6 +364,13 @@ void loop() {
       LOG_D("[IMU] roll=%.1f  pitch=%.1f  yaw=%.1f  dR=%.1f  dP=%.1f  dY=%.1f  armed=%d%d%d",
             roll, pitch, yaw, dRoll, dPitch, dYaw,
             rollArmed, pitchArmed, yawArmed);
+
+      // ── Raw stream mode (for data collection) ────────────────────────────
+      if (rawMode && Bluefruit.Periph.connected()) {
+        char buf[40] = {};
+        snprintf(buf, sizeof(buf), "raw|%.1f|%.1f|%.1f", roll, pitch, yaw);
+        gestureChar.notify(buf, 40);
+      }
 
       // ── Deadzone re-arm check ─────────────────────────────────────────────
       // Once a gesture fires on an axis, the axis is disarmed.
