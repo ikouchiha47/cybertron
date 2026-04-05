@@ -49,7 +49,7 @@ function InferenceIndicator({ active }: { active: boolean }) {
 }
 
 export default function MonitorScreen({ ip, onOpenSettings }: Props) {
-  const [gammaOn, setGammaOn] = useState(false);
+  const [gammaOn, setGammaOn] = useState(true); // firmware default: raw_gma=1
   const { result, modelReady, inferring } = usePersonDetection(gammaOn);
   // const result = { personCount: 1, nearness: 'close' as const, candidates: [{ score: 0.72, boxH: 0.5 }, { score: 0.45, boxH: 0.3 }] }; // MOCK
   const color = NEARNESS_COLOR[result.nearness];

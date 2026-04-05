@@ -2,6 +2,8 @@
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <ESPmDNS.h>
+#include <ArduinoOTA.h>
+#include <Preferences.h>
 
 // ===========================
 // Select camera model in board_config.h
@@ -48,7 +50,7 @@ void setup() {
   //                      for larger pre-allocated frame buffer.
   if (config.pixel_format == PIXFORMAT_JPEG) {
     if (psramFound()) {
-      config.jpeg_quality = 10;
+      config.jpeg_quality = 20;
       config.fb_count = 2;
       config.grab_mode = CAMERA_GRAB_LATEST;
     } else {
@@ -77,15 +79,15 @@ void setup() {
   }
 
   sensor_t *s = esp_camera_sensor_get();
-  // initial sensors are flipped vertically and colors are a bit saturated
   if (s->id.PID == OV3660_PID) {
-    s->set_vflip(s, 1);        // flip it back
-    s->set_brightness(s, 1);   // up the brightness just a bit
-    s->set_saturation(s, -2);  // lower the saturation
+    s->set_vflip(s, 1);
+    s->set_brightness(s, 1);
+    s->set_saturation(s, -2);
+    s->set_sharpness(s, 1);
+    s->set_raw_gma(s, 1);   // hardware gamma on — matches camera status defaults
   }
-  // drop down frame size for higher initial frame rate
   if (config.pixel_format == PIXFORMAT_JPEG) {
-    s->set_framesize(s, FRAMESIZE_QVGA);
+    s->set_framesize(s, FRAMESIZE_HVGA);  // 480x320, framesize=6 from /status
   }
 
 #if defined(CAMERA_MODEL_M5STACK_WIDE) || defined(CAMERA_MODEL_M5STACK_ESP32CAM)
@@ -105,16 +107,68 @@ void setup() {
   // WiFiManager: on first boot starts "DoorCam-Setup" hotspot.
   // Connect from your phone, enter WiFi credentials — saved to flash.
   // To reconfigure: hold reset for 3s (or call wm.resetSettings()).
-  WiFiManager wm;
   WiFi.setSleep(false);
 
-  bool connected = wm.autoConnect("DoorCam-Setup");
-  if (!connected) {
-    Serial.println("WiFi connection failed — restarting");
-    delay(3000);
-    ESP.restart();
+  Preferences prefs;
+
+  // --- Phase 1: try saved credentials (normal boot, fast) ---
+  WiFi.begin();
+  bool connected = WiFi.waitForConnectResult(8000) == WL_CONNECTED;
+  if (connected) {
+    Serial.println("WiFi connected (saved credentials)");
   }
-  Serial.println("WiFi connected");
+
+  // --- Phase 2: SmartConfig (phone broadcasts SSID+pass, all cameras pick it up) ---
+  if (!connected) {
+    Serial.println("Starting SmartConfig — use ESP-TOUCH app on your phone (60s timeout)...");
+    WiFi.beginSmartConfig();
+    int elapsed = 0;
+    while (!WiFi.smartConfigDone() && elapsed < 60000) {
+      delay(500);
+      elapsed += 500;
+    }
+    if (WiFi.smartConfigDone()) {
+      if (WiFi.waitForConnectResult(8000) == WL_CONNECTED) {
+        connected = true;
+        Serial.println("WiFi connected via SmartConfig");
+      }
+    } else {
+      WiFi.stopSmartConfig();
+      Serial.println("SmartConfig timed out — falling back to portal");
+    }
+  }
+
+  // --- Phase 3: WiFiManager captive portal (last resort, single camera setup) ---
+  if (!connected) {
+    WiFiManager wm;
+    char apName[32];
+    snprintf(apName, sizeof(apName), "DoorCam-%06llX", ESP.getEfuseMac() & 0xFFFFFF);
+
+    // Custom field to set OTA password during portal provisioning
+    WiFiManagerParameter ota_pass_param("ota_pass", "OTA Password", "", 32, "type='password'");
+    wm.addParameter(&ota_pass_param);
+
+    connected = wm.autoConnect(apName);
+    if (!connected) {
+      Serial.println("WiFi connection failed — restarting");
+      delay(3000);
+      ESP.restart();
+    }
+    Serial.println("WiFi connected via portal");
+
+    // Save OTA password to NVS if entered in portal
+    if (strlen(ota_pass_param.getValue()) > 0) {
+      prefs.begin("doorcam", false);
+      prefs.putString("ota_pass", ota_pass_param.getValue());
+      prefs.end();
+      Serial.println("OTA password saved to NVS");
+    }
+  }
+
+  // Read OTA password from NVS
+  prefs.begin("doorcam", true);
+  String otaPass = prefs.getString("ota_pass", "");
+  prefs.end();
 
   // Use last 3 bytes of MAC as unique suffix e.g. "doorcam-a1b2c3.local"
   String mac = WiFi.macAddress();
@@ -133,6 +187,21 @@ void setup() {
     Serial.println(".local");
   }
 
+  // OTA — reuses the mDNS hostname so it shows as "doorcam-a1b2c3" in Arduino IDE
+  ArduinoOTA.setHostname(hostname.c_str());
+  if (otaPass.length() > 0) {
+    ArduinoOTA.setPassword(otaPass.c_str());
+  }
+  ArduinoOTA
+    .onStart([]()  { Serial.println("OTA start"); })
+    .onEnd([]()    { Serial.println("OTA end — rebooting"); })
+    .onProgress([](unsigned int p, unsigned int t) {
+      Serial.printf("OTA %u%%\n", p / (t / 100));
+    })
+    .onError([](ota_error_t e) { Serial.printf("OTA error %u\n", e); });
+  ArduinoOTA.begin();
+  Serial.println("OTA ready");
+
   startCameraServer();
 
   Serial.print("Camera Ready! Use 'http://");
@@ -141,6 +210,6 @@ void setup() {
 }
 
 void loop() {
-  // Do nothing. Everything is done in another task by the web server
-  delay(10000);
+  ArduinoOTA.handle();
+  delay(1000);
 }
