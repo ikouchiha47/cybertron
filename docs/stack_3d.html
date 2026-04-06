@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>WristTurn — Sandwich Stack 3D</title>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/renderers/CSS2DRenderer.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0e1117; overflow: hidden; font-family: ui-monospace, monospace; }
+canvas { display: block; }
+#info  { position:absolute;top:14px;left:16px;color:#e2e8f0;font-size:13px;font-weight:600;pointer-events:none; }
+#hint  { position:absolute;top:34px;left:16px;color:#4b5563;font-size:10px;pointer-events:none; }
+#legend{ position:absolute;bottom:16px;left:16px;font-size:10px;line-height:2; }
+.li { display:flex;align-items:center;gap:8px;color:#8b949e; }
+.dot{ width:9px;height:9px;border-radius:2px;flex-shrink:0; }
+/* CSS2D labels */
+.layer-label {
+  color:#e2e8f0; font-size:10px; font-family:ui-monospace,monospace;
+  white-space:nowrap; line-height:1.6;
+  background:rgba(14,17,23,0.88); padding:3px 8px; border-radius:4px;
+}
+</style>
+</head>
+<body>
+<div id="info">WristTurn — Sandwich Stack</div>
+<div id="hint">drag to rotate · scroll to zoom · right-drag to pan</div>
+<div id="legend">
+  <div class="li"><div class="dot" style="background:#16a34a"></div> BNO085 breakout · 20×18×3 mm (toward skin)</div>
+  <div class="li"><div class="dot" style="background:#94a3b8"></div> Foam spacer · 21×18×5 mm</div>
+  <div class="li"><div class="dot" style="background:#2563eb"></div> XIAO nRF52840 · 21×17.5×3.5 mm</div>
+  <div class="li"><div class="dot" style="background:#f97316"></div> LiPo 150mAh · 30×25×3 mm (outermost)</div>
+  <div class="li"><div class="dot" style="background:#fbbf24"></div> 4× jumper wires · SDA SCL 3V3 GND</div>
+</div>
+
+<script>
+(function () {
+  // ── renderer ────────────────────────────────────────────────────────────────
+  var renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  document.body.appendChild(renderer.domElement);
+
+  var labelRenderer = new THREE.CSS2DRenderer();
+  labelRenderer.setSize(window.innerWidth, window.innerHeight);
+  labelRenderer.domElement.style.cssText = 'position:absolute;top:0;pointer-events:none';
+  document.body.appendChild(labelRenderer.domElement);
+
+  // ── scene / camera ──────────────────────────────────────────────────────────
+  var scene  = new THREE.Scene();
+  scene.background = new THREE.Color(0x0e1117);
+  scene.fog = new THREE.Fog(0x0e1117, 180, 320);
+
+  var camera = new THREE.PerspectiveCamera(42, window.innerWidth / window.innerHeight, 0.1, 500);
+  camera.position.set(70, 55, 90);
+
+  var controls = new THREE.OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.06;
+  controls.target.set(0, 12, 0);
+  controls.minDistance = 30;
+  controls.maxDistance = 200;
+
+  // ── lighting ────────────────────────────────────────────────────────────────
+  scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+
+  var sun = new THREE.DirectionalLight(0xffffff, 1.1);
+  sun.position.set(60, 90, 60);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048);
+  sun.shadow.camera.near = 1;
+  sun.shadow.camera.far  = 300;
+  sun.shadow.camera.left = sun.shadow.camera.bottom = -60;
+  sun.shadow.camera.right = sun.shadow.camera.top   =  60;
+  scene.add(sun);
+
+  var fill = new THREE.DirectionalLight(0x6688cc, 0.35);
+  fill.position.set(-40, 30, -40);
+  scene.add(fill);
+
+  // ── helpers ─────────────────────────────────────────────────────────────────
+  function stdMat(hex, rough, metal) {
+    return new THREE.MeshStandardMaterial({ color: hex, roughness: rough || 0.45, metalness: metal || 0.05 });
+  }
+
+  function box(w, h, d, mat) {
+    var m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+    m.castShadow = true; m.receiveShadow = true;
+    return m;
+  }
+
+  function addEdges(mesh, col) {
+    var eg = new THREE.EdgesGeometry(mesh.geometry);
+    var lm = new THREE.LineBasicMaterial({ color: col || 0x1f2937, transparent: true, opacity: 0.65 });
+    mesh.add(new THREE.LineSegments(eg, lm));
+  }
+
+  function makeLabel(html, borderColor) {
+    var div = document.createElement('div');
+    div.className = 'layer-label';
+    div.style.borderLeft = '2px solid ' + borderColor;
+    div.innerHTML = html;
+    return new THREE.CSS2DObject(div);
+  }
+
+  // ── wrist cylinder (context) ─────────────────────────────────────────────────
+  var wristGeo = new THREE.CylinderGeometry(18, 18, 55, 48, 1, false, 0, Math.PI);
+  var wristMat = new THREE.MeshStandardMaterial({ color: 0xc8956c, roughness: 0.9, side: THREE.BackSide });
+  var wrist = new THREE.Mesh(wristGeo, wristMat);
+  wrist.rotation.z = Math.PI / 2;
+  wrist.position.set(0, -18, 0);
+  scene.add(wrist);
+
+  // ── watch strap ──────────────────────────────────────────────────────────────
+  var strap = box(52, 2.5, 24, stdMat(0x1c1c1c, 0.95, 0));
+  strap.position.y = 1.25;
+  addEdges(strap, 0x374151);
+  scene.add(strap);
+  var strapLbl = makeLabel(
+    '<strong style="color:#94a3b8">Watch strap</strong><br><span style="font-size:9px;color:#4b5563">52 × 24 × 2.5 mm</span>',
+    '#374151'
+  );
+  strapLbl.position.set(29, 0, 0);
+  strap.add(strapLbl);
+
+  // ── stack ────────────────────────────────────────────────────────────────────
+  var yBase = 2.5;  // top of strap
+
+  // ─ BNO085 (closest to skin) ─
+  var bnoH = 3;
+  var bno  = box(20, bnoH, 18, stdMat(0x166534));
+  bno.position.y = yBase + bnoH / 2;
+  addEdges(bno, 0x16a34a);
+  scene.add(bno);
+  // BNO085 SoC chip
+  var bnoChip = box(6, 1.2, 6, stdMat(0x052e16, 0.2, 0.5));
+  bnoChip.position.set(0, yBase + bnoH + 0.6, 0);
+  scene.add(bnoChip);
+  var bnoLbl = makeLabel(
+    '<strong style="color:#4ade80">BNO085</strong><br><span style="font-size:9px;color:#4b5563">20×18×3mm · I2C 0x4A</span>',
+    '#16a34a'
+  );
+  bnoLbl.position.set(13, 0, 0);
+  bno.add(bnoLbl);
+  yBase += bnoH;
+
+  // ─ Foam spacer ─
+  var spH = 5;
+  var spacer = box(21, spH, 18, new THREE.MeshStandardMaterial({
+    color: 0x475569, roughness: 0.95, transparent: true, opacity: 0.65
+  }));
+  spacer.position.y = yBase + spH / 2;
+  addEdges(spacer, 0x94a3b8);
+  scene.add(spacer);
+  var spLbl = makeLabel(
+    '<strong style="color:#94a3b8">Foam spacer</strong><br><span style="font-size:9px;color:#4b5563">5 mm · isolation gap</span>',
+    '#94a3b8'
+  );
+  spLbl.position.set(14, 0, 0);
+  spacer.add(spLbl);
+  yBase += spH;
+
+  // ─ XIAO nRF52840 ─
+  var xiaoH = 3.5;
+  var xiao  = box(21, xiaoH, 17.5, stdMat(0x1e40af));
+  xiao.position.y = yBase + xiaoH / 2;
+  addEdges(xiao, 0x3b82f6);
+  scene.add(xiao);
+  // SoC
+  var soc = box(5.5, 1.5, 5.5, stdMat(0x0f172a, 0.2, 0.6));
+  soc.position.set(-2, yBase + xiaoH + 0.75, 0);
+  scene.add(soc);
+  // Antenna trace
+  var ant = box(5, 0.4, 1, stdMat(0xfbbf24, 0.3, 0.8));
+  ant.position.set(9, yBase + xiaoH, -4);
+  scene.add(ant);
+  // USB-C stub
+  var usb = box(2.5, 1.5, 3, stdMat(0x60a5fa, 0.3, 0.7));
+  usb.position.set(0, yBase + xiaoH / 2, 17.5 / 2 + 1);
+  scene.add(usb);
+  var xiaoLbl = makeLabel(
+    '<strong style="color:#60a5fa">XIAO nRF52840</strong><br><span style="font-size:9px;color:#4b5563">21×17.5×3.5mm · BLE 5.0</span>',
+    '#2563eb'
+  );
+  xiaoLbl.position.set(14, 0, 0);
+  xiao.add(xiaoLbl);
+  var xiaoBottomY = yBase;
+  yBase += xiaoH;
+
+  // ─ 4× jumper wires along the left side ─
+  var wireDefs = [
+    { color: 0xfbbf24, z: -5 },  // SDA
+    { color: 0xf87171, z: -3 },  // SCL
+    { color: 0x34d399, z: -1 },  // 3V3
+    { color: 0x6b7280, z:  1 },  // GND
+  ];
+  var xSide = -12;
+  var bnoTopY = 2.5 + bnoH;
+
+  wireDefs.forEach(function (w) {
+    var pts = [
+      new THREE.Vector3(xSide + 2, bnoTopY, w.z),
+      new THREE.Vector3(xSide,     bnoTopY + 1.5, w.z),
+      new THREE.Vector3(xSide,     xiaoBottomY - 1.5, w.z),
+      new THREE.Vector3(xSide + 2, xiaoBottomY, w.z),
+    ];
+    var curve  = new THREE.CatmullRomCurve3(pts);
+    var tubeGeo = new THREE.TubeGeometry(curve, 12, 0.35, 5, false);
+    var tube   = new THREE.Mesh(tubeGeo, new THREE.MeshStandardMaterial({ color: w.color, roughness: 0.5 }));
+    scene.add(tube);
+  });
+
+  var wireLblObj = new THREE.Object3D();
+  wireLblObj.position.set(xSide - 4, (bnoTopY + xiaoBottomY) / 2, 0);
+  scene.add(wireLblObj);
+  wireLblObj.add(makeLabel(
+    '<strong style="color:#fbbf24">SDA · SCL · 3V3 · GND</strong><br><span style="font-size:9px;color:#4b5563">4× jumper wires</span>',
+    '#fbbf24'
+  ));
+
+  // ─ LiPo battery (outermost) ─
+  var lipoH = 3;
+  var lipo  = box(30, lipoH, 25, stdMat(0xc2410c, 0.6, 0.1));
+  lipo.position.y = yBase + lipoH / 2;
+  addEdges(lipo, 0xf97316);
+  scene.add(lipo);
+  // JST connector stub
+  var jst = box(2.5, 2, 5, stdMat(0xf97316, 0.5, 0.1));
+  jst.position.set(16, yBase + lipoH / 2, 0);
+  scene.add(jst);
+  // Label strip
+  var strip = box(28, 0.3, 23, stdMat(0x111827, 0.9, 0));
+  strip.position.set(0, yBase + lipoH + 0.15, 0);
+  scene.add(strip);
+  var lipoLbl = makeLabel(
+    '<strong style="color:#fb923c">LiPo 150mAh</strong><br><span style="font-size:9px;color:#4b5563">30×25×3mm · 3.7V JST PH2.0</span>',
+    '#f97316'
+  );
+  lipoLbl.position.set(18, 0, 0);
+  lipo.add(lipoLbl);
+  yBase += lipoH;
+
+  // ─ Total height callout ─
+  var stackH = yBase - 2.5;
+  var totalObj = new THREE.Object3D();
+  totalObj.position.set(-22, 2.5 + stackH / 2, 0);
+  scene.add(totalObj);
+  totalObj.add(makeLabel(
+    '<span style="color:#60a5fa">stack ≈ ' + stackH + 'mm</span><br><span style="font-size:9px;color:#4b5563">excl. strap</span>',
+    '#60a5fa'
+  ));
+
+  // ── ground grid ──────────────────────────────────────────────────────────────
+  var grid = new THREE.GridHelper(140, 28, 0x1e293b, 0x1e293b);
+  grid.position.y = -0.5;
+  scene.add(grid);
+
+  // ── resize ───────────────────────────────────────────────────────────────────
+  window.addEventListener('resize', function () {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    labelRenderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  // ── animate ──────────────────────────────────────────────────────────────────
+  (function animate() {
+    requestAnimationFrame(animate);
+    controls.update();
+    renderer.render(scene, camera);
+    labelRenderer.render(scene, camera);
+  })();
+})();
+</script>
+</body>
+</html>

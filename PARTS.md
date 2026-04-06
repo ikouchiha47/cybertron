@@ -19,3 +19,8 @@ Software:
 Audrino IDE;
 
 - https://wiki.seeedstudio.com/XIAO_BLE/
+
+Arduino Libraries:
+
+- SparkFun BNO08x Arduino Library  (used by wristturn_bno085.ino.bkp)
+- Seeed Arduino LSM6DS3             (used by wristturn.ino — onboard IMU)
