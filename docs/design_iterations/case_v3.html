@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>WristTurn — Case v3 (BNO085 Qwiic + XIAO back-to-back)</title>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/renderers/CSS2DRenderer.js"></script>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#0e1117; overflow:hidden; font-family:ui-monospace,monospace; }
+canvas { display:block; }
+#info  { position:absolute; top:14px; left:16px; color:#e2e8f0; font-size:13px; font-weight:600; pointer-events:none; }
+#hint  { position:absolute; top:32px; left:16px; color:#4b5563; font-size:10px; pointer-events:none; }
+#controls { position:absolute; bottom:20px; left:16px; display:flex; gap:8px; flex-wrap:wrap; max-width:480px; }
+.btn {
+  background:#1f2937; border:1px solid #374151; color:#e2e8f0;
+  font-family:ui-monospace,monospace; font-size:11px;
+  padding:6px 12px; border-radius:4px; cursor:pointer;
+}
+.btn:hover { background:#374151; }
+.btn.active { border-color:#3b82f6; color:#60a5fa; }
+#dims {
+  position:absolute; top:14px; right:16px;
+  color:#cbd5e1; font-size:10px; line-height:2;
+  background:rgba(14,17,23,0.88); padding:10px 14px; border-radius:6px;
+  min-width:230px;
+}
+#dims .section { color:#e2e8f0; font-weight:600; margin-top:6px; margin-bottom:2px; }
+#dims .delta-good { color:#4ade80; }
+#dims .delta-same { color:#94a3b8; }
+.layer-label {
+  color:#e2e8f0; font-size:10px; font-family:ui-monospace,monospace;
+  white-space:nowrap; line-height:1.6;
+  background:rgba(14,17,23,0.88); padding:3px 8px; border-radius:4px;
+}
+</style>
+</head>
+<body>
+<div id="info">WristTurn — Case v3</div>
+<div id="hint">drag · scroll · right-drag pan</div>
+
+<div id="dims">
+  <div class="section">Case v3 — back-to-back stack</div>
+  <div>Inner cavity:  26 × 30 × 11.5 mm</div>
+  <div>Wall:          1.5 mm</div>
+  <div>Outer body:    29 × 33 × 14.5 mm</div>
+  <div>Strap slot:    22 × 3 mm (each side)</div>
+  <div>USB-C cutout:  9 × 4 mm (+Z face)</div>
+
+  <div class="section" style="margin-top:10px">vs case v2 (35×30×16mm)</div>
+  <div>Width:  35→29 mm <span class="delta-good">−6mm ✓</span></div>
+  <div>Height: 16→14.5 mm <span class="delta-good">−1.5mm ✓</span></div>
+  <div>Depth:  30→33 mm <span class="delta-same">+3mm (battery)</span></div>
+
+  <div class="section" style="margin-top:10px">Stack layers</div>
+  <div>LiPo 502030:   30×20×5 mm  200mAh</div>
+  <div>BNO085 Qwiic:  25.4×17.8×2.5 mm</div>
+  <div>Qwiic gap:     0.5 mm</div>
+  <div>XIAO nRF52840: 21×17.5×3.5 mm</div>
+  <div style="border-top:1px solid #374151;margin-top:4px;padding-top:4px">
+    Inner stack:   <strong>11.5 mm</strong>
+  </div>
+</div>
+
+<div id="controls">
+  <button class="btn active" id="btnStack"   onclick="toggleStack()">Stack</button>
+  <button class="btn active" id="btnShell"   onclick="toggleShell()">Shell</button>
+  <button class="btn"        id="btnExplode" onclick="toggleExplode()">Explode</button>
+  <button class="btn"        id="btnSection" onclick="toggleSection()">Cross-section</button>
+  <button class="btn"        id="btnWrist"   onclick="toggleWrist()">Wrist</button>
+  <button class="btn"        id="btnRender"  onclick="toggleRender()">Rendered</button>
+</div>
+
+<script>
+(function () {
+
+  // ── scene setup ─────────────────────────────────────────────────────────────
+  var renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  document.body.appendChild(renderer.domElement);
+
+  var labelRenderer = new THREE.CSS2DRenderer();
+  labelRenderer.setSize(window.innerWidth, window.innerHeight);
+  labelRenderer.domElement.style.cssText = 'position:absolute;top:0;pointer-events:none';
+  document.body.appendChild(labelRenderer.domElement);
+
+  var scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0e1117);
+  scene.fog = new THREE.Fog(0x0e1117, 180, 320);
+
+  var camera = new THREE.PerspectiveCamera(42, innerWidth / innerHeight, 0.1, 500);
+  camera.position.set(70, 55, 90);
+
+  var controls = new THREE.OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true; controls.dampingFactor = 0.06;
+  controls.target.set(0, 12, 0);
+  controls.minDistance = 30; controls.maxDistance = 250;
+
+  // lighting — schematic
+  var ambLight = new THREE.AmbientLight(0xffffff, 0.55);
+  scene.add(ambLight);
+  var sun = new THREE.DirectionalLight(0xffffff, 1.1);
+  sun.position.set(60, 90, 60); sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048);
+  sun.shadow.camera.left = sun.shadow.camera.bottom = -60;
+  sun.shadow.camera.right = sun.shadow.camera.top = 60;
+  scene.add(sun);
+  var fill = new THREE.DirectionalLight(0x6688cc, 0.35);
+  fill.position.set(-40, 30, -40); scene.add(fill);
+
+  // lighting — rendered
+  var sunR = new THREE.DirectionalLight(0xfff4e0, 1.6);
+  sunR.position.set(50, 100, 40); sunR.castShadow = true;
+  sunR.shadow.mapSize.set(4096, 4096);
+  sunR.shadow.camera.left = sunR.shadow.camera.bottom = -60;
+  sunR.shadow.camera.right = sunR.shadow.camera.top = 60;
+  sunR.shadow.bias = -0.001; sunR.visible = false; scene.add(sunR);
+  var hemi = new THREE.HemisphereLight(0xddeeff, 0x222222, 0.7);
+  hemi.visible = false; scene.add(hemi);
+  var rim = new THREE.DirectionalLight(0x88aaff, 0.5);
+  rim.position.set(-60, 20, -60); rim.visible = false; scene.add(rim);
+  var ground = new THREE.Mesh(
+    new THREE.PlaneGeometry(200, 200),
+    new THREE.MeshStandardMaterial({ color: 0x111827, roughness: 0.9 })
+  );
+  ground.rotation.x = -Math.PI / 2; ground.position.y = -0.6;
+  ground.receiveShadow = true; ground.visible = false; scene.add(ground);
+
+  var grid = new THREE.GridHelper(140, 28, 0x1e293b, 0x1e293b);
+  grid.position.y = -0.5; scene.add(grid);
+
+  window.addEventListener('resize', function () {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+    labelRenderer.setSize(innerWidth, innerHeight);
+  });
+
+  // ── helpers ──────────────────────────────────────────────────────────────────
+  function mat(hex, rough, metal, opts) {
+    var o = opts || {};
+    return new THREE.MeshStandardMaterial({
+      color: hex, roughness: rough !== undefined ? rough : 0.45,
+      metalness: metal !== undefined ? metal : 0.05,
+      transparent: o.transparent || false, opacity: o.opacity !== undefined ? o.opacity : 1,
+      side: o.side || THREE.FrontSide, depthWrite: o.depthWrite !== undefined ? o.depthWrite : true
+    });
+  }
+
+  function box(w, h, d, m) {
+    var mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m);
+    mesh.castShadow = true; mesh.receiveShadow = true;
+    return mesh;
+  }
+
+  function edges(mesh, col) {
+    var eg = new THREE.EdgesGeometry(mesh.geometry);
+    mesh.add(new THREE.LineSegments(eg, new THREE.LineBasicMaterial({ color: col || 0x374151, transparent: true, opacity: 0.7 })));
+  }
+
+  function label(html, border) {
+    var d = document.createElement('div');
+    d.className = 'layer-label';
+    d.style.borderLeft = '2px solid ' + (border || '#4b5563');
+    d.innerHTML = html;
+    return new THREE.CSS2DObject(d);
+  }
+
+  // ── constants ────────────────────────────────────────────────────────────────
+  var WALL     = 1.5;
+  var IN_W     = 26;    // X — inner cavity width (battery side = 20, BNO085 = 25.4 → drive to 26)
+  var IN_D     = 30;    // Z — inner cavity depth (battery length = 30mm drives this)
+  var IN_H     = 11.5;  // Y — inner cavity height
+  var OUT_W    = IN_W + WALL * 2;   // 29
+  var OUT_D    = IN_D + WALL * 2;   // 33
+  var OUT_H    = IN_H + WALL * 2;   // 14.5
+  var CASE_Y0  = 2.5;   // case bottom = strap top
+
+  // Board / component dimensions
+  var BNO_W = 25.4, BNO_D = 17.8, BNO_PCB = 1.0, BNO_COMP = 1.5;  // BNO085 breakout
+  var XIAO_W = 21,  XIAO_D = 17.5, XIAO_H = 3.5;                    // XIAO nRF52840
+  var BATT_W = 20,  BATT_D = 30,   BATT_H = 5;                       // 502030 LiPo
+
+  // Stack Y positions (from inner floor)
+  var yFloor  = CASE_Y0 + WALL;            // 4.0
+  var yBattB  = yFloor;                    // 4.0   battery bottom
+  var yBattT  = yBattB + BATT_H;           // 9.0   battery top
+  var bnoPcbB = yBattT;                    // 9.0   BNO085 PCB bottom
+  var bnoPcbT = bnoPcbB + BNO_PCB;         // 10.0  BNO085 PCB top
+  var bnoCompT= bnoPcbT + BNO_COMP;        // 11.5  BNO085 components top
+  var gap     = 0.5;
+  var xiaoB   = bnoCompT + gap;            // 12.0  XIAO bottom
+  var xiaoT   = xiaoB + XIAO_H;            // 15.5  XIAO top
+
+  // ── groups ───────────────────────────────────────────────────────────────────
+  var stackGroup = new THREE.Group();
+  var shellGroup = new THREE.Group();
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // STACK — boards and battery
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // Watch strap
+  var strapMesh = box(52, 2.5, 24, mat(0x1c1c1c, 0.95, 0));
+  strapMesh.position.y = 1.25;
+  edges(strapMesh, 0x374151);
+  scene.add(strapMesh);
+  var strapLbl = label('<strong style="color:#94a3b8">Watch strap</strong><br><span style="font-size:9px;color:#4b5563">52×24×2.5mm</span>', '#374151');
+  strapLbl.position.set(29, 0, 0); strapMesh.add(strapLbl);
+
+  // ── LiPo 502030 ──
+  var battMesh = box(BATT_W, BATT_H, BATT_D, mat(0x7f1d1d, 0.55, 0.1));
+  battMesh.position.set(0, yBattB + BATT_H / 2, 0);
+  edges(battMesh, 0xef4444);
+  stackGroup.add(battMesh);
+  // battery label stripe
+  var battStripe = box(BATT_W + 0.1, 1.5, BATT_D + 0.1, mat(0xef4444, 0.4, 0.05));
+  battStripe.position.set(0, yBattB + BATT_H / 2, 0);
+  stackGroup.add(battStripe);
+  // JST connector
+  var jst = box(3, 2, 5, mat(0xfbbf24, 0.4, 0.1));
+  jst.position.set(BATT_W / 2 + 1.5, yBattB + 2, 0);
+  stackGroup.add(jst);
+  var battLbl = label('<strong style="color:#f87171">LiPo 502030</strong><br><span style="font-size:9px;color:#4b5563">30×20×5mm · 200mAh · 3.7V</span>', '#ef4444');
+  battLbl.position.set(14, 0, 0); battMesh.add(battLbl);
+
+  // ── BNO085 Qwiic breakout ──
+  var bnoMat = mat(0x14532d, 0.45, 0.05);
+  var bnoPcb = box(BNO_W, BNO_PCB, BNO_D, bnoMat);
+  bnoPcb.position.set(0, bnoPcbB + BNO_PCB / 2, 0);
+  edges(bnoPcb, 0x4ade80);
+  stackGroup.add(bnoPcb);
+
+  // BNO085 chip (QFN-28, ~3.8×3.8mm)
+  var bnoChip = box(3.8, 1.4, 3.8, mat(0x0f172a, 0.15, 0.7));
+  bnoChip.position.set(-2, bnoPcbT + 0.7, 0);
+  stackGroup.add(bnoChip);
+
+  // Decoupling caps on BNO085 board (small white smd)
+  [-7, -4, 0, 4, 7].forEach(function(xo) {
+    var cap = box(0.8, 0.6, 1.2, mat(0xf1f5f9, 0.3, 0.1));
+    cap.position.set(xo, bnoPcbT + 0.3, -6);
+    stackGroup.add(cap);
+  });
+
+  // Qwiic connector on BNO085 (SM04B-SRSS, 4-pin, 1mm pitch)
+  var qwiicBno = box(5, 2, 3, mat(0xfbbf24, 0.4, 0.15));
+  qwiicBno.position.set(-8, bnoPcbT + 1, BNO_D / 2);
+  stackGroup.add(qwiicBno);
+
+  var bnoLbl = label(
+    '<strong style="color:#4ade80">BNO085 Qwiic breakout</strong><br>' +
+    '<span style="font-size:9px;color:#4b5563">25.4×17.8mm · 9DOF fused · onboard SH-2</span>',
+    '#4ade80'
+  );
+  bnoLbl.position.set(16, 0, 0); bnoPcb.add(bnoLbl);
+
+  // ── Qwiic cable ──
+  // Wraps from BNO085 connector up and around to XIAO connector
+  var cablePoints = [
+    new THREE.Vector3(-8, bnoPcbT + 1,   BNO_D / 2 + 1.5),
+    new THREE.Vector3(-8, bnoPcbT + 1.5, BNO_D / 2 + 4),
+    new THREE.Vector3(-8, xiaoB - 1.5,   XIAO_D / 2 + 4),
+    new THREE.Vector3(-8, xiaoB - 0.5,   XIAO_D / 2 + 1.5),
+    new THREE.Vector3(-8, xiaoB,          XIAO_D / 2)
+  ];
+  var cableCurve = new THREE.CatmullRomCurve3(cablePoints);
+  var cableMesh = new THREE.Mesh(
+    new THREE.TubeGeometry(cableCurve, 24, 0.55, 8, false),
+    mat(0xfbbf24, 0.6, 0.1)
+  );
+  stackGroup.add(cableMesh);
+  var cableLbl = label('<strong style="color:#fbbf24">Qwiic cable</strong><br><span style="font-size:9px;color:#4b5563">50mm · SDA/SCL/VCC/GND</span>', '#fbbf24');
+  cableLbl.position.set(-8, (bnoPcbT + xiaoB) / 2 - 2.5, BNO_D / 2 + 6);
+  scene.add(cableLbl);
+
+  // ── XIAO nRF52840 Sense ──
+  var xiaoPcb = box(XIAO_W, XIAO_H, XIAO_D, mat(0x1e3a8a, 0.45, 0.05));
+  xiaoPcb.position.set(0, xiaoB + XIAO_H / 2, 0);
+  edges(xiaoPcb, 0x60a5fa);
+  stackGroup.add(xiaoPcb);
+
+  // nRF52840 SoC (QFN-73, ~7×7mm)
+  var soc = box(7, 1.3, 7, mat(0x0f172a, 0.15, 0.7));
+  soc.position.set(0, xiaoT + 0.65, 2);
+  stackGroup.add(soc);
+
+  // PCB antenna (castellated copper trace at end)
+  var ant = box(5.5, 0.4, 1.2, mat(0xfbbf24, 0.3, 0.8));
+  ant.position.set(XIAO_W / 2 - 2, xiaoT, -3);
+  stackGroup.add(ant);
+
+  // Onboard LSM6DS3 (still there, powered down in firmware)
+  var lsm = box(2.5, 1.0, 2.5, mat(0x1e293b, 0.2, 0.5));
+  lsm.position.set(-5, xiaoT + 0.5, 2);
+  stackGroup.add(lsm);
+  var lsmLbl = label('<span style="color:#475569;font-size:9px">LSM6DS3 (powered down)</span>', '#475569');
+  lsmLbl.position.set(-5, 1.5, 0); lsm.add(lsmLbl);
+
+  // Qwiic connector on XIAO side (pads, at +Z edge)
+  var qwiicXiao = box(5, 1.5, 3, mat(0xfbbf24, 0.4, 0.15));
+  qwiicXiao.position.set(-8, xiaoB + 0.75, XIAO_D / 2);
+  stackGroup.add(qwiicXiao);
+
+  // USB-C port (at +Z end)
+  var usbC = box(9, 3.2, 3.2, mat(0x60a5fa, 0.25, 0.7));
+  usbC.position.set(0, xiaoB + 1.6, XIAO_D / 2 + 1.6);
+  stackGroup.add(usbC);
+
+  var xiaoLbl = label(
+    '<strong style="color:#60a5fa">XIAO nRF52840 Sense</strong><br>' +
+    '<span style="font-size:9px;color:#4b5563">21×17.5mm · nRF52840 · BLE 5.0</span>',
+    '#2563eb'
+  );
+  xiaoLbl.position.set(14, 0, 0); xiaoPcb.add(xiaoLbl);
+
+  scene.add(stackGroup);
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // SHELL — minimal 1.5mm wall case
+  // ─────────────────────────────────────────────────────────────────────────────
+  var caseMat = mat(0x1e3a5f, 0.45, 0.12, { transparent: true, opacity: 0.32, side: THREE.DoubleSide, depthWrite: false });
+
+  // Bottom face
+  var cBot = box(OUT_W, WALL, OUT_D, caseMat);
+  cBot.position.set(0, CASE_Y0 + WALL / 2, 0);
+  shellGroup.add(cBot);
+
+  // Top face
+  var cTop = box(OUT_W, WALL, OUT_D, caseMat);
+  cTop.position.set(0, CASE_Y0 + WALL + IN_H + WALL / 2, 0);
+  shellGroup.add(cTop);
+
+  // Left wall (−X)
+  var cLeft = box(WALL, IN_H, OUT_D, caseMat);
+  cLeft.position.set(-(IN_W / 2 + WALL / 2), CASE_Y0 + WALL + IN_H / 2, 0);
+  shellGroup.add(cLeft);
+
+  // Right wall (+X)
+  var cRight = box(WALL, IN_H, OUT_D, caseMat);
+  cRight.position.set(IN_W / 2 + WALL / 2, CASE_Y0 + WALL + IN_H / 2, 0);
+  shellGroup.add(cRight);
+
+  // Back face (−Z): full
+  var cBack = box(OUT_W, OUT_H, WALL, caseMat);
+  cBack.position.set(0, CASE_Y0 + OUT_H / 2, -(IN_D / 2 + WALL / 2));
+  shellGroup.add(cBack);
+
+  // Front face (+Z): USB-C cutout 9×4mm, at bottom of XIAO cavity
+  var usbW = 9, usbH = 4;
+  var frontZ = IN_D / 2 + WALL / 2;
+  var usbY = xiaoB + usbH / 2 + 0.5;
+
+  var fLeft = box((OUT_W - usbW) / 2, OUT_H, WALL, caseMat);
+  fLeft.position.set(-(usbW / 2 + (OUT_W - usbW) / 4), CASE_Y0 + OUT_H / 2, frontZ);
+  shellGroup.add(fLeft);
+  var fRight = box((OUT_W - usbW) / 2, OUT_H, WALL, caseMat);
+  fRight.position.set(usbW / 2 + (OUT_W - usbW) / 4, CASE_Y0 + OUT_H / 2, frontZ);
+  shellGroup.add(fRight);
+  var fTopStrip = box(usbW, OUT_H - WALL - usbH - 0.5, WALL, caseMat);
+  fTopStrip.position.set(0, CASE_Y0 + WALL + usbH + 0.5 + (OUT_H - WALL - usbH - 0.5) / 2, frontZ);
+  shellGroup.add(fTopStrip);
+
+  // ── Strap slots on ±X walls ──
+  var slotMat = mat(0xf97316, 0.4, 0.1);
+  slotMat.emissive = new THREE.Color(0xf97316); slotMat.emissiveIntensity = 0.2;
+  var slotY = CASE_Y0 + WALL / 2;
+  var slotL = box(WALL + 0.1, 3, 22, slotMat);
+  slotL.position.set(-(IN_W / 2 + WALL / 2), slotY + 1, 0);
+  shellGroup.add(slotL);
+  var slotR = box(WALL + 0.1, 3, 22, slotMat);
+  slotR.position.set(IN_W / 2 + WALL / 2, slotY + 1, 0);
+  shellGroup.add(slotR);
+
+  // ── USB-C slot highlight ──
+  var usbSlotMat = mat(0x60a5fa, 0.3, 0.1);
+  usbSlotMat.emissive = new THREE.Color(0x60a5fa); usbSlotMat.emissiveIntensity = 0.3;
+  var usbSlot = box(usbW, usbH, WALL + 0.1, usbSlotMat);
+  usbSlot.position.set(0, usbY, frontZ);
+  shellGroup.add(usbSlot);
+
+  // ── Outer edge lines ──
+  var outerEdgeMesh = new THREE.Mesh(new THREE.BoxGeometry(OUT_W, OUT_H, OUT_D));
+  outerEdgeMesh.position.set(0, CASE_Y0 + OUT_H / 2, 0);
+  var eg = new THREE.EdgesGeometry(outerEdgeMesh.geometry);
+  var edgeLines = new THREE.LineSegments(eg, new THREE.LineBasicMaterial({ color: 0x475569, transparent: true, opacity: 0.9 }));
+  edgeLines.position.copy(outerEdgeMesh.position);
+  shellGroup.add(edgeLines);
+
+  scene.add(shellGroup);
+
+  // ── Shell labels ──
+  var shellLbl = label('<strong style="color:#94a3b8">Shell</strong><br><span style="font-size:9px;color:#4b5563">29×33×14.5mm · 1.5mm wall · PETG</span>', '#64748b');
+  shellLbl.position.set(IN_W / 2 + WALL + 12, CASE_Y0 + OUT_H / 2, 0);
+  scene.add(shellLbl);
+  var usbLbl = label('<strong style="color:#60a5fa">USB-C cutout</strong><br><span style="font-size:9px;color:#4b5563">9×4mm · XIAO port</span>', '#60a5fa');
+  usbLbl.position.set(0, usbY, frontZ + 10);
+  scene.add(usbLbl);
+  var strapLblCase = label('<strong style="color:#f97316">Strap slot</strong><br><span style="font-size:9px;color:#4b5563">22mm wide · 3mm tall</span>', '#f97316');
+  strapLblCase.position.set(-(IN_W / 2 + WALL + 10), slotY + 1, 0);
+  scene.add(strapLblCase);
+
+  // ── Wrist context ─────────────────────────────────────────────────────────────
+  var wristGroup = new THREE.Group();
+  var wR = 27;
+  var armGeo = new THREE.CylinderGeometry(wR, wR, 80, 64);
+  var arm = new THREE.Mesh(armGeo, mat(0xc8956c, 0.85, 0));
+  arm.rotation.x = Math.PI / 2;
+  arm.position.set(0, -wR + 2, 0);
+  arm.castShadow = true;
+  wristGroup.add(arm);
+  [-12, 12].forEach(function(xo) {
+    var bump = new THREE.Mesh(new THREE.SphereGeometry(4, 16, 16), mat(0xb8855c, 0.9, 0));
+    bump.position.set(xo, -wR + 4, wR - 2);
+    wristGroup.add(bump);
+  });
+  wristGroup.visible = false;
+  scene.add(wristGroup);
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // EXPLODE offsets
+  // ─────────────────────────────────────────────────────────────────────────────
+  var explodeOffsets = [
+    { obj: battMesh,   yOff: 0  },
+    { obj: battStripe, yOff: 0  },
+    { obj: jst,        yOff: 0  },
+    { obj: bnoPcb,     yOff: 8  },
+    { obj: bnoChip,    yOff: 8  },
+    { obj: qwiicBno,   yOff: 8  },
+    { obj: cableMesh,  yOff: 14 },
+    { obj: xiaoPcb,    yOff: 20 },
+    { obj: soc,        yOff: 20 },
+    { obj: ant,        yOff: 20 },
+    { obj: lsm,        yOff: 20 },
+    { obj: usbC,       yOff: 20 },
+    { obj: qwiicXiao,  yOff: 20 }
+  ];
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Toggle state + handlers
+  // ─────────────────────────────────────────────────────────────────────────────
+  var stateStack   = true;
+  var stateShell   = true;
+  var stateExplode = false;
+  var stateSect    = false;
+  var stateWrist   = false;
+  var stateRender  = false;
+
+  // base Y positions before explode
+  var baseYMap = [];
+  explodeOffsets.forEach(function(item) {
+    baseYMap.push(item.obj.position.y);
+  });
+
+  function toggleStack() {
+    stateStack = !stateStack;
+    stackGroup.visible = stateStack;
+    document.getElementById('btnStack').classList.toggle('active', stateStack);
+  }
+
+  function toggleShell() {
+    stateShell = !stateShell;
+    shellGroup.visible = stateShell;
+    document.getElementById('btnShell').classList.toggle('active', stateShell);
+  }
+
+  function toggleExplode() {
+    stateExplode = !stateExplode;
+    explodeOffsets.forEach(function(item, i) {
+      item.obj.position.y = baseYMap[i] + (stateExplode ? item.yOff : 0);
+    });
+    if (stateExplode) shellGroup.position.y = 28;
+    else              shellGroup.position.y = 0;
+    document.getElementById('btnExplode').classList.toggle('active', stateExplode);
+  }
+
+  function toggleSection() {
+    stateSect = !stateSect;
+    if (stateSect) {
+      renderer.clippingPlanes = [new THREE.Plane(new THREE.Vector3(-1, 0, 0), 0)];
+      renderer.localClippingEnabled = true;
+    } else {
+      renderer.clippingPlanes = [];
+      renderer.localClippingEnabled = false;
+    }
+    document.getElementById('btnSection').classList.toggle('active', stateSect);
+  }
+
+  function toggleWrist() {
+    stateWrist = !stateWrist;
+    wristGroup.visible = stateWrist;
+    document.getElementById('btnWrist').classList.toggle('active', stateWrist);
+  }
+
+  function toggleRender() {
+    stateRender = !stateRender;
+    sun.visible = fill.visible = !stateRender;
+    sunR.visible = hemi.visible = rim.visible = ground.visible = stateRender;
+    renderer.toneMapping = stateRender ? THREE.ACESFilmicToneMapping : THREE.NoToneMapping;
+    renderer.toneMappingExposure = stateRender ? 1.2 : 1.0;
+    caseMat.opacity = stateRender ? 0.5 : 0.32;
+    caseMat.needsUpdate = true;
+    document.getElementById('btnRender').classList.toggle('active', stateRender);
+  }
+
+  window.toggleStack   = toggleStack;
+  window.toggleShell   = toggleShell;
+  window.toggleExplode = toggleExplode;
+  window.toggleSection = toggleSection;
+  window.toggleWrist   = toggleWrist;
+  window.toggleRender  = toggleRender;
+
+  // ── caps on small components ─────────────────────────────────────────────────
+  [lsm, soc, bnoChip].forEach(function(m) {
+    var eg2 = new THREE.EdgesGeometry(m.geometry);
+    m.add(new THREE.LineSegments(eg2, new THREE.LineBasicMaterial({ color: 0x1e293b, transparent: true, opacity: 0.5 })));
+  });
+
+  // ── animate ──────────────────────────────────────────────────────────────────
+  (function animate() {
+    requestAnimationFrame(animate);
+    controls.update();
+    renderer.render(scene, camera);
+    labelRenderer.render(scene, camera);
+  })();
+
+})();
+</script>
+</body>
+</html>
