@@ -1,29 +1,36 @@
 /**
- * WristTurn - LSM6DS3TR-C (XIAO nRF52840 Sense onboard IMU)
+ * WristTurn - BNO085 + XIAO nRF52840 Sense
  *
- * Drop-in replacement for wristturn_bno085.ino.
- * Same BLE UUIDs, same output format:
- *   raw|roll|pitch|yaw   (IMU stream, degrees)
- *   gyr|x|y|z            (gyro stream, rad/s)
+ * Detects wrist pronation/supination (turn left/right) using the BNO085
+ * rotation vector and broadcasts the gesture over BLE.
  *
- * No external wiring — uses the onboard LSM6DS3TR-C at I2C 0x6A.
- * Madgwick 6DOF filter replaces BNO085 onboard fusion.
+ * Wiring (QWIIC / I2C):
+ *   BNO085 SDA  -> XIAO D4 (SDA)
+ *   BNO085 SCL  -> XIAO D5 (SCL)
+ *   BNO085 VCC  -> 3.3V
+ *   BNO085 GND  -> GND
  *
- * Library required (install via Library Manager):
- *   - "Seeed Arduino LSM6DS3"
- *   - bluefruit.h (built into nRF52840 board package)
+ * Libraries required (install via Library Manager):
+ *   - SparkFun BNO08x Arduino Library
+ *   - bluefruit.h (built into Seeed nRF52840 board package – no install needed)
  */
 
 #include <Wire.h>
-#include <LSM6DS3.h>
+#include <SparkFun_BNO08x_Arduino_Library.h>
 #include <bluefruit.h>
 #include "log.h"
+#include "shake_detector.h"
 
-// ── BLE (same UUIDs as BNO085 version — Python server unchanged) ──────────────
+// ── BLE setup (Bluefruit / Adafruit nRF52 stack) ─────────────────────────────
 BLEService        wristService("19B10000-E8F2-537E-4F6C-D104768A1214");
 BLECharacteristic gestureChar("19B10001-E8F2-537E-4F6C-D104768A1214",
                                BLERead | BLENotify, 20);
 
+// Settings service — writable from app
+// thresholdChar: float, gesture trigger angle in degrees
+// debounceChar:  uint32, minimum ms between gestures
+// deadzoneChar:  float, return-to-neutral zone in degrees before re-arm
+// rawModeChar:   uint8, 0=gesture-only (default), 1=stream raw IMU on every rotation vector event
 BLEService        settingsService("19B10010-E8F2-537E-4F6C-D104768A1214");
 BLECharacteristic thresholdChar("19B10011-E8F2-537E-4F6C-D104768A1214",
                                  BLERead | BLEWrite, 4);
@@ -34,242 +41,196 @@ BLECharacteristic deadzoneChar("19B10013-E8F2-537E-4F6C-D104768A1214",
 BLECharacteristic rawModeChar("19B10014-E8F2-537E-4F6C-D104768A1214",
                                BLERead | BLEWrite, 1);
 
-// ── Onboard IMU ───────────────────────────────────────────────────────────────
-LSM6DS3 imu(I2C_MODE, 0x6A);
+// ── IMU ──────────────────────────────────────────────────────────────────────
+BNO08x imu;
 
-// ── Tap detection (polling TAP_SRC — no interrupt pin needed) ────────────────
-void setupTapDetection() {
-  // TAP_CFG (0x58):
-  //   bit7 = INTERRUPTS_ENABLE  (LSM6DS3TR-C specific — different from plain LSM6DS3)
-  //   bit3-1 = TAP_X/Y/Z_EN
-  //   bit0 = LIR (latch interrupt) — keeps SINGLE_TAP bit set until TAP_SRC is read.
-  //          Without LIR=1 the bit clears in ~38ms and polling can miss it.
-  // 0x8F = INTERRUPTS_ENABLE | TAP_X_EN | TAP_Y_EN | TAP_Z_EN | LIR
-  imu.writeRegister(0x58, 0x8F);
+// ── Thresholds — tunable via BLE ─────────────────────────────────────────────
+float         turnThreshold = 15.0f;  // degrees to trigger gesture
+float         deadzoneDegs  =  5.0f;  // degrees to return within before re-arm
+unsigned long debounceMs    =  200;   // min ms between gestures
 
-  // TAP_THS_6D (0x59): 1 LSB = FS/32 = 62.5mg at ±2g → 8 LSBs = 500mg
-  // Lower value = more sensitive. Try 0x04 (250mg) if not firing.
-  imu.writeRegister(0x59, 0x08);
+// ── State ────────────────────────────────────────────────────────────────────
+bool    rawMode        = false; // stream raw IMU on every rotation vector event
 
-  // INT_DUR2 (0x5A): SHOCK=2 (154ms max impulse) | QUIET=1 (38ms hardware debounce)
-  imu.writeRegister(0x5A, 0x06);
 
-  // WAKE_UP_THS (0x5B): bit7=0 → single tap only
-  imu.writeRegister(0x5B, 0x00);
+float   baseRoll       = 0.0f;
+float   basePitch      = 0.0f;
+float   baseYaw        = 0.0f;
+bool    baseSet        = false;
 
-  // Verify write landed (sanity check)
-  uint8_t check = 0;
-  imu.readRegister(&check, 0x58);
-  LOG_I("Tap detection ready. TAP_CFG readback=0x%02X (expect 0x8F)", check);
+// Per-axis armed flag — set false after gesture fires, true again once
+// wrist returns within deadzone of that axis base
+bool    rollArmed      = true;
+bool    pitchArmed     = true;
+bool    yawArmed       = true;
+
+unsigned long lastGestureMs  = 0;
+unsigned long lastPingMs     = 0;
+const unsigned long PING_INTERVAL_MS = 3000;
+ShakeDetector shake;
+
+// Last known orientation — updated every rotation vector event
+// Used by stability classifier to rebase when wrist is still
+float lastRoll  = 0.0f;
+float lastPitch = 0.0f;
+float lastYaw   = 0.0f;
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+float quaternionToRoll(float w, float x, float y, float z) {
+  float sinr = 2.0f * (w * x + y * z);
+  float cosr = 1.0f - 2.0f * (x * x + y * y);
+  return atan2f(sinr, cosr);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// State machine
-// ─────────────────────────────────────────────────────────────────────────────
-
-// States:
-//   WARMUP  – first WARMUP_SAMPLES iterations; Madgwick hasn't converged yet.
-//             Gesture detection and baseline-setting are both suppressed.
-//   IDLE    – at rest, baseline is fresh. No rebase needed yet.
-//   MOVING  – gyroMag ≥ STILL_THRESH; gesture detection active.
-//   STILL   – gyroMag < STILL_THRESH after moving; waiting to confirm stillness
-//             before rebasing.
-//
-// Transitions:
-//   WARMUP → IDLE    : sampleCount reaches WARMUP_SAMPLES; baseline is set here.
-//   IDLE   → MOVING  : gyroMag ≥ STILL_THRESH
-//   MOVING → STILL   : gyroMag < STILL_THRESH (records stillSinceMs)
-//   STILL  → MOVING  : gyroMag ≥ STILL_THRESH before timeout
-//   STILL  → IDLE    : still for STILL_MS AND gesture holdoff expired
-//                       → rebase baseline, re-arm all axes (breaks deadlock)
-
-enum class MotionState : uint8_t { WARMUP, IDLE, MOVING, STILL };
-
-// Hot path: all fields accessed every 20ms loop tick.
-// alignas(4) keeps the struct word-aligned; grouping quaternion + baseline
-// in the first 28 bytes means they share the first ARM bus-word burst.
-struct alignas(4) SensorState {
-    // Madgwick quaternion — 16 bytes
-    float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
-
-    // Orientation baseline — 12 bytes
-    float baseRoll = 0.0f, basePitch = 0.0f, baseYaw = 0.0f;
-
-    // Gyro bias (startup + runtime correction) — 12 bytes
-    float biasX = 0.0f, biasY = 0.0f, biasZ = 0.0f;
-
-    // Smoothed accel magnitude for accel-based stillness detection — 4 bytes
-    // Used independently of gyroMag so gyro bias can't fool the still check.
-    float smoothAccelMag = 1.0f;
-
-    // State machine + arm flags — packed into one 32-bit word boundary
-    MotionState motionState = MotionState::WARMUP;  // 1 byte
-    bool rollArmed  = true;   // 1 byte
-    bool pitchArmed = true;   // 1 byte
-    bool yawArmed   = true;   // 1 byte
-
-    // Warmup counter + raw mode flag — 4 bytes
-    int16_t warmupCount = 0;
-    bool    rawMode     = false;
-    uint8_t _pad        = 0;
-};  // 52 bytes
-
-// Timing: millisecond timestamps — updated every tick but separated from
-// SensorState so the hot quaternion/baseline block stays compact.
-struct TimingState {
-    unsigned long lastSampleMs  = 0;
-    unsigned long lastGestureMs = 0;
-    unsigned long lastPingMs    = 0;
-    unsigned long stillSinceMs  = 0;
-};  // 16 bytes
-
-// Settings: written only via BLE callbacks, never on the hot path.
-struct Settings {
-    float         turnThreshold = 15.0f;
-    float         deadzoneDegs  =  5.0f;
-    unsigned long debounceMs    =  200;
-};  // 12 bytes
-
-static SensorState ss;
-static TimingState timing;
-static Settings    cfg;
-
-// ── Constants ─────────────────────────────────────────────────────────────────
-static const float         STILL_THRESH      = 0.08f;   // rad/s
-static const unsigned long STILL_MS          = 600;     // ms motionless before rebase
-static const unsigned long REBASE_HOLDOFF_MS = 400;     // ms after gesture before rebase
-static const int           WARMUP_SAMPLES    = 100;     // samples for Madgwick to converge
-static const float         BETA              = 0.4f;    // Madgwick convergence rate
-static const unsigned long PING_INTERVAL_MS  = 3000;
-static const unsigned long SAMPLE_INTERVAL_MS = 20;    // 50 Hz
-
-// ── Madgwick 6DOF filter ──────────────────────────────────────────────────────
-static inline float clampf(float v, float lo, float hi) {
-  return v < lo ? lo : (v > hi ? hi : v);
+float quaternionToPitch(float w, float x, float y, float z) {
+  float sinp = 2.0f * (w * y - z * x);
+  if (fabsf(sinp) >= 1.0f) return copysignf(M_PI / 2.0f, sinp);
+  return asinf(sinp);
 }
 
-void madgwickUpdate(float gx, float gy, float gz,
-                    float ax, float ay, float az,
-                    float dt) {
-  float &q0 = ss.q0, &q1 = ss.q1, &q2 = ss.q2, &q3 = ss.q3;
-  float recipNorm;
-  float s0, s1, s2, s3;
-  float qDot0 = 0.5f * (-q1*gx - q2*gy - q3*gz);
-  float qDot1 = 0.5f * ( q0*gx + q2*gz - q3*gy);
-  float qDot2 = 0.5f * ( q0*gy - q1*gz + q3*gx);
-  float qDot3 = 0.5f * ( q0*gz + q1*gy - q2*gx);
+float quaternionToYaw(float w, float x, float y, float z) {
+  float siny = 2.0f * (w * z + x * y);
+  float cosy = 1.0f - 2.0f * (y * y + z * z);
+  return atan2f(siny, cosy);
+}
 
-  float accNorm = sqrtf(ax*ax + ay*ay + az*az);
-  if (accNorm > 0.001f) {
-    recipNorm = 1.0f / accNorm;
-    ax *= recipNorm; ay *= recipNorm; az *= recipNorm;
+// Feature flags — comment out to disable
+#define ENABLE_TAP
+// #define ENABLE_SHAKE      // uses linear accelerometer
+// #define ENABLE_STEP
+#define ENABLE_GRYO
 
-    float _2q0 = 2*q0, _2q1 = 2*q1, _2q2 = 2*q2, _2q3 = 2*q3;
-    float q0q0 = q0*q0, q1q1 = q1*q1, q2q2 = q2*q2, q3q3 = q3*q3;
+// Stability classifier values from BNO085 SHTP protocol spec
+// 0=unknown, 1=on_table, 2=stationary, 3=stable (held still), 4=motion
+#define STABILITY_ON_TABLE   1
+#define STABILITY_STATIONARY 2
+#define STABILITY_STABLE     3
 
-    s0 = 4*q0*q2q2 + _2q2*ax + 4*q0*q1q1 - _2q1*ay;
-    s1 = 4*q1*q3q3 - _2q3*ax + 4*q0q0*q1 - _2q0*ay - 4*q1
-       + 8*q1*q1q1 + 8*q1*q2q2 + 4*q1*az;
-    s2 = 4*q0q0*q2 + _2q0*ax + 4*q2*q3q3 - _2q3*ay - 4*q2
-       + 8*q2*q1q1 + 8*q2*q2q2 + 4*q2*az;
-    s3 = 4*q1q1*q3 - _2q1*ax + 4*q2q2*q3 - _2q2*ay;
+// Min ms after last gesture before stability can update base
+const unsigned long STABILITY_REBASE_HOLDOFF_MS = 1500;
 
-    recipNorm = 1.0f / sqrtf(s0*s0 + s1*s1 + s2*s2 + s3*s3);
-    s0 *= recipNorm; s1 *= recipNorm; s2 *= recipNorm; s3 *= recipNorm;
 
-    qDot0 -= BETA * s0;
-    qDot1 -= BETA * s1;
-    qDot2 -= BETA * s2;
-    qDot3 -= BETA * s3;
-  }
-
-  q0 += qDot0 * dt; q1 += qDot1 * dt;
-  q2 += qDot2 * dt; q3 += qDot3 * dt;
-
-  recipNorm = 1.0f / sqrtf(q0*q0 + q1*q1 + q2*q2 + q3*q3);
-  q0 *= recipNorm; q1 *= recipNorm; q2 *= recipNorm; q3 *= recipNorm;
+void enableReports() {
+  if (!imu.enableRotationVector())
+    LOG_E("BNO085: could not enable Rotation Vector");
+  if (!imu.enableStabilityClassifier(500))  // 500ms interval
+    LOG_E("BNO085: could not enable Stability Classifier");
+#ifdef ENABLE_SHAKE
+  if (!imu.enableLinearAccelerometer())
+    LOG_E("BNO085: could not enable Linear Accelerometer");
+#endif
+#ifdef ENABLE_TAP
+  if (!imu.enableTapDetector(100))
+    LOG_E("BNO085: could not enable Tap Detector");
+#endif
+#ifdef ENABLE_STEP
+  if (!imu.enableStepCounter(1000))
+    LOG_E("BNO085: could not enable Step Counter");
+#endif
+#ifdef ENABLE_GRYO
+  if(!imu.enableGyro())
+    LOG_E("BN0085: could not enable gyro");
+#endif
 }
 
 // ── BLE write callbacks ───────────────────────────────────────────────────────
-void onThresholdWrite(uint16_t, BLECharacteristic*, uint8_t* data, uint16_t len) {
+void onThresholdWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
   if (len == 4) {
-    float val; memcpy(&val, data, 4);
+    float val;
+    memcpy(&val, data, 4);
     if (val > 0.0f && val < 90.0f) {
-      cfg.turnThreshold = val;
-      LOG_I("[Settings] threshold=%.1f deg", cfg.turnThreshold);
+      turnThreshold = val;
+      LOG_I("[Settings] threshold updated: %.1f deg", turnThreshold);
+    } else {
+      LOG_E("[Settings] threshold out of range: %.1f (must be 0-90)", val);
     }
   }
 }
 
-void onDebounceWrite(uint16_t, BLECharacteristic*, uint8_t* data, uint16_t len) {
+void onDebounceWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
   if (len == 4) {
-    uint32_t val; memcpy(&val, data, 4);
+    uint32_t val;
+    memcpy(&val, data, 4);
     if (val >= 50 && val <= 2000) {
-      cfg.debounceMs = val;
-      LOG_I("[Settings] debounce=%lu ms", cfg.debounceMs);
+      debounceMs = val;
+      LOG_I("[Settings] debounce updated: %lu ms", debounceMs);
+    } else {
+      LOG_E("[Settings] debounce out of range: %lu (must be 50-2000)", val);
     }
   }
 }
 
-void onDeadzoneWrite(uint16_t, BLECharacteristic*, uint8_t* data, uint16_t len) {
-  if (len == 4) {
-    float val; memcpy(&val, data, 4);
-    if (val >= 0.0f && val < cfg.turnThreshold) {
-      cfg.deadzoneDegs = val;
-      LOG_I("[Settings] deadzone=%.1f deg", cfg.deadzoneDegs);
-    }
-  }
-}
-
-void onRawModeWrite(uint16_t, BLECharacteristic*, uint8_t* data, uint16_t len) {
+void onRawModeWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
   if (len == 1) {
-    ss.rawMode = (data[0] != 0);
-    LOG_I("[Settings] rawMode=%d", ss.rawMode);
+    rawMode = (data[0] != 0);
+    LOG_I("[Settings] rawMode=%d", rawMode);
+  }
+}
+
+void onDeadzoneWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
+  if (len == 4) {
+    float val;
+    memcpy(&val, data, 4);
+    if (val >= 0.0f && val < turnThreshold) {
+      deadzoneDegs = val;
+      LOG_I("[Settings] deadzone updated: %.1f deg", deadzoneDegs);
+    } else {
+      LOG_E("[Settings] deadzone out of range: %.1f (must be 0 to threshold)", val);
+    }
   }
 }
 
 // ── BLE callbacks ─────────────────────────────────────────────────────────────
 void onConnect(uint16_t conn_hdl) {
-  LOG_I("BLE connected conn_hdl=%u", conn_hdl);
+  LOG_I("BLE connected. conn_hdl=%u peers=%u", conn_hdl, Bluefruit.Periph.connected());
+  // Send current settings to app on connect
+  LOG_I("[Settings] current: threshold=%.1f deg  debounce=%lu ms  deadzone=%.1f deg",
+        turnThreshold, debounceMs, deadzoneDegs);
 }
 
 void onDisconnect(uint16_t conn_hdl, uint8_t reason) {
-  LOG_I("BLE disconnected conn_hdl=%u reason=0x%02X", conn_hdl, reason);
+  LOG_I("BLE disconnected. conn_hdl=%u reason=0x%02X", conn_hdl, reason);
   Bluefruit.Advertising.start(0);
+  LOG_I("BLE advertising restarted.");
 }
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
 
-  if (imu.begin() != 0) {
-    LOG_E("LSM6DS3 not found — check board is nRF52840 Sense");
+  // ── IMU init ──
+  Wire.begin();
+  LOG_D("Scanning I2C bus...");
+  int found = 0;
+  for (byte addr = 8; addr < 120; addr++) {
+    Wire.beginTransmission(addr);
+    byte err = Wire.endTransmission();
+    if (err == 0) {
+      LOG_D("  Found device at 0x%02X", addr);
+      found++;
+    } else if (err == 4) {
+      LOG_E("  I2C error at 0x%02X", addr);
+    }
+  }
+  if (found == 0) LOG_E("I2C: no devices found.");
+  LOG_D("I2C scan done.");
+
+  if (!imu.begin(0x4B, Wire) && !imu.begin(0x4A, Wire)) {
+    LOG_E("BNO085 not found - check wiring!");
     while (true) { delay(100); }
   }
-  LOG_I("LSM6DS3TR-C ready.");
-  setupTapDetection();
+  LOG_I("BNO085 ready.");
+  enableReports();
 
-  // ── Gyro bias calibration — keep wrist still for ~2s after power-on ──────
-  LOG_I("Calibrating gyro bias (keep still)...");
-  const int CAL_SAMPLES = 100;
-  float sumX = 0, sumY = 0, sumZ = 0;
-  for (int i = 0; i < CAL_SAMPLES; i++) {
-    sumX += imu.readFloatGyroX() * DEG_TO_RAD;
-    sumY += imu.readFloatGyroY() * DEG_TO_RAD;
-    sumZ += imu.readFloatGyroZ() * DEG_TO_RAD;
-    delay(10);
-  }
-  ss.biasX = sumX / CAL_SAMPLES;
-  ss.biasY = sumY / CAL_SAMPLES;
-  ss.biasZ = sumZ / CAL_SAMPLES;
-  LOG_I("Gyro bias: x=%.4f y=%.4f z=%.4f rad/s", ss.biasX, ss.biasY, ss.biasZ);
-
-  // ── BLE ──
+  // ── BLE init ──
+  LOG_I("BLE init...");
   Bluefruit.begin();
   Bluefruit.setName("WristTurn");
   Bluefruit.Periph.setConnInterval(6, 12);
   Bluefruit.Periph.setConnSupervisionTimeout(200);
+  LOG_I("BLE supervision timeout set to 2s.");
 
+  // Gesture service
   wristService.begin();
   gestureChar.setProperties(CHR_PROPS_READ | CHR_PROPS_NOTIFY);
   gestureChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
@@ -277,6 +238,7 @@ void setup() {
   gestureChar.begin();
   gestureChar.write("idle                                   ", 40);
 
+  // Settings service
   settingsService.begin();
 
   thresholdChar.setProperties(CHR_PROPS_READ | CHR_PROPS_WRITE);
@@ -284,14 +246,14 @@ void setup() {
   thresholdChar.setFixedLen(4);
   thresholdChar.setWriteCallback(onThresholdWrite);
   thresholdChar.begin();
-  thresholdChar.write(&cfg.turnThreshold, 4);
+  thresholdChar.write(&turnThreshold, 4);
 
   debounceChar.setProperties(CHR_PROPS_READ | CHR_PROPS_WRITE);
   debounceChar.setPermission(SECMODE_OPEN, SECMODE_OPEN);
   debounceChar.setFixedLen(4);
   debounceChar.setWriteCallback(onDebounceWrite);
   debounceChar.begin();
-  uint32_t dms = (uint32_t)cfg.debounceMs;
+  uint32_t dms = (uint32_t)debounceMs;
   debounceChar.write(&dms, 4);
 
   deadzoneChar.setProperties(CHR_PROPS_READ | CHR_PROPS_WRITE);
@@ -299,7 +261,7 @@ void setup() {
   deadzoneChar.setFixedLen(4);
   deadzoneChar.setWriteCallback(onDeadzoneWrite);
   deadzoneChar.begin();
-  deadzoneChar.write(&cfg.deadzoneDegs, 4);
+  deadzoneChar.write(&deadzoneDegs, 4);
 
   rawModeChar.setProperties(CHR_PROPS_READ | CHR_PROPS_WRITE);
   rawModeChar.setPermission(SECMODE_OPEN, SECMODE_OPEN);
@@ -318,193 +280,172 @@ void setup() {
   Bluefruit.Advertising.restartOnDisconnect(true);
   Bluefruit.Advertising.start(0);
   LOG_I("BLE advertising as 'WristTurn'.");
+  LOG_I("[Settings] defaults: threshold=%.1f deg  debounce=%lu ms  deadzone=%.1f deg",
+        turnThreshold, debounceMs, deadzoneDegs);
 }
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
 void loop() {
-  unsigned long now = millis();
-  if (now - timing.lastSampleMs < SAMPLE_INTERVAL_MS) return;
-  float dt = (now - timing.lastSampleMs) * 0.001f;
-  timing.lastSampleMs = now;
+  if (!imu.wasReset() && imu.getSensorEvent()) {
+    uint8_t eventId = imu.getSensorEventID();
 
-  // ── Tap polling (TAP_SRC clears on read) ─────────────────────────────────
-  {
-    static unsigned long lastTapMs = 0;
-    uint8_t tapSrc = 0;
-    imu.readRegister(&tapSrc, 0x1C);
-    if ((tapSrc & 0x20) && (now - lastTapMs > 500)) {  // bit5=SINGLE_TAP, 500ms sw debounce
-      lastTapMs = now;
-      if (Bluefruit.Periph.connected()) {
-        gestureChar.notify("tap", 3);
+#ifdef ENABLE_SHAKE
+    if (eventId == SENSOR_REPORTID_LINEAR_ACCELERATION) {
+      float ax = imu.getLinAccelX();
+      float ay = imu.getLinAccelY();
+      float az = imu.getLinAccelZ();
+      if (shake.update(ax, ay, az)) {
+        char buf[40] = {};
+        snprintf(buf, sizeof(buf), "shake");
+        LOG_I("%s", buf);
+        gestureChar.notify(buf, 40);
       }
-      LOG_I("[Tap] src=0x%02X", tapSrc);
     }
-  }
-
-  // ── Read sensors ─────────────────────────────────────────────────────────
-  float ax = imu.readFloatAccelX();
-  float ay = imu.readFloatAccelY();
-  float az = imu.readFloatAccelZ();
-  float gx = imu.readFloatGyroX() * DEG_TO_RAD - ss.biasX;
-  float gy = imu.readFloatGyroY() * DEG_TO_RAD - ss.biasY;
-  float gz = imu.readFloatGyroZ() * DEG_TO_RAD - ss.biasZ;
-
-  // ── Madgwick update ───────────────────────────────────────────────────────
-  madgwickUpdate(gx, gy, gz, ax, ay, az, dt);
-
-  // ── Euler angles (degrees) ────────────────────────────────────────────────
-  float roll  = atan2f(2*(ss.q0*ss.q1 + ss.q2*ss.q3), 1 - 2*(ss.q1*ss.q1 + ss.q2*ss.q2)) * 57.296f;
-  float pitch = asinf(clampf(2*(ss.q0*ss.q2 - ss.q3*ss.q1), -1.0f, 1.0f))                 * 57.296f;
-  float yaw   = atan2f(2*(ss.q0*ss.q3 + ss.q1*ss.q2), 1 - 2*(ss.q2*ss.q2 + ss.q3*ss.q3)) * 57.296f;
-
-  float gyroMag = sqrtf(gx*gx + gy*gy + gz*gz);
-
-  // Low-pass filter on gyroMag so Madgwick correction noise doesn't prevent
-  // the STILL state from being entered. ~120ms smoothing window at 50Hz.
-  static float smoothGyroMag = 0.0f;
-  smoothGyroMag = 0.85f * smoothGyroMag + 0.15f * gyroMag;
-
-  // ── Runtime gyro bias correction ─────────────────────────────────────────
-  // The LSM6DS3 zero-rate offset can be ±10°/s — startup calibration reduces
-  // this but residual drift can still be several °/s. When this is large,
-  // smoothGyroMag stays above STILL_THRESH even when physically motionless,
-  // blocking the rebase entirely.
-  //
-  // Fix: use accelerometer variance to detect true physical stillness,
-  // independent of gyro bias. When accel magnitude is stable (device at rest,
-  // gravity is constant), the remaining gyro reading IS the residual bias.
-  // Slowly subtract it — same principle as BNO085's onboard compensation.
-  //
-  // alpha=0.003 → ~7s to halve a 14°/s residual at 50Hz (50*0.003=0.15/s)
-  float accelMag = sqrtf(ax*ax + ay*ay + az*az);
-  ss.smoothAccelMag = 0.98f * ss.smoothAccelMag + 0.02f * accelMag;
-  bool accelStill = (fabsf(accelMag - ss.smoothAccelMag) < 0.02f)
-                    && ss.motionState != MotionState::WARMUP;
-  if (accelStill) {
-    const float BIAS_ALPHA = 0.003f;
-    ss.biasX += BIAS_ALPHA * gx;
-    ss.biasY += BIAS_ALPHA * gy;
-    ss.biasZ += BIAS_ALPHA * gz;
-  }
-
-  // ── State machine ─────────────────────────────────────────────────────────
-  switch (ss.motionState) {
-
-    case MotionState::WARMUP:
-      // Madgwick starts at identity quaternion (1,0,0,0). If the chip is
-      // tilted or sideways, the first Euler angles are wrong. Suppress both
-      // baseline-setting and gesture detection until the filter converges.
-      if (++ss.warmupCount >= WARMUP_SAMPLES) {
-        ss.baseRoll  = roll;
-        ss.basePitch = pitch;
-        ss.baseYaw   = yaw;
-        ss.motionState = MotionState::IDLE;
-        timing.stillSinceMs = now;
-        LOG_I("[IMU] warmup done, baseline: roll=%.1f pitch=%.1f yaw=%.1f",
-              ss.baseRoll, ss.basePitch, ss.baseYaw);
-      }
-      return;  // skip raw stream + gesture detection during warmup
-
-    case MotionState::IDLE:
-      if (smoothGyroMag >= STILL_THRESH) {
-        ss.motionState = MotionState::MOVING;
-      }
-      break;
-
-    case MotionState::MOVING:
-      if (smoothGyroMag < STILL_THRESH) {
-        ss.motionState    = MotionState::STILL;
-        timing.stillSinceMs = now;
-      }
-      break;
-
-    case MotionState::STILL:
-      if (smoothGyroMag >= STILL_THRESH) {
-        // Moved again before we could rebase — back to MOVING.
-        ss.motionState = MotionState::MOVING;
-      } else if ((now - timing.stillSinceMs) > STILL_MS) {
-        // Been still long enough.
-        // FIX: no allArmedAgain check here — that check caused a deadlock
-        // where a disarmed axis prevented rebase, which prevented re-arming.
-        // We hold off only if a gesture fired very recently.
-        bool holdoffOk = (now - timing.lastGestureMs) > REBASE_HOLDOFF_MS;
-        if (holdoffOk) {
-          ss.baseRoll  = roll;
-          ss.basePitch = pitch;
-          ss.baseYaw   = yaw;
-          // Re-arm all axes: deltas are now zero by definition.
-          ss.rollArmed = ss.pitchArmed = ss.yawArmed = true;
-          LOG_D("[Still] rebased: roll=%.1f pitch=%.1f yaw=%.1f",
-                ss.baseRoll, ss.basePitch, ss.baseYaw);
-        }
-        ss.motionState = MotionState::IDLE;
-      }
-      break;
-  }
-
-  // ── Raw stream (same format as BNO085 firmware) ───────────────────────────
-  if (ss.rawMode && Bluefruit.Periph.connected()) {
-    char buf[40] = {};
-    snprintf(buf, sizeof(buf), "raw|%.1f|%.1f|%.1f", roll, pitch, yaw);
-    gestureChar.notify(buf, 40);
-
-    snprintf(buf, sizeof(buf), "gyr|%.3f|%.3f|%.3f", gx, gy, gz);
-    gestureChar.notify(buf, 40);
-  }
-
-  // ── Gesture detection ─────────────────────────────────────────────────────
-  float dRoll  = roll  - ss.baseRoll;
-  float dPitch = pitch - ss.basePitch;
-  float dYaw   = yaw   - ss.baseYaw;
-
-  LOG_D("[IMU] r=%.1f p=%.1f y=%.1f  dr=%.1f dp=%.1f dy=%.1f",
-        roll, pitch, yaw, dRoll, dPitch, dYaw);
-
-  // Re-arm axes that returned within deadzone
-  if (!ss.rollArmed  && fabsf(dRoll)  <= cfg.deadzoneDegs) ss.rollArmed  = true;
-  if (!ss.pitchArmed && fabsf(dPitch) <= cfg.deadzoneDegs) ss.pitchArmed = true;
-  if (!ss.yawArmed   && fabsf(dYaw)   <= cfg.deadzoneDegs) ss.yawArmed   = true;
-
-  // Force-rebase safety net: drift can prevent smoothGyroMag from dropping below
-  // STILL_THRESH, which blocks the normal rebase path and permanently locks out gestures.
-  // Guard: accelStill must be true — wrist must actually be physically still.
-  // Without accelStill guard, this rebases mid-movement and the return motion fires
-  // as a phantom gesture in the opposite direction.
-  {
-    bool anyDisarmed = !ss.rollArmed || !ss.pitchArmed || !ss.yawArmed;
-    if (anyDisarmed && accelStill && (now - timing.lastGestureMs) > 2000) {
-      ss.baseRoll = roll; ss.basePitch = pitch; ss.baseYaw = yaw;
-      ss.rollArmed = ss.pitchArmed = ss.yawArmed = true;
-      LOG_D("[Rearm] force-rebase: roll=%.1f pitch=%.1f yaw=%.1f", roll, pitch, yaw);
-    }
-  }
-
-  if ((now - timing.lastGestureMs) > cfg.debounceMs) {
-    const char* gesture = nullptr;
-
-    if (ss.rollArmed && fabsf(dRoll) > cfg.turnThreshold) {
-      gesture = (dRoll > 0) ? "turn_right" : "turn_left";
-      ss.rollArmed = false;
-    } else if (ss.pitchArmed && fabsf(dPitch) > cfg.turnThreshold) {
-      gesture = (dPitch > 0) ? "pitch_up" : "pitch_down";
-      ss.pitchArmed = false;
-    } else if (ss.yawArmed && fabsf(dYaw) > cfg.turnThreshold) {
-      gesture = (dYaw > 0) ? "yaw_right" : "yaw_left";
-      ss.yawArmed = false;
-    }
-
-    if (gesture) {
+#endif
+#ifdef ENABLE_TAP
+    if (eventId == SENSOR_REPORTID_TAP_DETECTOR) {
       char buf[40] = {};
-      snprintf(buf, sizeof(buf), "%s|%.1f|%.1f|%.1f", gesture, roll, pitch, yaw);
+      snprintf(buf, sizeof(buf), "tap");
+      LOG_I("%s", buf);
       gestureChar.notify(buf, 40);
-      timing.lastGestureMs = now;
-      LOG_I("[Gesture] %s", gesture);
+    }
+#endif
+#ifdef ENABLE_STEP
+    if (eventId == SENSOR_REPORTID_STEP_COUNTER) {
+      uint16_t steps = imu.getStepCount();
+      char buf[40] = {};
+      snprintf(buf, sizeof(buf), "step|%u", steps);
+      LOG_I("%s", buf);
+      gestureChar.notify(buf, 40);
+    }
+#endif
+
+    if (eventId == SENSOR_REPORTID_STABILITY_CLASSIFIER) {
+      uint8_t stability = imu.getStabilityClassifier();
+      unsigned long now = millis();
+      bool allArmed = rollArmed && pitchArmed && yawArmed;
+      bool holdoffPassed = (now - lastGestureMs) > STABILITY_REBASE_HOLDOFF_MS;
+
+      LOG_D("[Stability] class=%u armed=%d%d%d holdoff=%d",
+            stability, rollArmed, pitchArmed, yawArmed, holdoffPassed);
+      if ((stability == STABILITY_ON_TABLE || stability == STABILITY_STATIONARY || stability == STABILITY_STABLE)
+          && allArmed && holdoffPassed && baseSet) {
+        baseRoll  = lastRoll;
+        basePitch = lastPitch;
+        baseYaw   = lastYaw;
+        LOG_D("[Stability] rebase: roll=%.1f  pitch=%.1f  yaw=%.1f",
+              baseRoll, basePitch, baseYaw);
+      }
+    }
+
+#ifdef ENABLE_GRYO
+    else if (eventId == SENSOR_REPORTID_GYROSCOPE_CALIBRATED) {
+      if (rawMode && Bluefruit.Periph.connected()) {
+        float gx = imu.getGyroX();  // rad/s
+        float gy = imu.getGyroY();
+        float gz = imu.getGyroZ();
+        char buf[40] = {};
+        snprintf(buf, sizeof(buf), "gyr|%.3f|%.3f|%.3f", gx, gy, gz);
+        gestureChar.notify(buf, 40);
+      }
+    }
+#endif
+
+    else if (eventId == SENSOR_REPORTID_ROTATION_VECTOR) {
+      float w = imu.getQuatReal();
+      float x = imu.getQuatI();
+      float y = imu.getQuatJ();
+      float z = imu.getQuatK();
+
+      float roll  = quaternionToRoll(w, x, y, z)  * 57.296f;
+      float pitch = quaternionToPitch(w, x, y, z) * 57.296f;
+      float yaw   = quaternionToYaw(w, x, y, z)   * 57.296f;
+
+      lastRoll  = roll;
+      lastPitch = pitch;
+      lastYaw   = yaw;
+
+      // Initialise baseline on first good reading
+      if (!baseSet) {
+        baseRoll  = roll;
+        basePitch = pitch;
+        baseYaw   = yaw;
+        baseSet   = true;
+        LOG_I("[IMU] baseline set: roll=%.1f  pitch=%.1f  yaw=%.1f", baseRoll, basePitch, baseYaw);
+      }
+
+      float dRoll  = roll  - baseRoll;
+      float dPitch = pitch - basePitch;
+      float dYaw   = yaw   - baseYaw;
+      unsigned long now = millis();
+
+      LOG_D("[IMU] roll=%.1f  pitch=%.1f  yaw=%.1f  dR=%.1f  dP=%.1f  dY=%.1f  armed=%d%d%d",
+            roll, pitch, yaw, dRoll, dPitch, dYaw,
+            rollArmed, pitchArmed, yawArmed);
+
+      // ── Raw stream mode (for data collection) ────────────────────────────
+      if (rawMode && Bluefruit.Periph.connected()) {
+        char buf[40] = {};
+        snprintf(buf, sizeof(buf), "raw|%.1f|%.1f|%.1f", roll, pitch, yaw);
+        gestureChar.notify(buf, 40);
+      }
+
+      // ── Deadzone re-arm check ─────────────────────────────────────────────
+      // Once a gesture fires on an axis, the axis is disarmed.
+      // It re-arms when the wrist returns within deadzoneDegs of that axis base.
+      if (!rollArmed && fabsf(dRoll) <= deadzoneDegs) {
+        rollArmed = true;
+        LOG_I("[Deadzone] roll re-armed dRoll=%.1f deg (base stays at %.1f)", dRoll, baseRoll);
+      }
+      if (!pitchArmed && fabsf(dPitch) <= deadzoneDegs) {
+        pitchArmed = true;
+        LOG_I("[Deadzone] pitch re-armed dPitch=%.1f deg (base stays at %.1f)", dPitch, basePitch);
+      }
+      if (!yawArmed && fabsf(dYaw) <= deadzoneDegs) {
+        yawArmed = true;
+        LOG_I("[Deadzone] yaw re-armed dYaw=%.1f deg (base stays at %.1f)", dYaw, baseYaw);
+      }
+
+      // ── Gesture detection ─────────────────────────────────────────────────
+      if ((now - lastGestureMs) > debounceMs) {
+        const char* gesture = nullptr;
+
+        if (rollArmed && fabsf(dRoll) > turnThreshold) {
+          gesture   = (dRoll > 0) ? "turn_right" : "turn_left";
+          rollArmed = false;
+          LOG_I("[Gesture] %s  dRoll=%.1f deg  (disarmed roll)", gesture, dRoll);
+        } else if (pitchArmed && fabsf(dPitch) > turnThreshold) {
+          gesture    = (dPitch > 0) ? "pitch_up" : "pitch_down";
+          pitchArmed = false;
+          LOG_I("[Gesture] %s  dPitch=%.1f deg  (disarmed pitch)", gesture, dPitch);
+        } else if (yawArmed && fabsf(dYaw) > turnThreshold) {
+          gesture  = (dYaw > 0) ? "yaw_right" : "yaw_left";
+          yawArmed = false;
+          LOG_I("[Gesture] %s  dYaw=%.1f deg  (disarmed yaw)", gesture, dYaw);
+        }
+
+        if (gesture) {
+          char buf[40] = {};
+          snprintf(buf, sizeof(buf), "%s|%.1f|%.1f|%.1f", gesture, roll, pitch, yaw);
+          gestureChar.notify(buf, 40);
+          lastGestureMs = now;
+        }
+      }
     }
   }
 
-  // ── Keepalive ping ────────────────────────────────────────────────────────
-  if (Bluefruit.Periph.connected() && (now - timing.lastPingMs > PING_INTERVAL_MS)) {
-    timing.lastPingMs = now;
-    gestureChar.notify("ping", 4);
+  // If IMU reset, re-enable reports
+  if (imu.wasReset()) {
+    LOG_E("BNO085 reset - re-enabling reports.");
+    enableReports();
+  }
+
+  // Keepalive ping
+  if (Bluefruit.Periph.connected()) {
+    unsigned long now = millis();
+    if (now - lastPingMs > PING_INTERVAL_MS) {
+      lastPingMs = now;
+      gestureChar.notify("ping", 4);
+    }
   }
 }
