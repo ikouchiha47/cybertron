@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>WristTurn — Case v2</title>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/renderers/CSS2DRenderer.js"></script>
+<script src="shared.js"></script>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#0e1117; overflow:hidden; font-family:ui-monospace,monospace; }
+canvas { display:block; }
+#info  { position:absolute; top:14px; left:16px; color:#e2e8f0; font-size:13px; font-weight:600; pointer-events:none; }
+#hint  { position:absolute; top:32px; left:16px; color:#4b5563; font-size:10px; pointer-events:none; }
+#controls { position:absolute; bottom:20px; left:16px; display:flex; gap:8px; flex-wrap:wrap; max-width:600px; }
+.btn { background:#1f2937; border:1px solid #374151; color:#e2e8f0; font-family:ui-monospace,monospace; font-size:11px; padding:6px 12px; border-radius:4px; cursor:pointer; }
+.btn:hover { background:#374151; }
+.btn.active { border-color:#3b82f6; color:#60a5fa; }
+.layer-label { color:#e2e8f0; font-size:10px; font-family:ui-monospace,monospace; white-space:nowrap; line-height:1.6; background:rgba(14,17,23,0.88); padding:3px 8px; border-radius:4px; }
+</style>
+</head>
+<body>
+<div id="info">WristTurn — Case v2</div>
+<div id="hint">drag · scroll · right-drag pan</div>
+<div id="controls">
+  <button class="btn active" id="btnBase"    onclick="toggle('base')">Base tray</button>
+  <button class="btn active" id="btnLid"     onclick="toggle('lid')">Lid</button>
+  <button class="btn active" id="btnStack"   onclick="toggle('stack')">Stack</button>
+  <button class="btn active" id="btnLabels"  onclick="toggle('labels')">Labels</button>
+  <button class="btn"        id="btnExplode" onclick="toggleExplode()">Explode</button>
+  <button class="btn"        id="btnSection" onclick="toggleSection()">Section</button>
+  <button class="btn"        id="btnWrist"   onclick="toggle('wrist')">Wrist</button>
+  <button class="btn"        id="btnRender"  onclick="toggleRender()">Rendered</button>
+</div>
+
+<script>
+(function () {
+
+  var sc = WT.setupScene(0x0e1117);
+  var scene = sc.scene, renderer = sc.renderer;
+
+  // ── dimensions ───────────────────────────────────────────────────────────────
+  var W   = 2;           // wall thickness
+  var IW  = 31;          // inner width  (X) — XIAO 21mm + 5mm each side
+  var ID  = 26;          // inner depth  (Z)
+  var IH  = 12;          // inner height (Y)
+  var OW  = IW + W*2;    // 35
+  var OD  = ID + W*2;    // 30
+  var OH  = IH + W*2;    // 16  — split: base 10mm + lid 6mm
+  var BH  = 10;          // base tray height (includes bottom wall)
+  var LH  =  6;          // lid height
+  var Y0  = 0;           // floor of base sits at Y=0
+
+  // retention geometry constants
+  var POST_R  = 1.5;   // PCB rail post radius
+  var CLIP_W  = 4;     // snap-fit clip width
+  var CLIP_H  = 3;     // snap-fit clip height
+  var CLIP_D  = 1.5;   // snap-fit clip depth (cantilever length)
+  var RAIL_W  = 1.5;   // PCB rail width
+  var RAIL_H  = 2;     // PCB rail height (above floor)
+
+  // materials
+  var baseMat  = new THREE.MeshStandardMaterial({ color:0x334155, roughness:0.45, metalness:0.1, transparent:true, opacity:0.55, side:THREE.DoubleSide, depthWrite:false });
+  var lidMat   = new THREE.MeshStandardMaterial({ color:0x1e3a5f, roughness:0.45, metalness:0.1, transparent:true, opacity:0.55, side:THREE.DoubleSide, depthWrite:false });
+  var clipMat  = new THREE.MeshStandardMaterial({ color:0xf97316, roughness:0.35, emissive:0xf97316, emissiveIntensity:0.15 });
+  var railMat  = new THREE.MeshStandardMaterial({ color:0x22c55e, roughness:0.4,  emissive:0x22c55e, emissiveIntensity:0.12 });
+  var pocketMat= new THREE.MeshStandardMaterial({ color:0x6366f1, roughness:0.5 });
+  var usbMat   = new THREE.MeshStandardMaterial({ color:0x60a5fa, roughness:0.3, emissive:0x60a5fa, emissiveIntensity:0.2 });
+  var ribMat   = new THREE.MeshStandardMaterial({ color:0xa855f7, roughness:0.4, emissive:0xa855f7, emissiveIntensity:0.15 });
+  var edgeMat  = new THREE.LineBasicMaterial({ color:0x64748b, transparent:true, opacity:0.7 });
+
+  function box(w,h,d,mat) {
+    var m = new THREE.Mesh(new THREE.BoxGeometry(w,h,d), mat);
+    m.castShadow = true; m.receiveShadow = true;
+    return m;
+  }
+  function cyl(r,h,mat,segs) {
+    var m = new THREE.Mesh(new THREE.CylinderGeometry(r,r,h,segs||16), mat);
+    m.castShadow = true; return m;
+  }
+  function edges(mesh) {
+    mesh.add(new THREE.LineSegments(new THREE.EdgesGeometry(mesh.geometry), edgeMat.clone()));
+  }
+  function lbl(html, col) {
+    return WT.makeLabel(html, col);
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════════
+  // BASE TRAY
+  // ══════════════════════════════════════════════════════════════════════════════
+  var baseGroup = new THREE.Group();
+
+  // bottom wall
+  var floor = box(OW, W, OD, baseMat);
+  floor.position.set(0, Y0 + W/2, 0);
+  edges(floor); baseGroup.add(floor);
+
+  // left wall
+  var lWall = box(W, BH, OD, baseMat);
+  lWall.position.set(-(IW/2 + W/2), Y0 + BH/2, 0);
+  edges(lWall); baseGroup.add(lWall);
+
+  // right wall
+  var rWall = box(W, BH, OD, baseMat);
+  rWall.position.set(IW/2 + W/2, Y0 + BH/2, 0);
+  edges(rWall); baseGroup.add(rWall);
+
+  // back wall
+  var bkWall = box(OW, BH, W, baseMat);
+  bkWall.position.set(0, Y0 + BH/2, -(ID/2 + W/2));
+  edges(bkWall); baseGroup.add(bkWall);
+
+  // front wall — two panels flanking USB-C channel
+  var usbW = 9, usbH = 4;
+  var frontZ = ID/2 + W/2;
+  var panelW = (OW - usbW) / 2;
+  var fL = box(panelW, BH, W, baseMat);
+  fL.position.set(-(usbW/2 + panelW/2), Y0 + BH/2, frontZ);
+  edges(fL); baseGroup.add(fL);
+  var fR = box(panelW, BH, W, baseMat);
+  fR.position.set(usbW/2 + panelW/2, Y0 + BH/2, frontZ);
+  edges(fR); baseGroup.add(fR);
+  // above USB-C
+  var fTop = box(usbW, BH - W - usbH, W, baseMat);
+  fTop.position.set(0, Y0 + W + usbH + (BH - W - usbH)/2, frontZ);
+  edges(fTop); baseGroup.add(fTop);
+
+  // USB-C boss highlight (channel guide)
+  var usbBoss = box(usbW + 1, usbH, W + 1.5, usbMat);
+  usbBoss.position.set(0, Y0 + W + usbH/2, frontZ - 0.5);
+  baseGroup.add(usbBoss);
+
+  // ── PCB rails (XIAO sits in a channel, 21mm wide × 17.5mm deep) ────────────
+  // Two rails along the Z-edges of the XIAO footprint, on the base floor.
+  // The XIAO slides in from above and the rail sidewalls prevent XY drift.
+  var xiaoW = 21, xiaoD = 17.5;
+  var railFloorY = Y0 + W;  // top of base floor
+
+  [-(xiaoW/2 + RAIL_W/2), xiaoW/2 + RAIL_W/2].forEach(function(xPos) {
+    var rail = box(RAIL_W, RAIL_H, xiaoD + RAIL_W*2, railMat);
+    rail.position.set(xPos, railFloorY + RAIL_H/2, 0);
+    baseGroup.add(rail);
+  });
+  // end-stops on the back: small ledge so XIAO can't slide backward
+  var stopBack = box(xiaoW, RAIL_H, RAIL_W, railMat);
+  stopBack.position.set(0, railFloorY + RAIL_H/2, -(xiaoD/2 + RAIL_W/2));
+  baseGroup.add(stopBack);
+
+  // ── Strap channel (through-slot in side walls with cross-bar retainer) ──────
+  // Proper slot: 24mm wide × 3mm tall, with a 1mm cross-bar in the middle
+  // so the strap can thread through but can't pull sideways out.
+  var strapMat = new THREE.MeshStandardMaterial({ color:0xfbbf24, roughness:0.4, emissive:0xfbbf24, emissiveIntensity:0.15 });
+  var slotH = 3.2, slotD = 24;
+  var slotYc = Y0 + W/2;  // centered on bottom wall
+
+  [-1, 1].forEach(function(side) {
+    var xc = side * (IW/2 + W/2);
+    // slot body (brighter overlay to show cutout)
+    var slotBody = box(W + 0.2, slotH, slotD, strapMat);
+    slotBody.position.set(xc, slotYc + slotH/2, 0);
+    baseGroup.add(slotBody);
+    // cross-bar retainer (1mm bar in center of slot, prevents strap pulling out)
+    var xbar = box(W + 0.4, slotH * 0.35, 1.5, strapMat);
+    xbar.position.set(xc, slotYc + slotH * 0.6, 0);
+    xbar.material = new THREE.MeshStandardMaterial({ color:0xf59e0b, roughness:0.3, emissive:0xf59e0b, emissiveIntensity:0.3 });
+    baseGroup.add(xbar);
+  });
+
+  // ── Snap-fit sockets on base rim (4 corners) ─────────────────────────────
+  // Rectangular notch on inner face of base walls — lid clips hook into these.
+  var socketMat = new THREE.MeshStandardMaterial({ color:0xf97316, roughness:0.35, emissive:0xf97316, emissiveIntensity:0.2 });
+  var sockY = Y0 + BH - 1.5;  // near top of base walls
+  [
+    [-(IW/2 + W/2),  sockY,  ID/4],   // left wall, front quarter
+    [-(IW/2 + W/2),  sockY, -ID/4],   // left wall, back quarter
+    [ IW/2 + W/2,    sockY,  ID/4],   // right wall
+    [ IW/2 + W/2,    sockY, -ID/4],
+  ].forEach(function(p) {
+    var sock = box(W + 0.2, 2, CLIP_W, socketMat);
+    sock.position.set(p[0], p[1], p[2]);
+    baseGroup.add(sock);
+  });
+
+  scene.add(baseGroup);
+
+  // ══════════════════════════════════════════════════════════════════════════════
+  // LID
+  // ══════════════════════════════════════════════════════════════════════════════
+  var lidGroup = new THREE.Group();
+  var lidY0 = Y0 + BH;  // lid sits on top of base
+
+  // top panel
+  var lidTop = box(OW, W, OD, lidMat);
+  lidTop.position.set(0, lidY0 + LH - W/2, 0);
+  edges(lidTop); lidGroup.add(lidTop);
+
+  // skirt walls (drop down over the base top rim, 4mm overlap)
+  var skirtH = 4;
+  var skirtY = lidY0 + skirtH/2;
+
+  var lSkirt = box(W, skirtH, OD, lidMat);
+  lSkirt.position.set(-(IW/2 + W/2), skirtY, 0);
+  edges(lSkirt); lidGroup.add(lSkirt);
+
+  var rSkirt = box(W, skirtH, OD, lidMat);
+  rSkirt.position.set(IW/2 + W/2, skirtY, 0);
+  edges(rSkirt); lidGroup.add(rSkirt);
+
+  var bkSkirt = box(OW, skirtH, W, lidMat);
+  bkSkirt.position.set(0, skirtY, -(ID/2 + W/2));
+  edges(bkSkirt); lidGroup.add(bkSkirt);
+
+  var frSkirt = box(OW, skirtH, W, lidMat);
+  frSkirt.position.set(0, skirtY, ID/2 + W/2);
+  edges(frSkirt); lidGroup.add(frSkirt);
+
+  // ── Snap-fit cantilever clips on lid skirt (4 corners) ───────────────────
+  // Each clip is a small hook that flexes inward during assembly and snaps
+  // into the socket notch on the base wall.
+  [
+    [-(IW/2 + W + CLIP_D/2),  skirtY - 0.5,  ID/4],
+    [-(IW/2 + W + CLIP_D/2),  skirtY - 0.5, -ID/4],
+    [ IW/2 + W + CLIP_D/2,    skirtY - 0.5,  ID/4],
+    [ IW/2 + W + CLIP_D/2,    skirtY - 0.5, -ID/4],
+  ].forEach(function(p) {
+    // cantilever arm
+    var arm = box(CLIP_D, CLIP_H, CLIP_W, clipMat);
+    arm.position.set(p[0], p[1], p[2]);
+    lidGroup.add(arm);
+    // hook nub (the catch that locks into the socket)
+    var nub = box(CLIP_D + 1, 1.2, CLIP_W - 1, clipMat);
+    nub.position.set(p[0] + (p[0] < 0 ? -0.5 : 0.5), p[1] - CLIP_H/2 + 0.6, p[2]);
+    lidGroup.add(nub);
+  });
+
+  // ── LiPo pocket on lid inner face ────────────────────────────────────────
+  // Recessed bay: raised walls (1mm) around the LiPo footprint (30×25mm)
+  // Battery presses in; lips stop it from sliding. Lid locks it down.
+  var lipoW = 30, lipoD = 25, lipoH = 3;
+  var pocketRimH = 1.5;
+  var pocketY = lidY0 + LH - W - pocketRimH/2;
+
+  // four rim walls of the pocket
+  [
+    [lipoW/2 + 0.75, pocketY, 0,           0.75, pocketRimH + lipoH, lipoD + 1.5],  // right
+    [-(lipoW/2+0.75),pocketY, 0,           0.75, pocketRimH + lipoH, lipoD + 1.5],  // left
+    [0, pocketY,  lipoD/2 + 0.75,          lipoW + 1.5, pocketRimH, 0.75],          // front
+    [0, pocketY, -(lipoD/2+0.75),          lipoW + 1.5, pocketRimH, 0.75],          // back
+  ].forEach(function(p) {
+    var rim = box(p[3], p[4], p[5], pocketMat);
+    rim.position.set(p[0], p[1], p[2]);
+    lidGroup.add(rim);
+  });
+
+  // ── Foam compression rib on lid inner face ────────────────────────────────
+  // 1mm raised rib runs across the width of the lid at the foam spacer position.
+  // When lid is closed it presses the foam 1mm, keeping the stack from rattling.
+  var compRib = box(IW - 1, 1.2, 3, ribMat);
+  compRib.position.set(0, lidY0 + LH - W - 0.6, 0);
+  lidGroup.add(compRib);
+
+  scene.add(lidGroup);
+
+  // ── component stack ───────────────────────────────────────────────────────
+  var stackGroup = new THREE.Group();
+  var yTop = WT.buildStack(scene, { showLabels: false });
+  // wrap in group for explode
+  scene.children.filter(function(c) {
+    return c !== baseGroup && c !== lidGroup;
+  }).forEach(function(c) { stackGroup.add(c); });
+  scene.add(stackGroup);
+
+  // ══════════════════════════════════════════════════════════════════════════════
+  // LABELS GROUP
+  // ══════════════════════════════════════════════════════════════════════════════
+  var labelsGroup = new THREE.Group();
+
+  function addLbl(html, col, x, y, z) {
+    var l = lbl(html, col);
+    l.position.set(x, y, z);
+    labelsGroup.add(l);
+  }
+
+  addLbl('<strong style="color:#22c55e">PCB rails</strong><br><span style="color:#4b5563;font-size:9px">XIAO slides in · 2mm side walls</span>',
+    '#22c55e', -(IW/2 + 18), Y0 + W + RAIL_H, 0);
+
+  addLbl('<strong style="color:#f97316">Snap-fit clips</strong><br><span style="color:#4b5563;font-size:9px">4 corners · cantilever hook</span>',
+    '#f97316', IW/2 + 20, lidY0 + 2, ID/4);
+
+  addLbl('<strong style="color:#6366f1">LiPo pocket</strong><br><span style="color:#4b5563;font-size:9px">30×25mm bay · 1.5mm rim</span>',
+    '#6366f1', IW/2 + 18, lidY0 + LH - W, 0);
+
+  addLbl('<strong style="color:#a855f7">Compression rib</strong><br><span style="color:#4b5563;font-size:9px">1.2mm · presses foam stack</span>',
+    '#a855f7', -(IW/2 + 20), lidY0 + LH - 1, 0);
+
+  addLbl('<strong style="color:#fbbf24">Strap channel</strong><br><span style="color:#4b5563;font-size:9px">24mm slot · cross-bar retainer</span>',
+    '#fbbf24', -(IW/2 + 20), Y0 + 3, 0);
+
+  addLbl('<strong style="color:#60a5fa">USB-C boss</strong><br><span style="color:#4b5563;font-size:9px">chamfered guide channel</span>',
+    '#60a5fa', 0, Y0 + W + usbH + 6, frontZ + 10);
+
+  scene.add(labelsGroup);
+
+  // ══════════════════════════════════════════════════════════════════════════════
+  // WRIST context
+  // ══════════════════════════════════════════════════════════════════════════════
+  var wristGroup = new THREE.Group();
+  var armGeo = new THREE.CylinderGeometry(27, 27, 80, 64);
+  var arm = new THREE.Mesh(armGeo, new THREE.MeshStandardMaterial({ color:0xc8956c, roughness:0.85 }));
+  arm.rotation.x = Math.PI/2;
+  arm.position.set(0, -27 + 2, 0);
+  arm.castShadow = true;
+  wristGroup.add(arm);
+  wristGroup.visible = false;
+  scene.add(wristGroup);
+
+  // ══════════════════════════════════════════════════════════════════════════════
+  // VISIBILITY / EXPLODE / SECTION
+  // ══════════════════════════════════════════════════════════════════════════════
+  var groups = { base: baseGroup, lid: lidGroup, stack: stackGroup, labels: labelsGroup, wrist: wristGroup };
+  var state   = { base:true, lid:true, stack:true, labels:true, wrist:false };
+
+  function toggle(key) {
+    state[key] = !state[key];
+    groups[key].visible = state[key];
+    document.getElementById('btn' + key.charAt(0).toUpperCase() + key.slice(1))
+      .classList.toggle('active', state[key]);
+  }
+
+  var exploded = false;
+  function toggleExplode() {
+    exploded = !exploded;
+    lidGroup.position.y   = exploded ? 30 : 0;
+    stackGroup.position.y = exploded ? 15 : 0;
+    document.getElementById('btnExplode').classList.toggle('active', exploded);
+  }
+
+  var sectioned = false;
+  function toggleSection() {
+    sectioned = !sectioned;
+    renderer.clippingPlanes    = sectioned ? [new THREE.Plane(new THREE.Vector3(-1,0,0), 0)] : [];
+    renderer.localClippingEnabled = sectioned;
+    document.getElementById('btnSection').classList.toggle('active', sectioned);
+  }
+
+  var rendered = false;
+  function toggleRender() {
+    rendered = !rendered;
+    sc.setRenderMode(rendered);
+    [baseMat, lidMat].forEach(function(m) {
+      m.opacity = rendered ? 0.7 : 0.55;
+      m.needsUpdate = true;
+    });
+    document.getElementById('btnRender').classList.toggle('active', rendered);
+  }
+
+  window.toggle        = toggle;
+  window.toggleExplode = toggleExplode;
+  window.toggleSection = toggleSection;
+  window.toggleRender  = toggleRender;
+
+})();
+</script>
+</body>
+</html>

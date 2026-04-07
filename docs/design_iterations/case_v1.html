@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>WristTurn — Case v1</title>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/renderers/CSS2DRenderer.js"></script>
+<script src="shared.js"></script>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#0e1117; overflow:hidden; font-family:ui-monospace,monospace; }
+canvas { display:block; }
+#info  { position:absolute; top:14px; left:16px; color:#e2e8f0; font-size:13px; font-weight:600; pointer-events:none; }
+#hint  { position:absolute; top:32px; left:16px; color:#4b5563; font-size:10px; pointer-events:none; }
+#controls { position:absolute; bottom:20px; left:16px; display:flex; gap:8px; }
+.btn {
+  background:#1f2937; border:1px solid #374151; color:#e2e8f0;
+  font-family:ui-monospace,monospace; font-size:11px;
+  padding:6px 12px; border-radius:4px; cursor:pointer;
+}
+.btn:hover { background:#374151; }
+.btn.active { border-color:#3b82f6; color:#60a5fa; }
+#dims {
+  position:absolute; top:14px; right:16px;
+  color:#cbd5e1; font-size:10px; line-height:2;
+  background:rgba(14,17,23,0.85); padding:10px 14px; border-radius:6px;
+}
+.layer-label {
+  color:#e2e8f0; font-size:10px; font-family:ui-monospace,monospace;
+  white-space:nowrap; line-height:1.6;
+  background:rgba(14,17,23,0.88); padding:3px 8px; border-radius:4px;
+}
+</style>
+</head>
+<body>
+<div id="info">WristTurn — Case v1</div>
+<div id="hint">drag · scroll · right-drag pan</div>
+<div id="dims">
+  <div style="color:#e2e8f0;font-weight:600;margin-bottom:4px">Case v1 dimensions</div>
+  <div>Inner cavity:  31 × 26 × 12 mm</div>
+  <div>Wall:          2 mm</div>
+  <div>Outer body:    35 × 30 × 16 mm</div>
+  <div>Strap slot:    22 × 3 mm (each side)</div>
+  <div>USB-C cutout:  9 × 4 mm (front face)</div>
+  <div>Stack height:  11.5 mm</div>
+</div>
+<div id="controls">
+  <button class="btn active" id="btnShell" onclick="toggleShell()">Shell</button>
+  <button class="btn" id="btnExplode" onclick="toggleExplode()">Explode</button>
+  <button class="btn" id="btnSection" onclick="toggleSection()">Cross-section</button>
+  <button class="btn" id="btnWrist" onclick="toggleWrist()">Wrist</button>
+  <button class="btn" id="btnRender" onclick="toggleRender()">Rendered</button>
+</div>
+
+<script>
+(function () {
+
+  var sc = WT.setupScene(0x0e1117);
+  var scene = sc.scene;
+
+  // ── build component stack ────────────────────────────────────────────────────
+  var yTop = WT.buildStack(scene, { showLabels: true });
+
+  // Stack sits on strap (yBase=2.5). Case inner bottom aligns with strap top.
+  // Case outer bottom = strap top = y=2.5
+  // Inner cavity: 31w × 26d × 12h  (stack 21×17.5×11.5 + 0.5mm clearance each side + USB-C protrusion room)
+  // Wall: 2mm → outer: 35w × 30d, height 16mm (12 inner + 2 bottom + 2 top)
+
+  var WALL      = 2;
+  var IN_W      = 31;   // inner width  (X)
+  var IN_D      = 26;   // inner depth  (Z)
+  var IN_H      = 12;   // inner height (Y)
+  var OUT_W     = IN_W + WALL * 2;   // 35
+  var OUT_D     = IN_D + WALL * 2;   // 30
+  var OUT_H     = IN_H + WALL * 2;   // 16
+  var CASE_Y0   = 2.5;               // bottom of case = top of strap
+
+  var caseMat = new THREE.MeshStandardMaterial({
+    color: 0x334155, roughness: 0.5, metalness: 0.1,
+    transparent: true, opacity: 0.35,
+    side: THREE.DoubleSide, depthWrite: false
+  });
+
+  var shellGroup = new THREE.Group();
+
+  // ── case body (hollow box via 5 faces) ───────────────────────────────────────
+  // Bottom face
+  var bottom = WT.box(OUT_W, WALL, OUT_D, caseMat);
+  bottom.position.set(0, CASE_Y0 + WALL / 2, 0);
+  shellGroup.add(bottom);
+
+  // Top face
+  var top = WT.box(OUT_W, WALL, OUT_D, caseMat);
+  top.position.set(0, CASE_Y0 + WALL + IN_H + WALL / 2, 0);
+  shellGroup.add(top);
+
+  // Left wall (−X)
+  var leftW = WT.box(WALL, IN_H, OUT_D, caseMat);
+  leftW.position.set(-(IN_W / 2 + WALL / 2), CASE_Y0 + WALL + IN_H / 2, 0);
+  shellGroup.add(leftW);
+
+  // Right wall (+X)
+  var rightW = WT.box(WALL, IN_H, OUT_D, caseMat);
+  rightW.position.set(IN_W / 2 + WALL / 2, CASE_Y0 + WALL + IN_H / 2, 0);
+  shellGroup.add(rightW);
+
+  // Back face (−Z): full
+  var backF = WT.box(OUT_W, OUT_H, WALL, caseMat);
+  backF.position.set(0, CASE_Y0 + OUT_H / 2, -(IN_D / 2 + WALL / 2));
+  shellGroup.add(backF);
+
+  // Front face (+Z): has USB-C cutout — rendered as two panels left/right of slot
+  // USB-C slot: 9mm wide × 4mm tall, centered horizontally, at bottom of inner cavity
+  var usbW = 9, usbH = 4;
+  var usbY = CASE_Y0 + WALL + usbH / 2 + 0.5;  // 0.5mm from inner bottom
+  var frontZ = IN_D / 2 + WALL / 2;
+
+  // left panel of front face
+  var frontL = WT.box((OUT_W - usbW) / 2, OUT_H, WALL, caseMat);
+  frontL.position.set(-(usbW / 2 + (OUT_W - usbW) / 4), CASE_Y0 + OUT_H / 2, frontZ);
+  shellGroup.add(frontL);
+  // right panel
+  var frontR = WT.box((OUT_W - usbW) / 2, OUT_H, WALL, caseMat);
+  frontR.position.set(usbW / 2 + (OUT_W - usbW) / 4, CASE_Y0 + OUT_H / 2, frontZ);
+  shellGroup.add(frontR);
+  // top strip above USB-C
+  var frontTop = WT.box(usbW, OUT_H - WALL - usbH - 0.5, WALL, caseMat);
+  frontTop.position.set(0, CASE_Y0 + WALL + usbH + 0.5 + (OUT_H - WALL - usbH - 0.5) / 2, frontZ);
+  shellGroup.add(frontTop);
+
+  // ── strap slot cutouts (left and right walls) ─────────────────────────────
+  // Strap slot: 22mm wide × 3mm tall, centered on ±X walls, at y = strap height + 1mm
+  // Visualised as a bright stripe on the wall mesh (approximation)
+  var slotMat = new THREE.MeshStandardMaterial({ color: 0xf97316, roughness: 0.4, emissive: 0xf97316, emissiveIntensity: 0.2 });
+  var slotY = CASE_Y0 + WALL / 2;   // at bottom wall level
+
+  var slotL = WT.box(WALL + 0.1, 3, 22, slotMat);
+  slotL.position.set(-(IN_W / 2 + WALL / 2), slotY + 1, 0);
+  shellGroup.add(slotL);
+
+  var slotR = WT.box(WALL + 0.1, 3, 22, slotMat);
+  slotR.position.set(IN_W / 2 + WALL / 2, slotY + 1, 0);
+  shellGroup.add(slotR);
+
+  // ── USB-C slot highlight ──────────────────────────────────────────────────
+  var usbSlotMat = new THREE.MeshStandardMaterial({ color: 0x60a5fa, roughness: 0.3, emissive: 0x60a5fa, emissiveIntensity: 0.3 });
+  var usbSlot = WT.box(usbW, usbH, WALL + 0.1, usbSlotMat);
+  usbSlot.position.set(0, usbY, frontZ);
+  shellGroup.add(usbSlot);
+
+  // ── outer edges on case ───────────────────────────────────────────────────
+  var edgeMat = new THREE.LineBasicMaterial({ color: 0x64748b, transparent: true, opacity: 0.8 });
+  var outerBox = new THREE.Mesh(new THREE.BoxGeometry(OUT_W, OUT_H, OUT_D));
+  outerBox.position.set(0, CASE_Y0 + OUT_H / 2, 0);
+  var eg = new THREE.EdgesGeometry(outerBox.geometry);
+  var edgeLines = new THREE.LineSegments(eg, edgeMat);
+  edgeLines.position.copy(outerBox.position);
+  shellGroup.add(edgeLines);
+
+  scene.add(shellGroup);
+
+  // ── labels ────────────────────────────────────────────────────────────────
+  var usbLabel = WT.makeLabel('<strong style="color:#60a5fa">USB-C cutout</strong><br><span style="font-size:9px;color:#4b5563">9×4mm · centered</span>', '#60a5fa');
+  usbLabel.position.set(0, usbY, frontZ + 8);
+  scene.add(usbLabel);
+
+  var slotLabel = WT.makeLabel('<strong style="color:#f97316">Strap slot</strong><br><span style="font-size:9px;color:#4b5563">22mm wide · 3mm tall</span>', '#f97316');
+  slotLabel.position.set(-(IN_W / 2 + WALL + 10), slotY + 1, 0);
+  scene.add(slotLabel);
+
+  var caseLabel = WT.makeLabel('<strong style="color:#94a3b8">Shell</strong><br><span style="font-size:9px;color:#4b5563">35×30×16mm · 2mm wall · PETG</span>', '#64748b');
+  caseLabel.position.set(IN_W / 2 + WALL + 10, CASE_Y0 + OUT_H / 2, 0);
+  scene.add(caseLabel);
+
+  // ── explode offsets ───────────────────────────────────────────────────────
+  // Collect movable objects for explode view
+  // (shellGroup stays, stack parts move up)
+  // ── wrist context (real-scale preview) ───────────────────────────────────────
+  var wristGroup = new THREE.Group();
+  var wristR = 27;
+
+  var armGeo = new THREE.CylinderGeometry(wristR, wristR, 80, 64);
+  var arm = new THREE.Mesh(armGeo, new THREE.MeshStandardMaterial({ color: 0xc8956c, roughness: 0.85 }));
+  arm.rotation.x = Math.PI / 2;
+  arm.position.set(0, -wristR + 2, 0);
+  arm.castShadow = true;
+  wristGroup.add(arm);
+
+  [-12, 12].forEach(function(xOff) {
+    var bump = new THREE.Mesh(
+      new THREE.SphereGeometry(4, 16, 16),
+      new THREE.MeshStandardMaterial({ color: 0xb8855c, roughness: 0.9 })
+    );
+    bump.position.set(xOff, -wristR + 4, wristR - 2);
+    wristGroup.add(bump);
+  });
+
+  wristGroup.visible = false;
+  scene.add(wristGroup);
+
+  var exploded = false;
+  var sectioned = false;
+  var shellVisible = true;
+  var wristVisible = false;
+
+  function toggleShell() {
+    shellVisible = !shellVisible;
+    shellGroup.visible = shellVisible;
+    document.getElementById('btnShell').classList.toggle('active', shellVisible);
+  }
+
+  function toggleExplode() {
+    exploded = !exploded;
+    // shift LiPo and foam upward for exploded view
+    // We traverse scene children that we placed at known Y positions
+    // Simple approach: rebuild not practical; instead shift shellGroup up
+    shellGroup.position.y = exploded ? 20 : 0;
+    document.getElementById('btnExplode').classList.toggle('active', exploded);
+  }
+
+  function toggleSection() {
+    sectioned = !sectioned;
+    // ClippingPlane: cut along X=0
+    if (sectioned) {
+      sc.renderer.clippingPlanes = [ new THREE.Plane(new THREE.Vector3(-1, 0, 0), 0) ];
+      sc.renderer.localClippingEnabled = true;
+    } else {
+      sc.renderer.clippingPlanes = [];
+      sc.renderer.localClippingEnabled = false;
+    }
+    document.getElementById('btnSection').classList.toggle('active', sectioned);
+  }
+
+  function toggleWrist() {
+    wristVisible = !wristVisible;
+    wristGroup.visible = wristVisible;
+    document.getElementById('btnWrist').classList.toggle('active', wristVisible);
+  }
+
+  var rendered = false;
+  function toggleRender() {
+    rendered = !rendered;
+    sc.setRenderMode(rendered);
+    // in rendered mode make shell more opaque so it catches light properly
+    caseMat.opacity = rendered ? 0.55 : 0.35;
+    caseMat.needsUpdate = true;
+    document.getElementById('btnRender').classList.toggle('active', rendered);
+  }
+
+  // expose to buttons
+  window.toggleShell    = toggleShell;
+  window.toggleExplode  = toggleExplode;
+  window.toggleSection  = toggleSection;
+  window.toggleWrist    = toggleWrist;
+  window.toggleRender   = toggleRender;
+
+})();
+</script>
+</body>
+</html>

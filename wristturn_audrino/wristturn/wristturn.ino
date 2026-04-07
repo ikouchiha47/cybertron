@@ -37,6 +37,32 @@ BLECharacteristic rawModeChar("19B10014-E8F2-537E-4F6C-D104768A1214",
 // ── Onboard IMU ───────────────────────────────────────────────────────────────
 LSM6DS3 imu(I2C_MODE, 0x6A);
 
+// ── Tap detection (polling TAP_SRC — no interrupt pin needed) ────────────────
+void setupTapDetection() {
+  // TAP_CFG (0x58):
+  //   bit7 = INTERRUPTS_ENABLE  (LSM6DS3TR-C specific — different from plain LSM6DS3)
+  //   bit3-1 = TAP_X/Y/Z_EN
+  //   bit0 = LIR (latch interrupt) — keeps SINGLE_TAP bit set until TAP_SRC is read.
+  //          Without LIR=1 the bit clears in ~38ms and polling can miss it.
+  // 0x8F = INTERRUPTS_ENABLE | TAP_X_EN | TAP_Y_EN | TAP_Z_EN | LIR
+  imu.writeRegister(0x58, 0x8F);
+
+  // TAP_THS_6D (0x59): 1 LSB = FS/32 = 62.5mg at ±2g → 8 LSBs = 500mg
+  // Lower value = more sensitive. Try 0x04 (250mg) if not firing.
+  imu.writeRegister(0x59, 0x08);
+
+  // INT_DUR2 (0x5A): SHOCK=2 (154ms max impulse) | QUIET=1 (38ms hardware debounce)
+  imu.writeRegister(0x5A, 0x06);
+
+  // WAKE_UP_THS (0x5B): bit7=0 → single tap only
+  imu.writeRegister(0x5B, 0x00);
+
+  // Verify write landed (sanity check)
+  uint8_t check = 0;
+  imu.readRegister(&check, 0x58);
+  LOG_I("Tap detection ready. TAP_CFG readback=0x%02X (expect 0x8F)", check);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // State machine
 // ─────────────────────────────────────────────────────────────────────────────
@@ -221,6 +247,7 @@ void setup() {
     while (true) { delay(100); }
   }
   LOG_I("LSM6DS3TR-C ready.");
+  setupTapDetection();
 
   // ── Gyro bias calibration — keep wrist still for ~2s after power-on ──────
   LOG_I("Calibrating gyro bias (keep still)...");
@@ -299,6 +326,20 @@ void loop() {
   if (now - timing.lastSampleMs < SAMPLE_INTERVAL_MS) return;
   float dt = (now - timing.lastSampleMs) * 0.001f;
   timing.lastSampleMs = now;
+
+  // ── Tap polling (TAP_SRC clears on read) ─────────────────────────────────
+  {
+    static unsigned long lastTapMs = 0;
+    uint8_t tapSrc = 0;
+    imu.readRegister(&tapSrc, 0x1C);
+    if ((tapSrc & 0x20) && (now - lastTapMs > 500)) {  // bit5=SINGLE_TAP, 500ms sw debounce
+      lastTapMs = now;
+      if (Bluefruit.Periph.connected()) {
+        gestureChar.notify("tap", 3);
+      }
+      LOG_I("[Tap] src=0x%02X", tapSrc);
+    }
+  }
 
   // ── Read sensors ─────────────────────────────────────────────────────────
   float ax = imu.readFloatAccelX();
@@ -423,6 +464,20 @@ void loop() {
   if (!ss.rollArmed  && fabsf(dRoll)  <= cfg.deadzoneDegs) ss.rollArmed  = true;
   if (!ss.pitchArmed && fabsf(dPitch) <= cfg.deadzoneDegs) ss.pitchArmed = true;
   if (!ss.yawArmed   && fabsf(dYaw)   <= cfg.deadzoneDegs) ss.yawArmed   = true;
+
+  // Force-rebase safety net: drift can prevent smoothGyroMag from dropping below
+  // STILL_THRESH, which blocks the normal rebase path and permanently locks out gestures.
+  // Guard: accelStill must be true — wrist must actually be physically still.
+  // Without accelStill guard, this rebases mid-movement and the return motion fires
+  // as a phantom gesture in the opposite direction.
+  {
+    bool anyDisarmed = !ss.rollArmed || !ss.pitchArmed || !ss.yawArmed;
+    if (anyDisarmed && accelStill && (now - timing.lastGestureMs) > 2000) {
+      ss.baseRoll = roll; ss.basePitch = pitch; ss.baseYaw = yaw;
+      ss.rollArmed = ss.pitchArmed = ss.yawArmed = true;
+      LOG_D("[Rearm] force-rebase: roll=%.1f pitch=%.1f yaw=%.1f", roll, pitch, yaw);
+    }
+  }
 
   if ((now - timing.lastGestureMs) > cfg.debounceMs) {
     const char* gesture = nullptr;
