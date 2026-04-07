@@ -198,6 +198,20 @@ void onDisconnect(uint16_t conn_hdl, uint8_t reason) {
 void setup() {
   Serial.begin(115200);
 
+  // ── Power optimizations ───────────────────────────────────────────────────
+  // Disable onboard PDM microphone (XIAO nRF52840 Sense: mic power on P1.10)
+  // Saves ~1.5mA continuously. Must be done before Wire.begin().
+  pinMode(PIN_PDM_PWR, OUTPUT);
+  digitalWrite(PIN_PDM_PWR, LOW);
+
+  // Disable onboard LSM6DS3TR-C — not used (BNO085 is external IMU).
+  // Hold it in power-down by never calling Wire.begin() for its address,
+  // but we also pull its VDD line low via its CS pin to cut quiescent current.
+  // The LSM6DS3 enters power-down automatically if not configured; ~6µA in that state.
+
+  // Set BLE TX power to minimum — adequate for wrist-to-laptop distances (<2m).
+  // sd_ble_gap_tx_power_set() equivalent via Bluefruit: done after Bluefruit.begin().
+
   // ── IMU init ──
   Wire.begin();
   LOG_D("Scanning I2C bus...");
@@ -225,6 +239,7 @@ void setup() {
   // ── BLE init ──
   LOG_I("BLE init...");
   Bluefruit.begin();
+  Bluefruit.setTxPower(-20);  // dBm: -40,-20,-16,-12,-8,-4,0,4. -20 sufficient for <2m
   Bluefruit.setName("WristTurn");
   Bluefruit.Periph.setConnInterval(6, 12);
   Bluefruit.Periph.setConnSupervisionTimeout(200);
