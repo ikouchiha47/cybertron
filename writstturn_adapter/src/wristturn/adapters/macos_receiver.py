@@ -24,6 +24,7 @@ from bleak import BleakScanner, BleakClient
 
 DEVICE_NAME       = "WristTurn"
 GESTURE_CHAR_UUID = "19B10001-E8F2-537E-4F6C-D104768A1214"
+BATTERY_CHAR_UUID = "00002a19-0000-1000-8000-00805f9b34fb"  # standard BLE Battery Level
 
 COMBO_TIMEOUT_S = 0.8   # seconds to wait for next gesture before firing
 COMBO_MAX_LEN   = 3     # maximum gestures in a combo
@@ -135,6 +136,11 @@ async def main():
 
         queue.push(gesture)
 
+    def on_battery(_, data: bytearray):
+        pct = data[0]
+        bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+        print(f"[Battery] {bar} {pct}%")
+
     print("Scanning for WristTurn...")
     device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=15)
     if device is None:
@@ -144,6 +150,17 @@ async def main():
     print(f"Found: {device.address}  Connecting...")
     async with BleakClient(device) as client:
         print("Connected. Waiting for gestures (Ctrl+C to quit)...")
+
+        # read battery level immediately on connect
+        try:
+            batt_data = await client.read_gatt_char(BATTERY_CHAR_UUID)
+            pct = batt_data[0]
+            bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+            print(f"[Battery] {bar} {pct}%")
+            await client.start_notify(BATTERY_CHAR_UUID, on_battery)
+        except Exception:
+            pass  # battery service not available — ignore
+
         await client.start_notify(GESTURE_CHAR_UUID, on_gesture)
         await asyncio.Future()
 

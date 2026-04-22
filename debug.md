@@ -61,6 +61,86 @@ BNO085 GND  → GND
 **I2C scan finds `0x4A` but `imu.begin()` fails:**
 - Try calling `imu.begin(0x4A, Wire)` explicitly in the sketch
 
+**BNO085 not found after DFU upload / reset (I2C bus lockup):**
+
+DFU upload or a sudden reset can interrupt an in-flight I2C transaction, leaving
+the BNO085 holding SDA low indefinitely. The bus appears dead — scan finds nothing.
+
+This is covered by **NXP UM10204 §3.1.16 "Bus Clear"** (the official I2C spec):
+send 9 SCL clock pulses to force the stuck slave to release SDA, then issue a
+STOP condition to reset bus state.
+
+The firmware already does this automatically in `setup()` before `Wire.begin()`.
+If you are writing a new sketch and hit this issue, add before `Wire.begin()`:
+
+```cpp
+Wire.end();
+pinMode(PIN_WIRE_SDA, OUTPUT); pinMode(PIN_WIRE_SCL, OUTPUT);
+// STOP condition
+digitalWrite(PIN_WIRE_SDA, LOW);  delayMicroseconds(20);
+digitalWrite(PIN_WIRE_SCL, HIGH); delayMicroseconds(20);
+digitalWrite(PIN_WIRE_SDA, HIGH); delayMicroseconds(20);
+// 9 clock pulses
+pinMode(PIN_WIRE_SDA, INPUT_PULLUP);
+for (int i = 0; i < 9; i++) {
+  digitalWrite(PIN_WIRE_SCL, LOW);  delayMicroseconds(20);
+  digitalWrite(PIN_WIRE_SCL, HIGH); delayMicroseconds(20);
+}
+// Final STOP
+pinMode(PIN_WIRE_SDA, OUTPUT);
+digitalWrite(PIN_WIRE_SDA, LOW);  delayMicroseconds(20);
+digitalWrite(PIN_WIRE_SCL, HIGH); delayMicroseconds(20);
+digitalWrite(PIN_WIRE_SDA, HIGH); delayMicroseconds(20);
+delay(50);
+Wire.begin();
+delay(100);
+```
+
+Source: https://www.nxp.com/docs/en/user-guide/UM10204.pdf
+
+---
+
+## 7. Sleep / Wake (Firmware)
+
+The firmware enters light sleep after 5 minutes of inactivity (no BLE connection,
+no gestures). During sleep:
+- All high-frequency IMU reports are disabled
+- `SH2_SIGNIFICANT_MOTION` (sensor ID `0x12`) is armed on the BNO085 — a
+  hardware one-shot detector that fires when the BNO085 detects a clear limb
+  movement. Source: BNO085 datasheet §3.4 / SH-2 Reference Manual
+- BLE advertising continues at a slow interval (~2–3s) so the phone can still
+  find the device and the SoftDevice generates events to periodically wake the
+  nRF52840 CPU to poll the IMU
+
+**Why slow advertising instead of stopping completely:**
+The BNO085 INT pin is not wired to the nRF52840 in the current hardware.
+Without an INT-pin GPIO interrupt, `waitForEvent()` would sleep the CPU
+indefinitely with no way to poll the IMU. Slow advertising keeps the SoftDevice
+alive, which wakes the CPU every ~2s to check for sensor events.
+
+**Hardware fix (next revision):**
+Wire BNO085 INT pin → XIAO D1 (nRF52840 P0.03), then add in setup():
+```cpp
+pinMode(1, INPUT_PULLUP);
+attachInterrupt(digitalPinToInterrupt(1), [](){}, FALLING);
+```
+Then `enterSleep()` can call `Bluefruit.Advertising.stop()` cleanly, and
+`waitForEvent()` will wake on the BNO085 interrupt instead.
+
+**Known issue with 7Semi BNO085 variant:**
+The SparkFun BNO08x library may not enable the INT output pin by default in I2C mode
+for the 7Semi variant. If `digitalRead(1)` stays HIGH after `enableReports()`, the INT
+signal is not being driven. The slow-advertising workaround handles this case — the
+interrupt is registered and will work if INT ever activates, but is not required.
+Proper INT configuration needs investigation with a logic analyzer on the next revision.
+
+**Confirmed sources:**
+- BNO085 INT pin: active-low, separate 0.1" header on SparkFun breakout (not
+  on Qwiic connector). Ref: https://docs.sparkfun.com/SparkFun_VR_IMU_Breakout_BNO086_QWIIC/hardware_overview/
+- nRF52840 GPIOTE: all 48 GPIO pins can be assigned to one of 8 GPIOTE channels
+  for external interrupts. P0.03 (D1) is confirmed compatible.
+  Ref: https://docs.nordicsemi.com/bundle/ps_nrf52840/page/gpio.html
+
 ---
 
 ## 5. No Gesture Logs (IMU Connected)

@@ -3,21 +3,29 @@ import {
   View, Text, FlatList, TouchableOpacity, Pressable, TextInput,
   StyleSheet, Alert, ActivityIndicator,
 } from "react-native";
+import type { CompositeScreenProps } from "@react-navigation/native";
 import type { StackScreenProps } from "@react-navigation/stack";
-import type { RootStackParams } from "../navigation/AppNavigator";
+import type { BottomTabScreenProps } from "@react-navigation/bottom-tabs";
+import type { TabParams, RootStackParams } from "../navigation/AppNavigator";
 import { registry } from "../devices/registry/DeviceRegistry";
 import { useMDNSDiscovery } from "../discovery/useMDNSDiscovery";
 import { AndroidTV } from "../../modules/androidtv";
 import { ANDROIDTV_COMMANDS } from "../devices/adapters/AndroidTVAdapter";
+import { WIZ_COMMANDS } from "../devices/adapters/WizAdapter";
+import { discoverWizDevices, WIZ_PORT } from "../devices/adapters/wizUdp";
 import { DEFAULT_PORT } from "../types";
 import type { DeviceMetadata, TransportType } from "../types";
 
-type Props = StackScreenProps<RootStackParams, "Settings">;
+type Props = CompositeScreenProps<
+  BottomTabScreenProps<TabParams, "Settings">,
+  StackScreenProps<RootStackParams>
+>;
 
 export function SettingsScreen({ navigation }: Props) {
   const { devices: discovered, scanning, rescan } = useMDNSDiscovery();
   const [saved, setSaved] = useState<DeviceMetadata[]>([]);
   const [showAddForm, setShowAddForm] = useState(false);
+  const [wizScanning, setWizScanning] = useState(false);
   const [manualHost, setManualHost] = useState("");
   const [manualPort, setManualPort] = useState(String(DEFAULT_PORT.androidtv));
   const [manualName, setManualName] = useState("");
@@ -87,6 +95,25 @@ export function SettingsScreen({ navigation }: Props) {
     setManualHost("");
     setManualName("");
     setSaved(registry.all());
+  }
+
+  async function scanForWizBulbs() {
+    setWizScanning(true);
+    try {
+      const found = await discoverWizDevices(5000);
+      for (const { ip } of found) {
+        const id = `wiz:${ip}`;
+        if (!registry.get(id)) {
+          await registry.register({
+            id, name: `WiZ Bulb (${ip})`, host: ip, port: WIZ_PORT,
+            transport: "wiz", availableCommands: WIZ_COMMANDS,
+          });
+        }
+      }
+      setSaved(registry.all());
+    } finally {
+      setWizScanning(false);
+    }
   }
 
   async function removeDevice(id: string) {
@@ -233,9 +260,26 @@ export function SettingsScreen({ navigation }: Props) {
         </View>
       ))}
 
+      {/* WiZ bulb discovery */}
+      <View style={s.sectionRow}>
+        <Text style={s.label}>Smart Bulbs (WiZ)</Text>
+        <TouchableOpacity
+          style={[s.scanBtn, wizScanning && s.scanBtnActive]}
+          onPress={wizScanning ? undefined : scanForWizBulbs}
+          disabled={wizScanning}
+        >
+          {wizScanning
+            ? <ActivityIndicator color="#4a9eff" size="small" />
+            : <Text style={s.scanBtnText}>Scan</Text>}
+        </TouchableOpacity>
+      </View>
+      <TouchableOpacity style={s.addToggle} onPress={() => navigation.navigate("WizProvision")}>
+        <Text style={s.addToggleText}>+  Add New Bulb (setup)</Text>
+      </TouchableOpacity>
+
       {/* Manual add — collapsible */}
       <TouchableOpacity style={s.addToggle} onPress={() => setShowAddForm((v) => !v)}>
-        <Text style={s.addToggleText}>+  Add Device</Text>
+        <Text style={s.addToggleText}>+  Add Device (manual)</Text>
       </TouchableOpacity>
       {showAddForm && (
         <View style={s.manualBlock}>

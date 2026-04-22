@@ -7,6 +7,7 @@ const SERVICE_TYPES: Array<{ service: string; transport: TransportType }> = [
   { service: "androidtvremote2", transport: "androidtv" },
   { service: "wt-daemon",        transport: "macdaemon" },
   { service: "http",             transport: "http"       },
+  { service: "wiz",              transport: "wiz"        },
 ];
 
 const SCAN_PLAN: Array<{ service: string; transport: TransportType }> = [
@@ -16,13 +17,14 @@ const SCAN_PLAN: Array<{ service: string; transport: TransportType }> = [
   SERVICE_TYPES[1],
   SERVICE_TYPES[2],
   SERVICE_TYPES[3],
+  SERVICE_TYPES[4],
 ];
 const SCAN_DURATION_MS = 3000;
 const SCAN_INTERVAL_MS = 300;
 const SCAN_IMPL = ImplType.DNSSD;
 
 const PRIORITY: Record<TransportType, number> = {
-  androidtv: 3, macdaemon: 2, websocket: 1, tcp: 1, http: 0,
+  androidtv: 3, macdaemon: 2, websocket: 1, tcp: 1, http: 0, wiz: 1,
 };
 
 export function useMDNSDiscovery() {

@@ -1,11 +1,14 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
-  View, Text, TouchableOpacity, StyleSheet, Animated, ScrollView,
+  View, Text, TouchableOpacity, StyleSheet, Animated, ScrollView, Pressable, AppState,
 } from "react-native";
+import MCI from "react-native-vector-icons/MaterialCommunityIcons";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { StackScreenProps } from "@react-navigation/stack";
 import type { RootStackParams } from "../navigation/AppNavigator";
 import { useBLE, setActiveComboMap } from "../ble/useBLE";
+import { BatteryWave } from "../ui/BatteryWave";
+import { SessionRecorder } from "../debug/SessionRecorder";
 import { registry } from "../devices/registry/DeviceRegistry";
 import { MappingStore } from "../mapping/MappingStore";
 import type { ComboMap } from "../types";
@@ -21,10 +24,41 @@ export function ActiveControlScreen({ route, navigation }: Props) {
   const [deviceConnected, setDeviceConnected] = useState(false);
   const [lastCmd, setLastCmd] = useState("");
   const [activeCombo, setActiveCombo] = useState("");
+  const [recording, setRecording]   = useState(SessionRecorder.isActive());
+  const [recCount, setRecCount]     = useState(SessionRecorder.eventCount());
+  const [locked, setLocked] = useState(false);  // when true, idle timeout is disabled
   const insets = useSafeAreaInsets();
 
-  const opacity = useRef(new Animated.Value(0)).current;
-  const scale   = useRef(new Animated.Value(0.8)).current;
+  const opacity     = useRef(new Animated.Value(0)).current;
+  const scale       = useRef(new Animated.Value(0.8)).current;
+  const idleTimer   = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lockedRef   = useRef(false);
+
+  const IDLE_TIMEOUT_MS = 8000;
+
+  function resetIdleTimer() {
+    if (idleTimer.current) clearTimeout(idleTimer.current);
+    if (lockedRef.current) return;
+    // Don't auto-dismiss while app is backgrounded — user is using gestures from another app
+    if (AppState.currentState !== "active") return;
+    idleTimer.current = setTimeout(() => navigation.goBack(), IDLE_TIMEOUT_MS);
+  }
+
+  useEffect(() => {
+    lockedRef.current = locked;
+    if (locked && idleTimer.current) {
+      clearTimeout(idleTimer.current);
+      idleTimer.current = null;
+    }
+  }, [locked]);
+
+  useEffect(() => {
+    return () => { if (idleTimer.current) clearTimeout(idleTimer.current); };
+  }, []);
+
+  useEffect(() => {
+    return SessionRecorder.subscribe((active, n) => { setRecording(active); setRecCount(n); });
+  }, []);
 
   useEffect(() => {
     if (!meta || !proxy) return;
@@ -50,14 +84,17 @@ export function ActiveControlScreen({ route, navigation }: Props) {
     ]).start();
   }
 
-  const { connected, lastGesture, lastCombo } = useBLE({
+  const { connected, lastGesture, lastCombo, batteryPct } = useBLE({
+    onGesture: (gesture) => {
+      resetIdleTimer();
+      if (gesture === "shake" && !lockedRef.current) navigation.goBack();
+    },
     onCombo: async (combo) => {
-      console.log("[ActiveControl] onCombo", combo, "map=", JSON.stringify(mapRef.current), "proxy=", !!proxy, "connected=", proxy?.isConnected());
       setActiveCombo(combo);
       animateGesture();
       const commandId = mapRef.current[combo];
-      console.log("[ActiveControl] commandId=", commandId, "availableCommands=", meta?.availableCommands?.length);
       if (!commandId || !proxy || !meta) return;
+      SessionRecorder.recordCommand(commandId, meta.id);
       if (commandId.startsWith("deeplink:")) {
         const url = commandId.slice("deeplink:".length);
         setLastCmd(url);
@@ -67,11 +104,8 @@ export function ActiveControlScreen({ route, navigation }: Props) {
       const cmd = meta.availableCommands.find((c) => c.id === commandId);
       if (!cmd) return;
       setLastCmd(cmd.label);
-      const t0 = Date.now();
-      console.log("[ActiveControl] sendCommand", cmd.id, "payload=", cmd.payload, "t=", t0);
       try {
         await proxy.sendCommand(cmd);
-        console.log("[ActiveControl] sendCommand ok jsLatency=", Date.now() - t0, "ms");
       } catch (e) {
         console.error("[ActiveControl] sendCommand error:", e);
       }
@@ -92,9 +126,26 @@ export function ActiveControlScreen({ route, navigation }: Props) {
     <View style={[s.container, { paddingBottom: insets.bottom + 16 }]}>
       {/* Header */}
       <View style={s.header}>
-        <Text style={s.deviceName}>{meta.name}</Text>
-        <View style={[s.pill, deviceConnected ? s.pillOn : s.pillOff]}>
-          <Text style={s.pillText}>{deviceConnected ? "Ready" : "Connecting..."}</Text>
+        <Text style={s.deviceName} numberOfLines={1}>{meta.name}</Text>
+        <View style={s.headerActions}>
+          {/* Lock toggle — keeps screen alive when on */}
+          <Pressable
+            style={[s.iconBtn, locked && s.iconBtnActive]}
+            onPress={() => setLocked((v) => !v)}
+          >
+            <MCI name={locked ? "pin" : "pin-outline"} size={20} color={locked ? "#4a9eff" : "#555"} />
+          </Pressable>
+          {/* REC toggle */}
+          <Pressable
+            style={[s.iconBtn, recording && s.iconBtnRec]}
+            onPress={() => recording ? SessionRecorder.stop().then(() => {}) : SessionRecorder.start()}
+          >
+            <MCI name={recording ? "stop-circle" : "record-circle-outline"} size={20} color={recording ? "#ff4444" : "#555"} />
+            {recording && <Text style={s.recCount}>{recCount}</Text>}
+          </Pressable>
+          <View style={[s.pill, deviceConnected ? s.pillOn : s.pillOff]}>
+            <Text style={s.pillText}>{deviceConnected ? "Ready" : "Connecting..."}</Text>
+          </View>
         </View>
       </View>
 
@@ -125,8 +176,13 @@ export function ActiveControlScreen({ route, navigation }: Props) {
 
       {/* Footer */}
       <View style={s.footer}>
-        <View style={[s.pill, connected ? s.pillOn : s.pillOff]}>
-          <Text style={s.pillText}>{connected ? "Wrist connected" : "Wrist scanning..."}</Text>
+        <View style={[s.pill, connected ? s.pillOn : s.pillOff, { flexDirection: "row", alignItems: "center", gap: 8 }]}>
+          <Text style={s.pillText}>
+            {connected ? "Wrist connected" : "Wrist scanning..."}
+          </Text>
+          {connected && batteryPct !== null && (
+            <BatteryWave pct={batteryPct} size={28} />
+          )}
         </View>
         <TouchableOpacity
           style={s.remapBtn}
@@ -142,7 +198,12 @@ export function ActiveControlScreen({ route, navigation }: Props) {
 const s = StyleSheet.create({
   container:      { flex: 1, backgroundColor: "#0f0f0f", padding: 20 },
   header:         { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 16 },
-  deviceName:     { fontSize: 22, color: "#fff", fontWeight: "600" },
+  deviceName:     { fontSize: 18, color: "#fff", fontWeight: "600", flex: 1, marginRight: 8 },
+  headerActions:  { flexDirection: "row", alignItems: "center", gap: 6 },
+  iconBtn:        { padding: 6, borderRadius: 8, backgroundColor: "#1c1c1c" },
+  iconBtnActive:  { backgroundColor: "#1e3a5f" },
+  iconBtnRec:     { backgroundColor: "#2a0f0f", flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 8 },
+  recCount:       { color: "#ff4444", fontSize: 11, fontFamily: "monospace" },
   pill:           { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 10 },
   pillOn:         { backgroundColor: "#1a7f4b" },
   pillOff:        { backgroundColor: "#333" },

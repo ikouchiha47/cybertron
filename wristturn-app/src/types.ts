@@ -1,4 +1,4 @@
-export type TransportType = "androidtv" | "http" | "websocket" | "tcp" | "macdaemon";
+export type TransportType = "androidtv" | "http" | "websocket" | "tcp" | "macdaemon" | "wiz";
 
 export const DEFAULT_PORT: Record<TransportType, number> = {
   androidtv: 6466,
@@ -6,6 +6,7 @@ export const DEFAULT_PORT: Record<TransportType, number> = {
   http:      80,
   websocket: 8080,
   tcp:       9000,
+  wiz:       38899,
 };
 
 export interface DiscoveredDevice {
@@ -44,7 +45,14 @@ export interface GestureEvent {
   roll?:  number;   // degrees, present for turn_*/pitch_*/yaw_*
   pitch?: number;
   yaw?:   number;
+  delta?: number;   // firmware-reported axis delta that triggered the gesture
   value?: number;   // present for step (count)
+}
+
+export interface RawSample {
+  roll: number;
+  pitch: number;
+  yaw: number;
 }
 
 const GESTURE_NAMES = new Set<string>([
@@ -58,14 +66,31 @@ export function parseGesturePayload(raw: string): GestureEvent | null {
   const name = parts[0].trim();
   if (!GESTURE_NAMES.has(name)) return null;
   const g: GestureEvent = { name: name as GestureName };
-  if (parts.length === 4) {
+  // 4 fields: gesture|r|p|y  — legacy
+  // 5 fields: gesture|r|p|y|d — current
+  if (parts.length >= 4) {
     g.roll  = parseFloat(parts[1]);
     g.pitch = parseFloat(parts[2]);
     g.yaw   = parseFloat(parts[3]);
-  } else if (parts.length === 2) {
+  }
+  if (parts.length >= 5) {
+    g.delta = parseFloat(parts[4]);
+  }
+  if (parts.length === 2) {
     g.value = parseFloat(parts[1]);
   }
   return g;
+}
+
+/** Parse a raw IMU stream payload `raw|r|p|y`. Returns null if not a raw sample. */
+export function parseRawPayload(raw: string): RawSample | null {
+  const parts = raw.split("|");
+  if (parts[0].trim() !== "raw" || parts.length < 4) return null;
+  return {
+    roll:  parseFloat(parts[1]),
+    pitch: parseFloat(parts[2]),
+    yaw:   parseFloat(parts[3]),
+  };
 }
 
 // combo string e.g. "turn_right" or "turn_right,turn_right"

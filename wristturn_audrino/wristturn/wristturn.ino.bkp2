@@ -21,7 +21,6 @@
 #include "log.h"
 #include "shake_detector.h"
 #include "mounting_adapter.h"
-#include "gesture/GestureDetector.h"
 
 // Wrist-mounted chip orientation. See mounting_adapter.h for encoding.
 // Current mounting: roll=+roll, pitch=+pitch, yaw=-yaw.
@@ -115,12 +114,18 @@ void publishBaseline(float r, float p, float y) {
 BLEBas bleBattery;
 
 // Settings service — writable from app
-// debounceChar:   uint32, minimum ms between gestures (shake/tap)
+// thresholdChar:  float, gesture trigger angle in degrees
+// debounceChar:   uint32, minimum ms between gestures
+// deadzoneChar:   float, return-to-neutral zone in degrees before re-arm
 // rawModeChar:    uint8, 0=gesture-only (default), 1=stream raw IMU
 // battVMaxChar:   float, battery full voltage (default 4.2V)
 // battVMinChar:   float, battery empty voltage (default 3.0V)
 BLEService        settingsService("19B10010-E8F2-537E-4F6C-D104768A1214");
+BLECharacteristic thresholdChar("19B10011-E8F2-537E-4F6C-D104768A1214",
+                                 BLERead | BLEWrite, 4);
 BLECharacteristic debounceChar("19B10012-E8F2-537E-4F6C-D104768A1214",
+                                BLERead | BLEWrite, 4);
+BLECharacteristic deadzoneChar("19B10013-E8F2-537E-4F6C-D104768A1214",
                                 BLERead | BLEWrite, 4);
 BLECharacteristic rawModeChar("19B10014-E8F2-537E-4F6C-D104768A1214",
                                BLERead | BLEWrite, 1);
@@ -133,15 +138,42 @@ BLECharacteristic battVMinChar("19B10016-E8F2-537E-4F6C-D104768A1214",
 BNO08x imu;
 
 // ── Thresholds — tunable via BLE ─────────────────────────────────────────────
-unsigned long debounceMs    =  200;   // min ms between gestures (kept for shake/tap)
+float         turnThreshold = 15.0f;  // degrees to trigger gesture
+float         deadzoneDegs  =  2.0f;  // degrees to return within before re-arm
+unsigned long debounceMs    =  200;   // min ms between gestures
 
 // ── State ────────────────────────────────────────────────────────────────────
 bool    rawMode        = false; // stream raw IMU on every rotation vector event
-GestureDetector gestureDetector;
 
+
+float   baseRoll       = 0.0f;
+float   basePitch      = 0.0f;
+float   baseYaw        = 0.0f;
+bool    baseSet        = false;
+
+// Per-axis armed flag — set false after gesture fires, true again once
+// wrist returns within deadzone of that axis base, or FORCE_REARM_MS elapses.
+bool          rollArmed      = true;
+bool          pitchArmed     = true;
+bool          yawArmed       = true;
+unsigned long rollDisarmedAt  = 0;
+unsigned long pitchDisarmedAt = 0;
+unsigned long yawDisarmedAt   = 0;
+
+// Force re-arm after this long even if wrist hasn't returned to deadzone.
+// Prevents getting permanently stuck after a partial gesture.
+const unsigned long FORCE_REARM_MS = 1500;
+
+unsigned long lastGestureMs  = 0;
 unsigned long lastPingMs     = 0;
 const unsigned long PING_INTERVAL_MS = 3000;
 ShakeDetector shake;
+
+// Last known orientation — updated every rotation vector event
+// Used by stability classifier to rebase when wrist is still
+float lastRoll  = 0.0f;
+float lastPitch = 0.0f;
+float lastYaw   = 0.0f;
 
 // ── Sleep / wake ──────────────────────────────────────────────────────────────
 const unsigned long SLEEP_TIMEOUT_MS = 5UL * 60UL * 1000UL;  // 5 minutes
@@ -173,9 +205,21 @@ float quaternionToYaw(float w, float x, float y, float z) {
 // #define ENABLE_STEP
 #define ENABLE_GRYO
 
+// Stability classifier values from BNO085 SHTP protocol spec
+// 0=unknown, 1=on_table, 2=stationary, 3=stable (held still), 4=motion
+#define STABILITY_ON_TABLE   1
+#define STABILITY_STATIONARY 2
+#define STABILITY_STABLE     3
+
+// Min ms after last gesture before stability can update base
+const unsigned long STABILITY_REBASE_HOLDOFF_MS = 1500;
+
+
 void enableReports() {
   if (!imu.enableRotationVector())
     LOG_E("BNO085: could not enable Rotation Vector");
+  if (!imu.enableStabilityClassifier(500))  // 500ms interval
+    LOG_E("BNO085: could not enable Stability Classifier");
 #ifdef ENABLE_SHAKE
   if (!imu.enableLinearAccelerometer())
     LOG_E("BNO085: could not enable Linear Accelerometer");
@@ -195,6 +239,19 @@ void enableReports() {
 }
 
 // ── BLE write callbacks ───────────────────────────────────────────────────────
+void onThresholdWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
+  if (len == 4) {
+    float val;
+    memcpy(&val, data, 4);
+    if (val > 0.0f && val < 90.0f) {
+      turnThreshold = val;
+      LOG_I("[Settings] threshold updated: %.1f deg", turnThreshold);
+    } else {
+      LOG_E("[Settings] threshold out of range: %.1f (must be 0-90)", val);
+    }
+  }
+}
+
 void onDebounceWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
   if (len == 4) {
     uint32_t val;
@@ -212,6 +269,19 @@ void onRawModeWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, ui
   if (len == 1) {
     rawMode = (data[0] != 0);
     LOG_I("[Settings] rawMode=%d", rawMode);
+  }
+}
+
+void onDeadzoneWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
+  if (len == 4) {
+    float val;
+    memcpy(&val, data, 4);
+    if (val >= 0.0f && val < turnThreshold) {
+      deadzoneDegs = val;
+      LOG_I("[Settings] deadzone updated: %.1f deg", deadzoneDegs);
+    } else {
+      LOG_E("[Settings] deadzone out of range: %.1f (must be 0 to threshold)", val);
+    }
   }
 }
 
@@ -292,7 +362,8 @@ void exitSleep() {
 void onConnect(uint16_t conn_hdl) {
   lastMotionMs = millis();
   LOG_I("BLE connected. conn_hdl=%u peers=%u", conn_hdl, Bluefruit.Periph.connected());
-  LOG_I("[Settings] current: debounce=%lu ms", debounceMs);
+  LOG_I("[Settings] current: threshold=%.1f deg  debounce=%lu ms  deadzone=%.1f deg",
+        turnThreshold, debounceMs, deadzoneDegs);
 }
 
 void onDisconnect(uint16_t conn_hdl, uint8_t reason) {
@@ -440,6 +511,13 @@ void setup() {
   // Settings service
   settingsService.begin();
 
+  thresholdChar.setProperties(CHR_PROPS_READ | CHR_PROPS_WRITE);
+  thresholdChar.setPermission(SECMODE_OPEN, SECMODE_OPEN);
+  thresholdChar.setFixedLen(4);
+  thresholdChar.setWriteCallback(onThresholdWrite);
+  thresholdChar.begin();
+  thresholdChar.write(&turnThreshold, 4);
+
   debounceChar.setProperties(CHR_PROPS_READ | CHR_PROPS_WRITE);
   debounceChar.setPermission(SECMODE_OPEN, SECMODE_OPEN);
   debounceChar.setFixedLen(4);
@@ -447,6 +525,13 @@ void setup() {
   debounceChar.begin();
   uint32_t dms = (uint32_t)debounceMs;
   debounceChar.write(&dms, 4);
+
+  deadzoneChar.setProperties(CHR_PROPS_READ | CHR_PROPS_WRITE);
+  deadzoneChar.setPermission(SECMODE_OPEN, SECMODE_OPEN);
+  deadzoneChar.setFixedLen(4);
+  deadzoneChar.setWriteCallback(onDeadzoneWrite);
+  deadzoneChar.begin();
+  deadzoneChar.write(&deadzoneDegs, 4);
 
   rawModeChar.setProperties(CHR_PROPS_READ | CHR_PROPS_WRITE);
   rawModeChar.setPermission(SECMODE_OPEN, SECMODE_OPEN);
@@ -481,7 +566,8 @@ void setup() {
   Bluefruit.Advertising.start(0);
   lastMotionMs = millis();
   LOG_I("BLE advertising as 'RUNE-I'.");
-  LOG_I("[Settings] defaults: debounce=%lu ms", debounceMs);
+  LOG_I("[Settings] defaults: threshold=%.1f deg  debounce=%lu ms  deadzone=%.1f deg",
+        turnThreshold, debounceMs, deadzoneDegs);
 }
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
@@ -533,51 +619,165 @@ void loop() {
     }
 #endif
 
-#ifdef ENABLE_GRYO
-    if (eventId == SENSOR_REPORTID_GYROSCOPE_CALIBRATED) {
-      float gx = imu.getGyroX();  // rad/s
-      float gy = imu.getGyroY();
-      float gz = imu.getGyroZ();
-      mountAdapter.transform(gx, gy, gz);
+    if (eventId == SENSOR_REPORTID_STABILITY_CLASSIFIER) {
+      uint8_t stability = imu.getStabilityClassifier();
+      unsigned long now = millis();
+      bool allArmed = rollArmed && pitchArmed && yawArmed;
+      bool holdoffPassed = (now - lastGestureMs) > STABILITY_REBASE_HOLDOFF_MS;
 
+      LOG_D("[Stability] class=%u armed=%d%d%d holdoff=%d",
+            stability, rollArmed, pitchArmed, yawArmed, holdoffPassed);
+      if ((stability == STABILITY_ON_TABLE || stability == STABILITY_STATIONARY || stability == STABILITY_STABLE)
+          && allArmed && holdoffPassed && baseSet) {
+        baseRoll  = lastRoll;
+        basePitch = lastPitch;
+        baseYaw   = lastYaw;
+        LOG_D("[Stability] rebase: roll=%.1f  pitch=%.1f  yaw=%.1f",
+              baseRoll, basePitch, baseYaw);
+      }
+    }
+
+#ifdef ENABLE_GRYO
+    else if (eventId == SENSOR_REPORTID_GYROSCOPE_CALIBRATED) {
       if (rawMode && Bluefruit.Periph.connected()) {
+        float gx = imu.getGyroX();  // rad/s
+        float gy = imu.getGyroY();
+        float gz = imu.getGyroZ();
         char buf[40] = {};
         snprintf(buf, sizeof(buf), "gyr|%.3f|%.3f|%.3f", gx, gy, gz);
         gestureChar.notify(buf, 40);
       }
-
-      const char* gesture = gestureDetector.update(gx, gy, gz);
-      if (gesture) {
-        char buf[40] = {};
-        snprintf(buf, sizeof(buf), "%s", gesture);
-        gestureChar.notify(buf, 40);
-        lastMotionMs = millis();
-        LOG_I("[Gesture] %s", gesture);
-      }
     }
 #endif
 
-    if (eventId == (uint8_t)SH2_SIGNIFICANT_MOTION) {
+    else if (eventId == (uint8_t)SH2_SIGNIFICANT_MOTION) {
       LOG_I("[Sleep] significant motion — waking");
       if (sleeping) exitSleep();
       // One-shot sensor; re-arming only happens in the next enterSleep() call.
     }
 
-    if (eventId == SENSOR_REPORTID_ROTATION_VECTOR) {
-      if (sleeping) return;
+    else if (eventId == SENSOR_REPORTID_ROTATION_VECTOR) {
+      float w = imu.getQuatReal();
+      float x = imu.getQuatI();
+      float y = imu.getQuatJ();
+      float z = imu.getQuatK();
 
+      float roll  = quaternionToRoll(w, x, y, z)  * 57.296f;
+      float pitch = quaternionToPitch(w, x, y, z) * 57.296f;
+      float yaw   = quaternionToYaw(w, x, y, z)   * 57.296f;
+
+      // Apply physical-mounting remap so downstream gesture code sees
+      // roll/pitch/yaw in the wrist's intended frame regardless of how
+      // the chip is soldered in the case.
+      mountAdapter.transform(roll, pitch, yaw);
+
+      lastRoll  = roll;
+      lastPitch = pitch;
+      lastYaw   = yaw;
+
+      if (sleeping) return;  // rotation vector disabled during sleep; shouldn't fire
+
+      // Initialise baseline on first good reading
+      if (!baseSet) {
+        baseRoll  = roll;
+        basePitch = pitch;
+        baseYaw   = yaw;
+        baseSet   = true;
+        LOG_I("[IMU] baseline set: roll=%.1f  pitch=%.1f  yaw=%.1f", baseRoll, basePitch, baseYaw);
+        publishBaseline(baseRoll, basePitch, baseYaw);
+      }
+
+      // Wrap angular deltas to (-180, +180] so turns crossing the
+      // ±180 boundary register as a small signed delta, not ~±360.
+      auto wrap180 = [](float d) -> float {
+        while (d >  180.0f) d -= 360.0f;
+        while (d < -180.0f) d += 360.0f;
+        return d;
+      };
+      float dRoll  = wrap180(roll  - baseRoll);
+      float dPitch = wrap180(pitch - basePitch);
+      float dYaw   = wrap180(yaw   - baseYaw);
+      unsigned long now = millis();
+
+      LOG_D("[IMU] roll=%.1f  pitch=%.1f  yaw=%.1f  dR=%.1f  dP=%.1f  dY=%.1f  armed=%d%d%d",
+            roll, pitch, yaw, dRoll, dPitch, dYaw,
+            rollArmed, pitchArmed, yawArmed);
+
+      // ── Raw stream mode (for data collection) ────────────────────────────
       if (rawMode && Bluefruit.Periph.connected()) {
-        float w = imu.getQuatReal();
-        float x = imu.getQuatI();
-        float y = imu.getQuatJ();
-        float z = imu.getQuatK();
-        float roll  = quaternionToRoll(w, x, y, z)  * 57.296f;
-        float pitch = quaternionToPitch(w, x, y, z) * 57.296f;
-        float yaw   = quaternionToYaw(w, x, y, z)   * 57.296f;
-        mountAdapter.transform(roll, pitch, yaw);
         char buf[40] = {};
         snprintf(buf, sizeof(buf), "raw|%.1f|%.1f|%.1f", roll, pitch, yaw);
         gestureChar.notify(buf, 40);
+      }
+
+      // ── Deadzone re-arm check ─────────────────────────────────────────────
+      // Re-arms when wrist returns within deadzoneDegs of that axis base,
+      // OR after FORCE_REARM_MS elapses (prevents permanent stuck state).
+      if (!rollArmed) {
+        bool byDeadzone = fabsf(dRoll) <= deadzoneDegs;
+        bool byTimeout  = (now - rollDisarmedAt) >= FORCE_REARM_MS;
+        if (byDeadzone || byTimeout) {
+          rollArmed = true;
+          LOG_I("[Rearm] roll %s dRoll=%.1f", byTimeout ? "timeout" : "deadzone", dRoll);
+          emitState("arm", "roll", "armed", dRoll);
+        }
+      }
+      if (!pitchArmed) {
+        bool byDeadzone = fabsf(dPitch) <= deadzoneDegs;
+        bool byTimeout  = (now - pitchDisarmedAt) >= FORCE_REARM_MS;
+        if (byDeadzone || byTimeout) {
+          pitchArmed = true;
+          LOG_I("[Rearm] pitch %s dPitch=%.1f", byTimeout ? "timeout" : "deadzone", dPitch);
+          emitState("arm", "pitch", "armed", dPitch);
+        }
+      }
+      if (!yawArmed) {
+        bool byDeadzone = fabsf(dYaw) <= deadzoneDegs;
+        bool byTimeout  = (now - yawDisarmedAt) >= FORCE_REARM_MS;
+        if (byDeadzone || byTimeout) {
+          yawArmed = true;
+          LOG_I("[Rearm] yaw %s dYaw=%.1f", byTimeout ? "timeout" : "deadzone", dYaw);
+          emitState("arm", "yaw", "armed", dYaw);
+        }
+      }
+
+      // ── Gesture detection ─────────────────────────────────────────────────
+      if ((now - lastGestureMs) > debounceMs) {
+        const char* gesture = nullptr;
+        const char* firedAxis = nullptr;
+        float firedDelta = 0.0f;
+
+        if (rollArmed && fabsf(dRoll) > turnThreshold) {
+          gesture = (dRoll > 0) ? "turn_right" : "turn_left";
+          firedAxis = "roll"; firedDelta = dRoll;
+          LOG_I("[Gesture] %s  dRoll=%.1f deg", gesture, dRoll);
+        } else if (pitchArmed && fabsf(dPitch) > turnThreshold) {
+          gesture = (dPitch > 0) ? "pitch_up" : "pitch_down";
+          firedAxis = "pitch"; firedDelta = dPitch;
+          LOG_I("[Gesture] %s  dPitch=%.1f deg", gesture, dPitch);
+        } else if (yawArmed && fabsf(dYaw) > turnThreshold) {
+          gesture = (dYaw > 0) ? "yaw_right" : "yaw_left";
+          firedAxis = "yaw"; firedDelta = dYaw;
+          LOG_I("[Gesture] %s  dYaw=%.1f deg", gesture, dYaw);
+        }
+        if (gesture) {
+          // Disarm all axes: fired axis uses full FORCE_REARM_MS, cross-axes
+          // use a short contamination window so combos on the same axis still work.
+          const unsigned long CROSS_INHIBIT_MS = 300;
+          rollArmed  = false; rollDisarmedAt  = (firedAxis == "roll")  ? now : now - (FORCE_REARM_MS - CROSS_INHIBIT_MS);
+          pitchArmed = false; pitchDisarmedAt = (firedAxis == "pitch") ? now : now - (FORCE_REARM_MS - CROSS_INHIBIT_MS);
+          yawArmed   = false; yawDisarmedAt   = (firedAxis == "yaw")   ? now : now - (FORCE_REARM_MS - CROSS_INHIBIT_MS);
+        }
+
+        if (gesture) {
+          char buf[40] = {};
+          snprintf(buf, sizeof(buf), "%s|%.1f|%.1f|%.1f|%.1f",
+                   gesture, roll, pitch, yaw, firedDelta);
+          gestureChar.notify(buf, 40);
+          emitState("arm", firedAxis, "disarmed", firedDelta);
+          lastGestureMs = now;
+          lastMotionMs  = now;
+        }
       }
     }
   }

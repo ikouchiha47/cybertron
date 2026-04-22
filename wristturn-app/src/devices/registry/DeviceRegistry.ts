@@ -11,6 +11,8 @@ import { DeviceProxy } from "../proxy/DeviceProxy";
 import { AndroidTVAdapter } from "../adapters/AndroidTVAdapter";
 import { MacDaemonAdapter } from "../adapters/MacDaemonAdapter";
 import { HttpAdapter } from "../adapters/HttpAdapter";
+import { WizAdapter } from "../adapters/WizAdapter";
+import { WIZ_COMMANDS } from "../adapters/WizAdapter";
 import type { IDeviceAdapter } from "../adapters/IDeviceAdapter";
 
 const STORAGE_KEY = "wristturn:devices";
@@ -74,6 +76,7 @@ class DeviceRegistry {
     switch (meta.transport as TransportType) {
       case "androidtv": return { ...meta, availableCommands: ANDROIDTV_COMMANDS };
       case "macdaemon": return { ...meta, availableCommands: MACDAEMON_COMMANDS };
+      case "wiz":       return { ...meta, availableCommands: WIZ_COMMANDS };
       default:          return meta;
     }
   }
@@ -83,6 +86,7 @@ class DeviceRegistry {
       case "androidtv":  return new AndroidTVAdapter(meta);
       case "macdaemon":  return new MacDaemonAdapter(meta);
       case "http":       return new HttpAdapter(meta);
+      case "wiz":        return new WizAdapter(meta);
       default:           return null;
     }
   }

@@ -1,4 +1,4 @@
-const COMBO_TIMEOUT_MS = 150;
+const COMBO_TIMEOUT_MS = 250;
 const COMBO_MAX_LEN    = 3;
 
 type ComboCallback = (combo: string) => void;
