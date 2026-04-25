@@ -1,6 +1,7 @@
 import { AndroidTV, KeyCode, AppLink } from "../../../modules/androidtv";
 import type { IDeviceAdapter } from "./IDeviceAdapter";
 import type { Command, ComboMap, DeviceMetadata } from "../../types";
+import { ANDROIDTV_DEFAULT_MAPPING } from "./defaultMappings";
 
 export const ANDROIDTV_COMMANDS: Command[] = [
   { id: "dpad_right",      label: "Right",          payload: KeyCode.DPAD_RIGHT },
@@ -26,6 +27,8 @@ export const ANDROIDTV_COMMANDS: Command[] = [
   { id: "open_spotify",    label: "Open Spotify",    payload: { link: AppLink.Spotify } },
 ];
 
+export { ANDROIDTV_DEFAULT_MAPPING };
+
 export class AndroidTVAdapter implements IDeviceAdapter {
   readonly meta: DeviceMetadata;
   private _connected = false;
@@ -40,20 +43,7 @@ export class AndroidTVAdapter implements IDeviceAdapter {
   }
 
   defaultMapping(): ComboMap {
-    return {
-      // Single gestures — fire immediately
-      "turn_right":            "dpad_right",
-      "turn_left":             "dpad_left",
-      "pitch_up":              "dpad_up",
-      "pitch_down":            "dpad_down",
-      "tap":                   "dpad_center",
-      // Combos — buffer until timeout
-      "turn_right,turn_right": "ff",
-      "turn_left,turn_left":   "rewind",
-      "turn_right,turn_left":  "back",
-      "tap,tap":               "open_netflix",
-      "tap,tap,tap":           "open_prime",
-    };
+    return ANDROIDTV_DEFAULT_MAPPING;
   }
 
   async connect(): Promise<void> {

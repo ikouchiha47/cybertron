@@ -1,0 +1,33 @@
+CXX      = g++
+CXXFLAGS = -std=c++14 -Wall -Wextra -I. -fsanitize=address,undefined
+
+# Test sources live outside the sketch folder — Arduino's build system compiles
+# every .cpp in the sketch folder and links it into the firmware. A test file
+# with its own int main() would link alongside the Arduino main and crash the
+# nRF52 on boot. See wristturn_audrino/tests/ for any new host-only tests.
+TESTS_DIR = ../tests
+
+.PHONY: test test-all clean
+
+# Default: StabilityClassifierDetector + state_packet host tests
+test: test_stillness test_state_packet
+	./test_stillness
+	./test_state_packet
+
+# Run with ManualZUPTDetector enabled (when constants are calibrated against real data)
+test-all: test_stillness_full test_state_packet
+	./test_stillness_full
+	./test_state_packet
+
+test_stillness: $(TESTS_DIR)/test_stillness.cpp StillnessDetector.h
+	$(CXX) $(CXXFLAGS) -o $@ $(TESTS_DIR)/test_stillness.cpp
+
+test_stillness_full: $(TESTS_DIR)/test_stillness.cpp StillnessDetector.h
+	$(CXX) $(CXXFLAGS) -DENABLE_MANUAL_ZUPT -o $@ $(TESTS_DIR)/test_stillness.cpp
+
+# state_packet test lives in ../tests/ so it isn't compiled into the firmware.
+test_state_packet: $(TESTS_DIR)/test_state_packet.cpp state_packet.h
+	$(CXX) -std=c++17 -Wall -Wextra -I. -o $@ $(TESTS_DIR)/test_state_packet.cpp
+
+clean:
+	rm -f test_stillness test_stillness_full test_state_packet

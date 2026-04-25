@@ -8,6 +8,8 @@ const stub = {
   stop:  () => Promise.resolve(),
   getState: () => Promise.resolve({ connected: false, sleeping: false, deviceName: "", batteryPct: -1 }),
   setRawMode: (_: boolean) => Promise.resolve(),
+  setMode:    (_: number)  => Promise.resolve(),
+  setArmed:   (_: boolean) => Promise.resolve(),
   addListener: (_: string) => {},
   removeListeners: (_: number) => {},
 };
@@ -22,6 +24,7 @@ export type BLEGesturePayload = {
   roll?: number; pitch?: number; yaw?: number; delta?: number; value?: number;
 };
 export type BLERawPayload    = { roll: number; pitch: number; yaw: number };
+export type BLEDeltaPayload  = { roll: number; pitch: number; yaw: number };
 export type BLEStatePayload  = { raw: string };
 export type BLEConnectedPayload    = { name: string; address: string };
 export type BLEDisconnectedPayload = { reason: number };
@@ -32,13 +35,18 @@ export const BLEServiceNative = {
   stop:       (): Promise<void> => native.stop(),
   getState:   (): Promise<{ connected: boolean; sleeping: boolean; deviceName: string; batteryPct: number }> =>
     native.getState(),
-  setRawMode: (enabled: boolean): Promise<void> => native.setRawMode(enabled),
+  setRawMode: (enabled: boolean): Promise<void>  => native.setRawMode(enabled),
+  /** Write interaction mode: 0=gesture, 1=knob, 2=symbol */
+  setMode:    (mode: number): Promise<void>       => native.setMode(mode),
+  /** Write arm state: true=arm (enable rotation vector + baseline), false=disarm */
+  setArmed:   (armed: boolean): Promise<void>     => native.setArmed(armed),
 
   onGesture:     (cb: (p: BLEGesturePayload)    => void) => emitter?.addListener("BLE_GESTURE",      cb),
   onConnected:   (cb: (p: BLEConnectedPayload)  => void) => emitter?.addListener("BLE_CONNECTED",    cb),
   onDisconnected:(cb: (p: BLEDisconnectedPayload)=>void) => emitter?.addListener("BLE_DISCONNECTED", cb),
   onBattery:     (cb: (p: BLEBatteryPayload)    => void) => emitter?.addListener("BLE_BATTERY",      cb),
   onRaw:         (cb: (p: BLERawPayload)         => void) => emitter?.addListener("BLE_RAW",          cb),
+  onDelta:       (cb: (p: BLEDeltaPayload)       => void) => emitter?.addListener("BLE_DELTA",        cb),
   onState:       (cb: (p: BLEStatePayload)       => void) => emitter?.addListener("BLE_STATE",        cb),
   onSleeping:    (cb: () => void)                         => emitter?.addListener("BLE_SLEEPING",     cb),
   onError:       (cb: (p: { msg: string }) => void)       => emitter?.addListener("BLE_ERROR",        cb),

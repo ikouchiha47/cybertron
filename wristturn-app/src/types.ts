@@ -96,3 +96,17 @@ export function parseRawPayload(raw: string): RawSample | null {
 // combo string e.g. "turn_right" or "turn_right,turn_right"
 export type ComboString = string;
 export type ComboMap = Record<ComboString, string>; // combo → command id
+
+// Knob tick events synthesized by KnobQuantizer
+export type KnobTickName = "knob_tick+" | "knob_tick-";
+
+// Symbol recognition events synthesized by SymbolCapture: "symbol:M", "symbol:Z" etc.
+export type SymbolEventName = `symbol:${string}`;
+
+/** Interaction mode written to firmware modeChar */
+export const INTERACTION_MODE = {
+  GESTURE: 0,
+  KNOB:    1,
+  SYMBOL:  2,
+} as const;
+export type InteractionModeValue = typeof INTERACTION_MODE[keyof typeof INTERACTION_MODE];

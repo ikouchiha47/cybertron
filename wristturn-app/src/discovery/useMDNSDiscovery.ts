@@ -120,7 +120,7 @@ export function useMDNSDiscovery() {
     const onResolved = (service: any) => {
       const transport = inferTransport(service);
       const ip = Array.isArray(service.addresses)
-        ? service.addresses.map(String).find((a) => !a.startsWith("127.") && a !== "::1")
+        ? service.addresses.map(String).find((a: string) => !a.startsWith("127.") && a !== "::1")
         : undefined;
       const rawHost = service.host ? String(service.host) : undefined;
       const host = ip ?? rawHost;

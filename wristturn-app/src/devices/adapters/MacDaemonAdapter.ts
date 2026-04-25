@@ -1,5 +1,6 @@
 import type { IDeviceAdapter } from "./IDeviceAdapter";
 import type { Command, ComboMap, DeviceMetadata } from "../../types";
+import { MACDAEMON_DEFAULT_MAPPING } from "./defaultMappings";
 
 export const MACDAEMON_COMMANDS: Command[] = [
   { id: "ctrl_left",   label: "Previous Desktop", payload: "ctrl_left" },
@@ -11,6 +12,8 @@ export const MACDAEMON_COMMANDS: Command[] = [
   { id: "media_next",  label: "Next Track",        payload: "media_next" },
   { id: "media_prev",  label: "Previous Track",    payload: "media_prev" },
 ];
+
+export { MACDAEMON_DEFAULT_MAPPING };
 
 export class MacDaemonAdapter implements IDeviceAdapter {
   readonly meta: DeviceMetadata;
@@ -63,14 +66,6 @@ export class MacDaemonAdapter implements IDeviceAdapter {
   }
 
   defaultMapping(): ComboMap {
-    return {
-      "turn_right":           "ctrl_right",
-      "turn_left":            "ctrl_left",
-      "pitch_up":             "volume_up",
-      "pitch_down":           "volume_down",
-      "tap":                  "media_play",
-      "tap,tap":              "media_next",
-      "turn_right,turn_left": "mute",
-    };
+    return MACDAEMON_DEFAULT_MAPPING;
   }
 }

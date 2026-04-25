@@ -71,6 +71,11 @@ public:
         if (!evt.valid) return nullptr;
 
         switch (evt.axis) {
+            case GestureAxis::ROLL:  _lastIntegral = cr.integral; break;
+            case GestureAxis::PITCH: _lastIntegral = cp.integral; break;
+            case GestureAxis::YAW:   _lastIntegral = cy.integral; break;
+        }
+        switch (evt.axis) {
             case GestureAxis::ROLL:
                 return evt.direction > 0 ? "turn_right" : "turn_left";
             case GestureAxis::PITCH:
@@ -80,6 +85,8 @@ public:
         }
         return nullptr;
     }
+
+    float lastIntegral() const { return _lastIntegral; }
 
     /** Runtime tuning — lets BLE settings char update the integral threshold. */
     void setIntegralThreshold(float t) {
@@ -104,4 +111,5 @@ private:
     uint32_t _lastMicros;
     bool     _firstSample;
     float    _integralThreshold;
+    float    _lastIntegral = 0.0f;
 };

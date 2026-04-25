@@ -19,7 +19,7 @@ export const DebugLog = {
   subscribe(fn: Listener) {
     listeners.add(fn);
     fn([...lines]);
-    return () => listeners.delete(fn);
+    return () => { listeners.delete(fn); };
   },
   clear() {
     lines.length = 0;

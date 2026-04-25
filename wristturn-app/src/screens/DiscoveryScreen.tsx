@@ -177,22 +177,110 @@ function CircleView({
   );
 }
 
+const BROWSE_TIMEOUT_MS = 3000;
+
 export function DiscoveryScreen({ navigation }: Props) {
   const [viewMode, setViewMode] = useState<"circle" | "list">("circle");
   const [devices, setDevices]   = useState<DeviceMetadata[]>([]);
   const [selectedIdx, setSelected] = useState(0);
-  const connectingRef = useRef(false);
-  const devicesRef    = useRef<DeviceMetadata[]>([]);
-  const selectedRef   = useRef(0);
-  const insets        = useSafeAreaInsets();
-  const iconRot       = useRef(new Animated.Value(0)).current;
+  const [browsing, setBrowsing] = useState(false);
+  const [awake, setAwake]       = useState(false);
+  const [showPose, setShowPose] = useState(false);
+  const connectingRef  = useRef(false);
+  const devicesRef     = useRef<DeviceMetadata[]>([]);
+  const selectedRef    = useRef(0);
+  const browsingRef    = useRef(false);
+  const awakeRef       = useRef(false);
+  const sleepTimerRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const inactivityRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const insets         = useSafeAreaInsets();
+  const iconRot        = useRef(new Animated.Value(0)).current;
 
-  const { connected, wristName, batteryPct } = useBLE({
+  const WAKE_TIMEOUT_MS = 10_000;
+
+  function wakeUp(reason?: string) {
+    awakeRef.current = true;
+    setAwake(true);
+    resetSleepTimer();
+    console.log("[WAKE] wakeUp reason=" + (reason ?? "unknown"));
+  }
+
+  function goSleep(reason?: string) {
+    awakeRef.current = false;
+    setAwake(false);
+    clearSleepTimer();
+    exitBrowse();
+    console.log("[WAKE] goSleep reason=" + (reason ?? "unknown"));
+  }
+
+  function resetSleepTimer() {
+    clearSleepTimer();
+    sleepTimerRef.current = setTimeout(goSleep, WAKE_TIMEOUT_MS);
+  }
+
+  function clearSleepTimer() {
+    if (sleepTimerRef.current) { clearTimeout(sleepTimerRef.current); sleepTimerRef.current = null; }
+  }
+
+  function enterBrowse(reason?: string) {
+    browsingRef.current = true;
+    setBrowsing(true);
+    resetInactivity();
+    console.log("[BROWSE] enterBrowse reason=" + (reason ?? "unknown"));
+  }
+
+  function exitBrowse() {
+    browsingRef.current = false;
+    setBrowsing(false);
+    clearInactivity();
+  }
+
+  function resetInactivity() {
+    clearInactivity();
+    inactivityRef.current = setTimeout(exitBrowse, BROWSE_TIMEOUT_MS);
+  }
+
+  function clearInactivity() {
+    if (inactivityRef.current) { clearTimeout(inactivityRef.current); inactivityRef.current = null; }
+  }
+
+  // Clean up on unmount
+  useEffect(() => () => { clearInactivity(); clearSleepTimer(); }, []);
+
+  const { connected, wristName, batteryPct, pose } = useBLE({
     onGesture: (g) => {
-      if (g === "turn_right") cycleDevice(1);
-      if (g === "turn_left")  cycleDevice(-1);
-      if (g === "tap" && devicesRef.current.length > 0)
-        openDevice(devicesRef.current[selectedRef.current]);
+      if (g === "shake") {
+        goSleep("shake");
+        return;
+      }
+
+      // pitch_up, tap, or pitch_down all wake the device
+      if (!awakeRef.current) {
+        if (g === "pitch_up" || g === "tap" || g === "pitch_down") {
+          wakeUp(g);
+          enterBrowse(g);
+        } else {
+          console.log("[WAKE] gesture ignored while asleep:", g);
+        }
+        return;
+      }
+
+      resetSleepTimer();
+
+      if (g === "turn_right" || g === "turn_left") {
+        if (!browsingRef.current) return;
+        cycleDevice(g === "turn_right" ? 1 : -1);
+        resetInactivity();
+        return;
+      }
+      if (g === "tap" || g === "pitch_down") {
+        if (!browsingRef.current) { enterBrowse(); return; }
+        if (devicesRef.current.length > 0) {
+          exitBrowse();
+          openDevice(devicesRef.current[selectedRef.current]);
+        }
+        return;
+      }
     },
   });
 
@@ -215,6 +303,8 @@ export function DiscoveryScreen({ navigation }: Props) {
       const all = registry.all();
       setDevices(all);
       devicesRef.current = all;
+      // Coming back from a device screen — user was active, wake + browse
+      if (all.length > 0) { wakeUp(); enterBrowse(); }
     });
     return unsub;
   }, [navigation]);
@@ -293,6 +383,7 @@ export function DiscoveryScreen({ navigation }: Props) {
             <Text style={s.emptySub}>Tap ⚙ to add one</Text>
           </View>
         ) : viewMode === "circle" ? (
+          <React.Fragment>
           <View style={s.circleWrapper}>
             <CircleView
               devices={devices}
@@ -303,8 +394,21 @@ export function DiscoveryScreen({ navigation }: Props) {
               batteryPct={batteryPct}
               wristConnected={connected}
             />
-            <Text style={s.hint}>roll ← → · tap to open · long-press to map</Text>
+            {connected && (
+              <View style={[s.browseBar, browsing && s.browseBarActive]}>
+                <Text style={[s.hint, browsing && s.hintActive]}>
+                  {!awake
+                    ? "raise arm to wake"
+                    : browsing
+                    ? "roll ← → · tap or pitch down to open · shake to sleep"
+                    : "tap to browse · shake to sleep"}
+                </Text>
+              </View>
+            )}
           </View>
+          {/* Pose HUD: floating in bottom-right of content area */}
+          {connected && pose && <PoseHUD pose={pose} onToggle={() => setShowPose(p => !p)} visible={showPose} />}
+          </React.Fragment>
         ) : (
           <ScrollView style={s.listArea} showsVerticalScrollIndicator={false}>
             {devices.map((dev, i) => (
@@ -319,6 +423,49 @@ export function DiscoveryScreen({ navigation }: Props) {
           </ScrollView>
         )}
       </View>
+    </View>
+  );
+}
+
+// ── Pose HUD: shows current roll/pitch vs baseline ──────────────────────────
+// Red line = baseline, blue dot = current position.
+// Tap the toggle button to expand/collapse the HUD.
+
+type PoseHUDProps = {
+  pose: { roll: number; pitch: number; yaw: number; baseRoll: number; basePitch: number; baseYaw: number };
+  onToggle: () => void;
+  visible: boolean;
+};
+
+function PoseHUD({ pose, onToggle, visible }: PoseHUDProps) {
+  const { roll, pitch, baseRoll, basePitch } = pose;
+  // Map roll/pitch to visual range: -90..+90 → 0..100%
+  const toPct = (v: number) => Math.max(0, Math.min(100, ((v + 90) / 180) * 100));
+  const cx = toPct(roll);
+  const cy = toPct(pitch);
+  const bx = toPct(baseRoll);
+  const by = toPct(basePitch);
+
+  return (
+    <View style={hudS.container}>
+      <TouchableOpacity onPress={onToggle} style={hudS.toggleBtn}>
+        <Text style={hudS.toggleText}>{visible ? "▾" : "▸"}</Text>
+      </TouchableOpacity>
+      {visible && (
+        <View style={hudS.hud}>
+          {/* Visual grid: roll (X) vs pitch (Y) */}
+          <View style={hudS.grid}>
+            {/* Baseline marker (red crosshair) */}
+            <View style={[hudS.crosshair, { left: `${bx}%`, top: `${by}%` }]} />
+            {/* Current position (blue dot) */}
+            <View style={[hudS.dot, { left: `${cx}%`, top: `${cy}%` }]} />
+            {/* Labels */}
+            <Text style={hudS.label} numberOfLines={1}>
+              r: {roll.toFixed(1)}° ({baseRoll.toFixed(1)}°)  p: {pitch.toFixed(1)}° ({basePitch.toFixed(1)}°)
+            </Text>
+          </View>
+        </View>
+      )}
     </View>
   );
 }
@@ -371,5 +518,76 @@ const s = StyleSheet.create({
   emptyText:      { fontSize: 16, color: "#444" },
   emptySub:       { fontSize: 12, color: "#333" },
 
-  hint:           { fontSize: 11, color: "#333", marginTop: 16, letterSpacing: 0.5 },
+  browseBar:      { marginTop: 16, paddingHorizontal: 14, paddingVertical: 6, borderRadius: 20, borderWidth: 1, borderColor: "transparent" },
+  browseBarActive:{ borderColor: "#4a9eff33", backgroundColor: "#4a9eff11" },
+  hint:           { fontSize: 11, color: "#333", letterSpacing: 0.5, textAlign: "center" },
+  hintActive:     { color: "#4a9eff" },
+});
+
+// Pose HUD styles
+const hudS = StyleSheet.create({
+  container: {
+    position: "absolute",
+    right: 12,
+    bottom: 80,
+    zIndex: 200,
+    alignItems: "flex-end",
+  },
+  toggleBtn: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: "#1c1c1c",
+    borderWidth: 1,
+    borderColor: "#333",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  toggleText: { color: "#888", fontSize: 12 },
+  hud: {
+    marginTop: 6,
+    backgroundColor: "#1c1c1c",
+    borderRadius: 12,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: "#333",
+    width: 160,
+  },
+  grid: {
+    width: "100%",
+    aspectRatio: 1,
+    position: "relative",
+    borderWidth: 1,
+    borderColor: "#2a2a2a",
+    borderRadius: 8,
+  },
+  crosshair: {
+    position: "absolute",
+    width: 14,
+    height: 14,
+    marginLeft: -7,
+    marginTop: -7,
+    borderWidth: 1.5,
+    borderColor: "#ff4444",
+    backgroundColor: "transparent",
+    borderRadius: 0,
+  },
+  dot: {
+    position: "absolute",
+    width: 8,
+    height: 8,
+    marginLeft: -4,
+    marginTop: -4,
+    borderRadius: 4,
+    backgroundColor: "#4a9eff",
+  },
+  label: {
+    position: "absolute",
+    bottom: -18,
+    left: 0,
+    right: 0,
+    fontSize: 8,
+    color: "#666",
+    textAlign: "center",
+  },
 });

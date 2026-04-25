@@ -22,6 +22,8 @@
 #include "shake_detector.h"
 #include "mounting_adapter.h"
 #include "gesture/GestureDetector.h"
+#include "StillnessDetector.h"
+#include "state_packet.h"
 
 // Wrist-mounted chip orientation. See mounting_adapter.h for encoding.
 // Current mounting: roll=+roll, pitch=+pitch, yaw=-yaw.
@@ -71,44 +73,49 @@ bool isCharging() {
 }
 
 // ── BLE setup (Bluefruit / Adafruit nRF52 stack) ─────────────────────────────
+// Fixed payload sizes for BLE characteristics.
+// Bluefruit requires notify() length to exactly match setFixedLen() / constructor len —
+// shorter payloads are silently dropped. Pad with spaces before every notify() call.
+#define GESTURE_CHAR_LEN  40
+#define STATE_CHAR_LEN    80  // largest JSON event fits in 80 bytes; within 247-byte ATT MTU
+
 BLEService        wristService("19B10000-E8F2-537E-4F6C-D104768A1214");
 BLECharacteristic gestureChar("19B10001-E8F2-537E-4F6C-D104768A1214",
-                               BLERead | BLENotify, 40);
+                               BLERead | BLENotify, GESTURE_CHAR_LEN);
 // stateChar: JSON-line notifications for arm/disarm + baseline-set events.
-// Payload up to 80 bytes; requires MTU > default (nRF negotiates 247 with RN apps).
 BLECharacteristic stateChar("19B10002-E8F2-537E-4F6C-D104768A1214",
-                             BLERead | BLENotify, 80);
+                             BLERead | BLENotify, STATE_CHAR_LEN);
 // baselineChar: current baseline roll/pitch/yaw as three little-endian floats.
 BLECharacteristic baselineChar("19B10003-E8F2-537E-4F6C-D104768A1214",
                                 BLERead | BLENotify, 12);
 
-// Emit a JSON line event on stateChar. `axis` may be null for non-axis events.
+// Emit a per-axis arm/disarm event. Binary schema defined in state_packet.h.
+// `axis` maps: "roll"→0, "pitch"→1, "yaw"→2. Unknown axis is ignored.
 void emitState(const char* evt, const char* axis, const char* state, float d) {
-  char buf[80] = {0};
-  unsigned long t = millis();
-  if (axis) {
-    snprintf(buf, sizeof(buf),
-             "{\"t\":%lu,\"evt\":\"%s\",\"axis\":\"%s\",\"state\":\"%s\",\"d\":%.1f}",
-             t, evt, axis, state, d);
-  } else {
-    snprintf(buf, sizeof(buf), "{\"t\":%lu,\"evt\":\"%s\"}", t, evt);
-  }
-  size_t n = strlen(buf);
-  while (n < 80) buf[n++] = ' ';
-  stateChar.notify(buf, 80);
+  (void)evt;  // reserved for future multi-event dispatch; today only ARM_EVT uses this
+  if (!axis || !state) return;
+
+  uint8_t axisId;
+  if      (strcmp(axis, "roll")  == 0) axisId = AXIS_ROLL;
+  else if (strcmp(axis, "pitch") == 0) axisId = AXIS_PITCH;
+  else if (strcmp(axis, "yaw")   == 0) axisId = AXIS_YAW;
+  else return;
+
+  uint8_t stateId = (strcmp(state, "armed") == 0) ? ARM_STATE_ARMED : ARM_STATE_DISARMED;
+
+  uint8_t buf[STATE_PACKET_MAX_LEN];
+  uint8_t n = pkt_arm_evt(buf, axisId, stateId, d);
+  stateChar.notify(buf, n);
 }
 
 void publishBaseline(float r, float p, float y) {
   float vals[3] = { r, p, y };
   baselineChar.write(vals, 12);
   baselineChar.notify(vals, 12);
-  char buf[80] = {0};
-  snprintf(buf, sizeof(buf),
-           "{\"t\":%lu,\"evt\":\"baseline\",\"r\":%.1f,\"p\":%.1f,\"y\":%.1f}",
-           millis(), r, p, y);
-  size_t n = strlen(buf);
-  while (n < 80) buf[n++] = ' ';
-  stateChar.notify(buf, 80);
+
+  uint8_t buf[STATE_PACKET_MAX_LEN];
+  uint8_t n = pkt_baseline(buf, r, p, y);
+  stateChar.notify(buf, n);
 }
 
 // Standard BLE Battery Service (0x180F / 0x2A19)
@@ -128,6 +135,15 @@ BLECharacteristic battVMaxChar("19B10015-E8F2-537E-4F6C-D104768A1214",
                                 BLERead | BLEWrite, 4);
 BLECharacteristic battVMinChar("19B10016-E8F2-537E-4F6C-D104768A1214",
                                 BLERead | BLEWrite, 4);
+// Interaction mode: 0=gesture (default), 1=knob, 2=symbol
+BLECharacteristic modeChar("19B10018-E8F2-537E-4F6C-D104768A1214",
+                             BLERead | BLEWrite, 1);
+// Arm/disarm: 1=arm (capture baseline + enable rotation vector), 0=disarm
+BLECharacteristic armChar("19B10019-E8F2-537E-4F6C-D104768A1214",
+                            BLERead | BLEWrite, 1);
+// Delta from baseline: 3x LE float [deltaRoll, deltaPitch, deltaYaw] in degrees
+BLECharacteristic deltaChar("19B1001A-E8F2-537E-4F6C-D104768A1214",
+                              BLERead | BLENotify, 12);
 
 // ── IMU ──────────────────────────────────────────────────────────────────────
 BNO08x imu;
@@ -139,12 +155,49 @@ unsigned long debounceMs    =  200;   // min ms between gestures (kept for shake
 bool    rawMode        = false; // stream raw IMU on every rotation vector event
 GestureDetector gestureDetector;
 
+// Interaction modes (written by app via modeChar)
+#define MODE_GESTURE 0
+#define MODE_KNOB    1
+#define MODE_SYMBOL  2
+uint8_t currentMode = MODE_GESTURE;
+
+// Arm state — when armed, baseline is captured via rolling-window calibration
+bool    armed         = false;
+float   baselineRoll  = 0.0f;
+float   basePitch_arm = 0.0f;
+float   baselineYaw   = 0.0f;
+
+// Rolling-window calibration accumulator (populates during first stable window)
+CalibrationBuffer calBuffer;
+bool calInProgress = false;
+
+// Last logged stability value — used to suppress duplicate logs
+static uint8_t lastLoggedStab = 255;
+
+// Delta rate limiter — emit at most every 20ms (~50Hz)
+unsigned long lastDeltaMs = 0;
+
+// Last known Euler angles — updated every rotation vector event for stability rebase
+float lastRoll  = 0.0f;
+float lastPitch = 0.0f;
+float lastYaw   = 0.0f;
+
+// Stillness detector — swap implementation without touching event handlers
+StabilityClassifierDetector _stabDetector;
+IStillnessDetector* stillDetector = &_stabDetector;
+
 unsigned long lastPingMs     = 0;
 const unsigned long PING_INTERVAL_MS = 3000;
 ShakeDetector shake;
 
 // ── Sleep / wake ──────────────────────────────────────────────────────────────
-const unsigned long SLEEP_TIMEOUT_MS = 5UL * 60UL * 1000UL;  // 5 minutes
+// Define DEBUG_SLEEP to use 30s timeout for bench testing sleep/wake via serial.
+// #define DEBUG_SLEEP
+#ifdef DEBUG_SLEEP
+const unsigned long SLEEP_TIMEOUT_MS = 30UL * 1000UL;         // 30 seconds (test)
+#else
+const unsigned long SLEEP_TIMEOUT_MS = 5UL * 60UL * 1000UL;  // 5 minutes (production)
+#endif
 bool                sleeping         = false;
 unsigned long       lastMotionMs     = 0;
 
@@ -174,8 +227,11 @@ float quaternionToYaw(float w, float x, float y, float z) {
 #define ENABLE_GRYO
 
 void enableReports() {
-  if (!imu.enableRotationVector())
-    LOG_E("BNO085: could not enable Rotation Vector");
+  // Rotation vector needed for rawMode streaming or when armed (knob/symbol modes)
+  if (rawMode || armed) {
+    if (!imu.enableRotationVector())
+      LOG_E("BNO085: could not enable Rotation Vector");
+  }
 #ifdef ENABLE_SHAKE
   if (!imu.enableLinearAccelerometer())
     LOG_E("BNO085: could not enable Linear Accelerometer");
@@ -192,6 +248,8 @@ void enableReports() {
   if(!imu.enableGyro())
     LOG_E("BN0085: could not enable gyro");
 #endif
+  if (!imu.enableStabilityClassifier(500))
+    LOG_E("BNO085: could not enable Stability Classifier");
 }
 
 // ── BLE write callbacks ───────────────────────────────────────────────────────
@@ -210,7 +268,15 @@ void onDebounceWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, u
 
 void onRawModeWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
   if (len == 1) {
-    rawMode = (data[0] != 0);
+    bool newMode = (data[0] != 0);
+    if (newMode != rawMode) {
+      rawMode = newMode;
+      if (rawMode) {
+        imu.enableRotationVector();
+      } else {
+        imu.enableReport(SENSOR_REPORTID_ROTATION_VECTOR, 0);
+      }
+    }
     LOG_I("[Settings] rawMode=%d", rawMode);
   }
 }
@@ -241,6 +307,40 @@ void onBattVMinWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, u
   }
 }
 
+void onModeWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
+  if (len == 1 && data[0] <= MODE_SYMBOL) {
+    currentMode = data[0];
+    LOG_I("[Mode] switched to %d (0=gesture,1=knob,2=symbol)", currentMode);
+  }
+}
+
+void onArmWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
+  if (len != 1) return;
+  bool newArmed = (data[0] != 0);
+  if (newArmed == armed) return;
+  armed = newArmed;
+  if (armed) {
+    // Capture current Euler as baseline — rotation vector must be on
+    imu.enableRotationVector();
+    // Baseline will be published on the next rotation-vector event when it's fresh
+    LOG_I("[Arm] armed — rotation vector enabled, awaiting baseline sample");
+  } else {
+    // Disarm: disable rotation vector (unless rawMode also needs it)
+    if (!rawMode) {
+      imu.enableReport(SENSOR_REPORTID_ROTATION_VECTOR, 0);
+    }
+    baselineRoll  = 0.0f;
+    basePitch_arm = 0.0f;
+    baselineYaw   = 0.0f;
+    float zeros[3] = {0, 0, 0};
+    deltaChar.write(zeros, 12);
+    publishBaseline(0, 0, 0);
+    LOG_I("[Arm] disarmed — rotation vector disabled");
+    calBuffer.reset();
+    calInProgress = false;
+  }
+}
+
 // Forward declaration — blinkLED is defined later in the file
 void blinkLED(int pin, int times, int onMs, int offMs);
 
@@ -250,7 +350,9 @@ void enterSleep() {
   sleeping = true;
   LOG_I("[Sleep] inactivity timeout — entering light sleep");
   if (Bluefruit.Periph.connected()) {
-    emitState("sleep", nullptr, nullptr, 0);
+    uint8_t sbuf[STATE_PACKET_MAX_LEN];
+    uint8_t sn = pkt_sleep(sbuf);
+    stateChar.notify(sbuf, sn);
     delay(80);  // let the notification flush before disconnect
     Bluefruit.disconnect(0);
     delay(50);
@@ -262,6 +364,13 @@ void enterSleep() {
   Bluefruit.Advertising.stop();
   Bluefruit.Advertising.setInterval(1600, 3200);  // ~2–3s interval, ~10x less power than active
   Bluefruit.Advertising.start(0);
+
+  // Clear arm state on sleep — app re-arms when waking
+  if (armed) {
+    armed = false;
+    float zeros[3] = {0, 0, 0};
+    deltaChar.write(zeros, 12);
+  }
 
   // Disable high-frequency reports — SH-2 protocol: reportInterval_us = 0 stops the report.
   // The library has no disable* methods; enableReport(..., 0) is the correct approach.
@@ -291,6 +400,8 @@ void exitSleep() {
 // ── BLE callbacks ─────────────────────────────────────────────────────────────
 void onConnect(uint16_t conn_hdl) {
   lastMotionMs = millis();
+  lastPingMs   = 0;  // fire stab heartbeat soon after CCCDs are written (~1-3s)
+  if (sleeping) exitSleep();   // phone reconnected — wake up
   LOG_I("BLE connected. conn_hdl=%u peers=%u", conn_hdl, Bluefruit.Periph.connected());
   LOG_I("[Settings] current: debounce=%lu ms", debounceMs);
 }
@@ -376,6 +487,7 @@ void setup() {
   }
   if (found == 0) LOG_E("I2C: no devices found.");
   LOG_D("I2C scan done.");
+  blinkLED(LED_BLUE, 2, 100, 100);  // ★ 2 blinks = I2C recovered
 
   bool imuOk = false;
   for (int attempt = 0; attempt < 5 && !imuOk; attempt++) {
@@ -389,6 +501,7 @@ void setup() {
   }
   LOG_I("BNO085 ready.");
   enableReports();
+  blinkLED(LED_BLUE, 3, 100, 100);  // ★ 3 blinks = IMU ready
 
   // INT pin — wired to BNO085 INT (D1/P0.03). Empty ISR just wakes CPU from waitForEvent().
   pinMode(1, INPUT_PULLUP);
@@ -416,16 +529,20 @@ void setup() {
   wristService.begin();
   gestureChar.setProperties(CHR_PROPS_READ | CHR_PROPS_NOTIFY);
   gestureChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
-  gestureChar.setFixedLen(40);
+  gestureChar.setFixedLen(GESTURE_CHAR_LEN);
   gestureChar.begin();
   gestureChar.write("idle                                   ", 40);
 
-  // stateChar — JSON line events (arm/disarm/baseline)
+  // stateChar — JSON line events (arm/disarm/baseline/stab/pose)
+  // Use variable-length (setMaxLen) not setFixedLen — fixed-len forces every
+  // notification to be exactly STATE_CHAR_LEN bytes, which gets silently
+  // dropped when the negotiated ATT MTU is smaller than that (e.g. 23 on some
+  // MediaTek devices). Variable-length lets us notify only the JSON we emit.
   stateChar.setProperties(CHR_PROPS_READ | CHR_PROPS_NOTIFY);
   stateChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
-  stateChar.setFixedLen(80);
+  stateChar.setMaxLen(STATE_CHAR_LEN);
   stateChar.begin();
-  stateChar.write("{}                                                                              ", 80);
+  stateChar.write("{}", 2);
 
   // baselineChar — 3 floats, little-endian
   baselineChar.setProperties(CHR_PROPS_READ | CHR_PROPS_NOTIFY);
@@ -470,6 +587,30 @@ void setup() {
   battVMinChar.begin();
   battVMinChar.write(&battVMin, 4);
 
+  modeChar.setProperties(CHR_PROPS_READ | CHR_PROPS_WRITE);
+  modeChar.setPermission(SECMODE_OPEN, SECMODE_OPEN);
+  modeChar.setFixedLen(1);
+  modeChar.setWriteCallback(onModeWrite);
+  modeChar.begin();
+  modeChar.write(&currentMode, 1);
+
+  armChar.setProperties(CHR_PROPS_READ | CHR_PROPS_WRITE);
+  armChar.setPermission(SECMODE_OPEN, SECMODE_OPEN);
+  armChar.setFixedLen(1);
+  armChar.setWriteCallback(onArmWrite);
+  armChar.begin();
+  uint8_t armVal = 0;
+  armChar.write(&armVal, 1);
+
+  deltaChar.setProperties(CHR_PROPS_READ | CHR_PROPS_NOTIFY);
+  deltaChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  deltaChar.setFixedLen(12);
+  deltaChar.begin();
+  {
+    float zeros[3] = {0, 0, 0};
+    deltaChar.write(zeros, 12);
+  }
+
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
   Bluefruit.Advertising.addTxPower();
   Bluefruit.Advertising.addService(wristService);
@@ -481,7 +622,216 @@ void setup() {
   Bluefruit.Advertising.start(0);
   lastMotionMs = millis();
   LOG_I("BLE advertising as 'RUNE-I'.");
-  LOG_I("[Settings] defaults: debounce=%lu ms", debounceMs);
+  blinkLED(LED_BLUE, 4, 100, 100);  // ★ 4 blinks = setup complete, entering loop
+}
+
+// ── IMU event handlers ────────────────────────────────────────────────────────
+// One function per sensor report. Registered in IMU_HANDLERS dispatch table below.
+// Adding a new sensor = add a handler function + one entry in the table.
+
+#ifdef ENABLE_SHAKE
+static void handleLinearAcceleration() {
+  float ax = imu.getLinAccelX();
+  float ay = imu.getLinAccelY();
+  float az = imu.getLinAccelZ();
+  if (shake.update(ax, ay, az)) {
+    char buf[40] = {};
+    snprintf(buf, sizeof(buf), "shake");
+    LOG_I("%s", buf);
+    gestureChar.notify(buf, 40);
+    lastMotionMs = millis();
+  }
+}
+#endif
+
+#ifdef ENABLE_TAP
+static void handleTapDetector() {
+  char buf[40] = {};
+  snprintf(buf, sizeof(buf), "tap");
+  LOG_I("%s", buf);
+  gestureChar.notify(buf, 40);
+  lastMotionMs = millis();
+}
+#endif
+
+#ifdef ENABLE_STEP
+static void handleStepCounter() {
+  uint16_t steps = imu.getStepCount();
+  char buf[40] = {};
+  snprintf(buf, sizeof(buf), "step|%u", steps);
+  LOG_I("%s", buf);
+  gestureChar.notify(buf, 40);
+}
+#endif
+
+#ifdef ENABLE_GRYO
+static void handleGyroCalibrated() {
+  float gx = imu.getGyroX();
+  float gy = imu.getGyroY();
+  float gz = imu.getGyroZ();
+  mountAdapter.transform(gx, gy, gz);
+
+  if (rawMode && Bluefruit.Periph.connected()) {
+    char buf[40] = {};
+    snprintf(buf, sizeof(buf), "gyr|%.3f|%.3f|%.3f", gx, gy, gz);
+    gestureChar.notify(buf, 40);
+  }
+
+  const char* gesture = gestureDetector.update(gx, gy, gz);
+  if (gesture) {
+    float integ = gestureDetector.lastIntegral();
+    char buf[40] = {};
+    snprintf(buf, sizeof(buf), "%s|%.2f|%.2f|%.2f|%.2f", gesture, gx, gy, gz, integ);
+    gestureChar.notify(buf, 40);
+    lastMotionMs = millis();
+    _stabDetector.markMotion(lastMotionMs);
+    LOG_I("[Gesture] %s gx=%.2f gy=%.2f gz=%.2f integ=%.2f", gesture, gx, gy, gz, integ);
+  }
+}
+#endif
+
+static void handleSignificantMotion() {
+  LOG_I("[Sleep] significant motion — waking");
+  if (sleeping) exitSleep();
+  // One-shot sensor; re-arming only happens in the next enterSleep() call.
+}
+
+static void handleRotationVector() {
+  if (sleeping) return;
+
+  float w = imu.getQuatReal();
+  float x = imu.getQuatI();
+  float y = imu.getQuatJ();
+  float z = imu.getQuatK();
+  float roll  = quaternionToRoll(w, x, y, z)  * 57.296f;
+  float pitch = quaternionToPitch(w, x, y, z) * 57.296f;
+  float yaw   = quaternionToYaw(w, x, y, z)   * 57.296f;
+  mountAdapter.transform(roll, pitch, yaw);
+
+  // Track current Euler for stability-triggered rebase
+  lastRoll = roll; lastPitch = pitch; lastYaw = yaw;
+
+  stillDetector->onRotationVector(roll, pitch, yaw, millis());
+  if (armed && stillDetector->shouldRebase()) {
+    baselineRoll  = roll;
+    basePitch_arm = pitch;
+    baselineYaw   = yaw;
+    if (Bluefruit.Periph.connected()) {
+      publishBaseline(baselineRoll, basePitch_arm, baselineYaw);
+    }
+    LOG_I("[Rebase] stillness rebase: r=%.1f p=%.1f y=%.1f", roll, pitch, yaw);
+  }
+
+  if (!Bluefruit.Periph.connected()) return;
+
+  if (rawMode) {
+    char buf[40] = {};
+    snprintf(buf, sizeof(buf), "raw|%.1f|%.1f|%.1f", roll, pitch, yaw);
+    gestureChar.notify(buf, 40);
+  }
+
+  // ── Calibration: accumulate stable samples in rolling window, then average ──
+  static bool baselineCaptured = false;
+  if (armed) {
+    if (!baselineCaptured) {
+      // Feed every stable sample into the calibration buffer
+      if (!calInProgress) { calBuffer.reset(); calInProgress = true; }
+      calBuffer.push(roll, pitch, yaw);
+
+      if (calBuffer.isFull()) {
+        calInProgress = false;
+        baselineCaptured = true;
+        calBuffer.getAverage(baselineRoll, basePitch_arm, baselineYaw);
+        publishBaseline(baselineRoll, basePitch_arm, baselineYaw);
+        LOG_I("[Cal] baseline captured: r=%.1f p=%.1f y=%.1f (%d samples)",
+              baselineRoll, basePitch_arm, baselineYaw, MAX_CAL_SAMPLES);
+      }
+    }
+
+    unsigned long now = millis();
+    if (now - lastDeltaMs >= 20) {
+      lastDeltaMs = now;
+      if (currentMode == MODE_KNOB) {
+        float dr = roll  - baselineRoll;
+        float dp = pitch - basePitch_arm;
+        float dy = yaw   - baselineYaw;
+        while (dr >  180.0f) dr -= 360.0f; while (dr < -180.0f) dr += 360.0f;
+        while (dp >  180.0f) dp -= 360.0f; while (dp < -180.0f) dp += 360.0f;
+        while (dy >  180.0f) dy -= 360.0f; while (dy < -180.0f) dy += 360.0f;
+        float deltas[3] = { dr, dp, dy };
+        deltaChar.notify(deltas, 12);
+      }
+      // Emit pose for HUD (current vs baseline) at throttled rate
+      if (currentMode == MODE_GESTURE) {
+        // Throttle pose updates to ~10Hz to avoid flooding BLE
+        static unsigned long lastPoseMs = 0;
+        if (now - lastPoseMs >= 100) {
+          lastPoseMs = now;
+          // Binary pose packet — 7 bytes total (see state_packet.h).
+          // Baseline is published separately via publishBaseline() on change.
+          uint8_t pbuf[STATE_PACKET_MAX_LEN];
+          uint8_t pn = pkt_pose(pbuf, roll, pitch, yaw);
+          stateChar.notify(pbuf, pn);
+        }
+      }
+    }
+  } else {
+    baselineCaptured = false;
+  }
+}
+
+static void handleStabilityClassifier() {
+  uint8_t stab = imu.getStabilityClassifier();
+  unsigned long now = millis();
+
+  stillDetector->onStabilityClass(stab, now);
+  if (armed && stillDetector->shouldRebase()) {
+    baselineRoll  = lastRoll;
+    basePitch_arm = lastPitch;
+    baselineYaw   = lastYaw;
+    publishBaseline(baselineRoll, basePitch_arm, baselineYaw);
+    LOG_I("[Rebase] stability rebase: r=%.1f p=%.1f y=%.1f", lastRoll, lastPitch, lastYaw);
+  }
+
+  // Only log on state change to avoid spam (~40ms events flood everything)
+  if (stab != lastLoggedStab) {
+    lastLoggedStab = stab;
+    LOG_I("[Stab] s=%u (1=table,2=stationary,3=stable,0=unknown)", stab);
+  }
+  // Only notify when BLE is connected — calling notify() before the
+  // SoftDevice has a valid connection handle causes a hard fault on nRF52.
+  if (Bluefruit.Periph.connected()) {
+    uint8_t sbuf[STATE_PACKET_MAX_LEN];
+    uint8_t sn = pkt_stab(sbuf, stab);
+    stateChar.notify(sbuf, sn);
+  }
+}
+
+// ── IMU dispatch table ────────────────────────────────────────────────────────
+// Add new sensors here — no changes needed in loop().
+
+static const struct { uint8_t id; void(*fn)(); } IMU_HANDLERS[] = {
+#ifdef ENABLE_SHAKE
+  { SENSOR_REPORTID_LINEAR_ACCELERATION,   handleLinearAcceleration  },
+#endif
+#ifdef ENABLE_TAP
+  { SENSOR_REPORTID_TAP_DETECTOR,          handleTapDetector         },
+#endif
+#ifdef ENABLE_STEP
+  { SENSOR_REPORTID_STEP_COUNTER,          handleStepCounter         },
+#endif
+#ifdef ENABLE_GRYO
+  { SENSOR_REPORTID_GYROSCOPE_CALIBRATED,  handleGyroCalibrated      },
+#endif
+  { (uint8_t)SH2_SIGNIFICANT_MOTION,       handleSignificantMotion   },
+  { SENSOR_REPORTID_ROTATION_VECTOR,       handleRotationVector      },
+  { SENSOR_REPORTID_STABILITY_CLASSIFIER,  handleStabilityClassifier },
+};
+
+static void dispatchIMUEvent(uint8_t eventId) {
+  for (const auto& h : IMU_HANDLERS) {
+    if (h.id == eventId) { h.fn(); return; }
+  }
 }
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
@@ -500,86 +850,7 @@ void loop() {
   }
   firstLoop = false;
   if (!imuReset && imu.getSensorEvent()) {
-    uint8_t eventId = imu.getSensorEventID();
-
-#ifdef ENABLE_SHAKE
-    if (eventId == SENSOR_REPORTID_LINEAR_ACCELERATION) {
-      float ax = imu.getLinAccelX();
-      float ay = imu.getLinAccelY();
-      float az = imu.getLinAccelZ();
-      if (shake.update(ax, ay, az)) {
-        char buf[40] = {};
-        snprintf(buf, sizeof(buf), "shake");
-        LOG_I("%s", buf);
-        gestureChar.notify(buf, 40);
-      }
-    }
-#endif
-#ifdef ENABLE_TAP
-    if (eventId == SENSOR_REPORTID_TAP_DETECTOR) {
-      char buf[40] = {};
-      snprintf(buf, sizeof(buf), "tap");
-      LOG_I("%s", buf);
-      gestureChar.notify(buf, 40);
-    }
-#endif
-#ifdef ENABLE_STEP
-    if (eventId == SENSOR_REPORTID_STEP_COUNTER) {
-      uint16_t steps = imu.getStepCount();
-      char buf[40] = {};
-      snprintf(buf, sizeof(buf), "step|%u", steps);
-      LOG_I("%s", buf);
-      gestureChar.notify(buf, 40);
-    }
-#endif
-
-#ifdef ENABLE_GRYO
-    if (eventId == SENSOR_REPORTID_GYROSCOPE_CALIBRATED) {
-      float gx = imu.getGyroX();  // rad/s
-      float gy = imu.getGyroY();
-      float gz = imu.getGyroZ();
-      mountAdapter.transform(gx, gy, gz);
-
-      if (rawMode && Bluefruit.Periph.connected()) {
-        char buf[40] = {};
-        snprintf(buf, sizeof(buf), "gyr|%.3f|%.3f|%.3f", gx, gy, gz);
-        gestureChar.notify(buf, 40);
-      }
-
-      const char* gesture = gestureDetector.update(gx, gy, gz);
-      if (gesture) {
-        char buf[40] = {};
-        snprintf(buf, sizeof(buf), "%s", gesture);
-        gestureChar.notify(buf, 40);
-        lastMotionMs = millis();
-        LOG_I("[Gesture] %s", gesture);
-      }
-    }
-#endif
-
-    if (eventId == (uint8_t)SH2_SIGNIFICANT_MOTION) {
-      LOG_I("[Sleep] significant motion — waking");
-      if (sleeping) exitSleep();
-      // One-shot sensor; re-arming only happens in the next enterSleep() call.
-    }
-
-    if (eventId == SENSOR_REPORTID_ROTATION_VECTOR) {
-      if (sleeping) return;
-
-      if (rawMode && Bluefruit.Periph.connected()) {
-        float w = imu.getQuatReal();
-        float x = imu.getQuatI();
-        float y = imu.getQuatJ();
-        float z = imu.getQuatK();
-        float roll  = quaternionToRoll(w, x, y, z)  * 57.296f;
-        float pitch = quaternionToPitch(w, x, y, z) * 57.296f;
-        float yaw   = quaternionToYaw(w, x, y, z)   * 57.296f;
-        mountAdapter.transform(roll, pitch, yaw);
-        char buf[40] = {};
-        snprintf(buf, sizeof(buf), "raw|%.1f|%.1f|%.1f", roll, pitch, yaw);
-        gestureChar.notify(buf, 40);
-      }
-    }
+    dispatchIMUEvent(imu.getSensorEventID());
   }
 
   // Keepalive ping
@@ -588,11 +859,24 @@ void loop() {
     if (now - lastPingMs > PING_INTERVAL_MS) {
       lastPingMs = now;
       gestureChar.notify("ping", 4);
+      // Re-emit last known stability class every ping cycle.
+      // BNO085 only fires stab events on class change — if the device was already
+      // stable before the phone connected, the app never gets a stab event and
+      // calibration hangs forever. This heartbeat guarantees one delivery within
+      // PING_INTERVAL_MS of the CCCD being written.
+      if (lastLoggedStab <= 4) {
+        uint8_t hbuf[STATE_PACKET_MAX_LEN];
+        uint8_t hn = pkt_stab(hbuf, lastLoggedStab);
+        stateChar.notify(hbuf, hn);
+      }
     }
   }
 
   // ── Sleep entry check ────────────────────────────────────────────────────
-  if (!sleeping && !Bluefruit.Periph.connected()) {
+  // Trigger even when connected — a connected-but-idle device (no gestures for
+  // SLEEP_TIMEOUT_MS) should still sleep. enterSleep() disconnects the phone;
+  // onConnect() calls exitSleep() if the phone reconnects.
+  if (!sleeping) {
     unsigned long now = millis();
     if ((now - lastMotionMs) > SLEEP_TIMEOUT_MS) {
       enterSleep();
@@ -615,6 +899,8 @@ void loop() {
     }
   }
 
-  // Only yield CPU when in sleep mode — keeps USB CDC responsive during normal operation.
-  if (sleeping) waitForEvent();
+  // Yield CPU every loop — lets SoftDevice put nRF52840 to sleep between BLE
+  // connection events and IMU interrupts. Saves ~2-3mA during active use.
+  // BNO085 INT pin (pin 1) wakes the CPU when IMU data is ready.
+  waitForEvent();
 }

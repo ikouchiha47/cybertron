@@ -9,6 +9,10 @@ import type { BottomTabScreenProps } from "@react-navigation/bottom-tabs";
 import type { TabParams, RootStackParams } from "../navigation/AppNavigator";
 import { registry } from "../devices/registry/DeviceRegistry";
 import { useMDNSDiscovery } from "../discovery/useMDNSDiscovery";
+import { useBLE, recalibrate, applyMode } from "../ble/useBLE";
+import { PrefsStore } from "../mapping/PrefsStore";
+import { INTERACTION_MODE } from "../types";
+import type { InteractionModeValue } from "../types";
 import { AndroidTV } from "../../modules/androidtv";
 import { ANDROIDTV_COMMANDS } from "../devices/adapters/AndroidTVAdapter";
 import { WIZ_COMMANDS } from "../devices/adapters/WizAdapter";
@@ -21,8 +25,20 @@ type Props = CompositeScreenProps<
   StackScreenProps<RootStackParams>
 >;
 
+const MODE_LABELS: Record<InteractionModeValue, string> = {
+  [INTERACTION_MODE.GESTURE]: "Gesture",
+  [INTERACTION_MODE.KNOB]:    "Knob",
+  [INTERACTION_MODE.SYMBOL]:  "Symbol",
+};
+
 export function SettingsScreen({ navigation }: Props) {
+  const { connected, wristName, motionState } = useBLE();
+  const [defaultMode, setDefaultMode] = useState<InteractionModeValue>(INTERACTION_MODE.GESTURE);
   const { devices: discovered, scanning, rescan } = useMDNSDiscovery();
+
+  useEffect(() => {
+    PrefsStore.getDefaultMode().then(setDefaultMode).catch(() => {});
+  }, []);
   const [saved, setSaved] = useState<DeviceMetadata[]>([]);
   const [showAddForm, setShowAddForm] = useState(false);
   const [wizScanning, setWizScanning] = useState(false);
@@ -219,8 +235,60 @@ export function SettingsScreen({ navigation }: Props) {
     );
   }
 
+  const calibLabel =
+    !connected          ? "Not connected" :
+    motionState === "calibrating"  ? "Calibrating…" :
+    motionState === "stable"       ? "Calibrated" :
+    motionState === "moving"       ? "Calibrated" :
+                                     "Uncalibrated";
+
+  const calibColor =
+    motionState === "stable" || motionState === "moving" ? "#1a7f4b" :
+    motionState === "calibrating"                        ? "#7f6a1a" :
+                                                           "#555";
+
   return (
     <View style={s.container}>
+      {/* Wrist sensor */}
+      <Text style={s.label}>Wrist Sensor</Text>
+      <View style={[s.row, { marginBottom: 12 }]}>
+        <View style={s.rowHeader}>
+          <View style={{ flex: 1 }}>
+            <Text style={s.rowName}>{connected ? (wristName || "Connected") : "Not connected"}</Text>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 6, marginTop: 4 }}>
+              <View style={[s.dot, { backgroundColor: calibColor }]} />
+              <Text style={[s.rowSub, { color: calibColor }]}>{calibLabel}</Text>
+            </View>
+          </View>
+          {connected && (
+            <Pressable
+              style={({ pressed }) => [s.iconBtn, pressed && s.iconBtnPressed]}
+              onPress={recalibrate}
+            >
+              <Text style={s.iconBtnText}>⟳</Text>
+            </Pressable>
+          )}
+        </View>
+        <View style={[s.editPanel, { paddingTop: 10 }]}>
+          <Text style={[s.label, { marginTop: 0, marginBottom: 6 }]}>Default mode on connect</Text>
+          <View style={s.segmented}>
+            {([INTERACTION_MODE.GESTURE, INTERACTION_MODE.KNOB, INTERACTION_MODE.SYMBOL] as const).map((m) => (
+              <TouchableOpacity
+                key={m}
+                style={[s.seg, defaultMode === m && s.segActive]}
+                onPress={() => {
+                  setDefaultMode(m);
+                  PrefsStore.setDefaultMode(m).catch(() => {});
+                  if (connected) applyMode(m);
+                }}
+              >
+                <Text style={[s.segText, defaultMode === m && s.segTextActive]}>{MODE_LABELS[m]}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        </View>
+      </View>
+
       {/* Saved devices */}
       <Text style={s.label}>Devices</Text>
       <FlatList
@@ -336,4 +404,5 @@ const s = StyleSheet.create({
   segText:      { color: "#555", fontSize: 12 },
   segTextActive:{ color: "#4a9eff", fontSize: 12 },
   empty:        { color: "#444", fontSize: 14 },
+  dot:          { width: 7, height: 7, borderRadius: 4 },
 });

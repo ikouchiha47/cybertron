@@ -11,6 +11,7 @@ import { SettingsScreen } from "../screens/SettingsScreen";
 import { WizProvisionScreen } from "../screens/WizProvisionScreen";
 import { LogsScreen } from "../screens/LogsScreen";
 import { SessionScreen } from "../screens/SessionScreen";
+import { CalibrationOverlay } from "../screens/CalibrationOverlay";
 
 export type TabParams = {
   Home:     undefined;
@@ -80,6 +81,7 @@ export function AppNavigator() {
         <Stack.Screen name="Pairing"        component={PairingScreen}        options={{ title: "Pair Device" }} />
         <Stack.Screen name="WizProvision"   component={WizProvisionScreen}   options={{ title: "Add Smart Bulb" }} />
       </Stack.Navigator>
+      <CalibrationOverlay />
     </NavigationContainer>
   );
 }

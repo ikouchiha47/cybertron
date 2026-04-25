@@ -51,10 +51,17 @@ struct GestureEvent {
 class GestureArbitrator {
 public:
     // Tuneable constants — all named, no magic numbers in the algorithm body.
-    static constexpr float DOMINANT_RATIO_THRESHOLD = 1.5f;
+    // Raised from 1.5→2.0 to reject cross-axis bleed (yaw firing during pure roll).
+    // Bleed integrals ~0.32-0.35 barely cleared 1.5; 2.0 keeps real gestures intact
+    // (0.51 / 0.05 ≈ 10x ratio) while blocking contaminated signals.
+    static constexpr float DOMINANT_RATIO_THRESHOLD = 2.0f;
     // Small epsilon added to the denominator to prevent divide-by-zero when
     // all non-dominant candidates have zero integrals.
     static constexpr float DENOMINATOR_EPSILON = 0.001f;
+    // Absolute minimum |integral| for any axis to be considered a real gesture.
+    // Values below this are sensor noise or cross-axis coupling. Calibrated from
+    // real-world logs: bleed events ≈0.32-0.35, intended turns ≥0.51.
+    static constexpr float MIN_INTEGRAL = 0.4f;
 
     // arbitrate() may be called on every gyro sample or only when at least
     // one candidate is valid — the caller decides the cadence.
@@ -120,7 +127,14 @@ public:
         }
 
         // ----------------------------------------------------------------
-        // 4. Ratio test.
+        // 4. Absolute minimum check — reject noise and cross-axis bleed.
+        // ----------------------------------------------------------------
+        if (dominantAbs < MIN_INTEGRAL) {
+            return NO_EVENT;
+        }
+
+        // ----------------------------------------------------------------
+        // 5. Ratio test.
         // ----------------------------------------------------------------
         float ratio = dominantAbs / (otherSum + DENOMINATOR_EPSILON);
 
@@ -130,7 +144,7 @@ public:
         }
 
         // ----------------------------------------------------------------
-        // 5. Emit event.
+        // 6. Emit event.
         // ----------------------------------------------------------------
         const AxisCandidate& winner = *slots[dominantIdx].cand;
         GestureEvent evt;

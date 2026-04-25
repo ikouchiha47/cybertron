@@ -6,7 +6,7 @@ APK          := android/app/build/outputs/apk/debug/app-debug.apk
 export ANDROID_HOME
 export JAVA_HOME
 
-.PHONY: build install run prebuild clean logs start launch metro tunnel
+.PHONY: build install run prebuild clean logs start launch metro tunnel test
 
 # Full rebuild + install
 all: build install
@@ -56,8 +56,16 @@ logs:
 clean:
 	$(GRADLE) -p android clean
 
+# Run core unit tests (pure TypeScript, no device required)
+test:
+	bun src/gestures/__tests__/MotionClassifier.test.ts
+	bun src/ble/__tests__/StatePacket.test.ts
+
 # Full wipe — node_modules + native cache + rebuild from scratch
 nuke:
 	rm -rf node_modules android/app/.cxx android/app/build android/.gradle
 	npm install --legacy-peer-deps
 	$(MAKE) build install
+
+device.logs:
+	adb logcat -d --pid=$(adb shell pidof com.anonymous.wristturnapp 2>/dev/null | tr -d '\r')

@@ -1,7 +1,7 @@
 import { requireNativeModule, EventEmitter } from "expo-modules-core";
 
 const native = requireNativeModule("AndroidTV");
-const emitter = new EventEmitter<{ onSecret: []; onReady: []; onError: [{ message: string }] }>(native);
+const emitter = new EventEmitter<{ onSecret: () => void; onReady: () => void; onError: (e: { message: string }) => void }>(native);
 
 export const KeyCode = {
   DPAD_UP:          19,
