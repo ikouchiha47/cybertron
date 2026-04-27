@@ -48,6 +48,25 @@ make -f Makefile.test test-all # includes ManualZUPTDetector (calibration requir
 
 Tests exit non-zero on failure.
 
+### BNO08x INT pin — known library bug
+
+The SparkFun BNO08x Cortex library (`SparkFun_BNO08x_Cortex_Based_IMU`) has a
+race condition in its INT pin synchronization. When `begin()` receives an INT
+pin (e.g. `imu.begin(0x4B, Wire, INT_PIN, RST_PIN)`), the library sets
+`_int_pin` and then **every** `enableReport()` call invokes `hal_wait_for_int()`
+**before** sending the command to the BNO08x. This means the library waits for
+an INT pulse that the BNO08x will never send because it hasn't received the
+command yet. After 500ms it times out, calls `hal_hardwareReset()`, and the
+enable fails.
+
+**Correct usage:** Call `imu.begin(address, Wire)` with **2 arguments only**.
+This leaves `_int_pin = -1` and bypasses the broken `hal_wait_for_int()` path.
+The BNO08x still works fine — I2C communication is synchronous and the INT
+pin is not needed for reliable operation.
+
+**Do NOT** pass INT/RST pins to `begin()` for this library. This was
+discovered and confirmed 2026-04-27.
+
 ### Backup sketches
 
 - `wristturn_nrf52840.ino.bkp` — archived LSM6DS3 version (nRF52840 Sense, 6DOF)
