@@ -38,8 +38,10 @@
 
 class ShakeDetector {
 public:
-  // Datasheet defaults
-  static constexpr float    ACCEL_THRESHOLD_MS2  = 8.0f;   // m/s²
+  // Datasheet defaults — lowered for wrist-worn use case.
+  // Original BNO085 threshold of 8.0 m/s² (~0.8g) requires vigorous shaking.
+  // 2.5 m/s² (~0.25g) allows normal wrist shakes to register.
+  static constexpr float    ACCEL_THRESHOLD_MS2  = 2.5f;   // m/s²
   static constexpr uint8_t  DIRECTION_CHANGES     = 3;
   static constexpr uint32_t MIN_CHANGE_MS          = 50;
   static constexpr uint32_t MAX_CHANGE_MS          = 400;

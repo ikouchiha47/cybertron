@@ -42,6 +42,7 @@ enum StatePacketType : uint8_t {
     PKT_SLEEP        = 0x04,  // entering sleep                (sizeof TagOnlyPacket)
     PKT_WAKE         = 0x05,  // waking from sleep             (sizeof TagOnlyPacket)
     PKT_ARM_EVT      = 0x06,  // per-axis arm/disarm           (sizeof ArmEvtPacket)
+    PKT_GRAV         = 0x07,  // arm pose from gravity vector  (sizeof GravPacket)
 };
 
 // Axis identifiers used in PKT_ARM_EVT.
@@ -55,6 +56,13 @@ enum StatePacketAxis : uint8_t {
 enum StatePacketArmState : uint8_t {
     ARM_STATE_DISARMED = 0,
     ARM_STATE_ARMED    = 1,
+};
+
+// Arm pose values from gravity vector (PKT_GRAV).
+enum StatePacketGravPose : uint8_t {
+    GRAV_POSE_FLAT     = 0,  // gravity along Z′ — device flat on surface
+    GRAV_POSE_HANGING  = 1,  // gravity along X′ — arm hanging by side
+    GRAV_POSE_RAISED   = 2,  // gravity mixed Y′/Z′ — arm raised, transitional
 };
 
 // ── Packed wire structs ─────────────────────────────────────────────────────
@@ -97,6 +105,12 @@ struct __attribute__((packed)) ArmEvtPacket {
     int16_t delta_dd;   // deci-degrees
 };
 static_assert(sizeof(ArmEvtPacket) == 5, "ArmEvtPacket must be 5 bytes");
+
+struct __attribute__((packed)) GravPacket {
+    uint8_t tag;
+    uint8_t pose;       // StatePacketGravPose
+};
+static_assert(sizeof(GravPacket) == 2, "GravPacket must be 2 bytes");
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -159,6 +173,12 @@ static inline uint8_t pkt_arm_evt(uint8_t* out, uint8_t axis, uint8_t state, flo
         state,
         angle_to_i16(delta),
     };
+    memcpy(out, &p, sizeof(p));
+    return sizeof(p);
+}
+
+static inline uint8_t pkt_grav(uint8_t* out, uint8_t pose) {
+    GravPacket p { PKT_GRAV, pose };
     memcpy(out, &p, sizeof(p));
     return sizeof(p);
 }

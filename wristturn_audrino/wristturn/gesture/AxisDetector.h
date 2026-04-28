@@ -16,11 +16,14 @@
 
 // ── Tunable constants ─────────────────────────────────────────────────────────
 
-/** Jerk magnitude (rad/s²) that opens the ONSET window. */
-static constexpr float    JERK_ONSET_THRESHOLD  = 8.0f;
+/** Jerk magnitude (rad/s²) that opens the ONSET window.
+ *  Lowered from 8.0 → 3.0 to allow slower wrist movements to register.
+ *  At 3.0 rad/s², a gentle wrist turn (~30°/s²) will trigger detection. */
+static constexpr float    JERK_ONSET_THRESHOLD  = 3.0f;
 
-/** Minimum signed integral (rad) to advance ONSET→PEAK. ~14 degrees. */
-static constexpr float    INTEGRAL_THRESHOLD    = 0.25f;
+/** Minimum signed integral (rad) to advance ONSET→PEAK. ~8.6 degrees.
+ *  Lowered from 0.25 → 0.15 so smaller rotations (not just sharp flicks) fire. */
+static constexpr float    INTEGRAL_THRESHOLD    = 0.15f;
 
 /** Gyro magnitude (rad/s) below which PEAK transitions to DECAY. */
 static constexpr float    DECAY_THRESHOLD       = 0.15f;
@@ -31,8 +34,9 @@ static constexpr float    ZUPT_GYRO_THRESHOLD   = 0.03f;
 /** Consecutive sub-ZUPT samples required before isQuiet() == true. ~400ms at 50Hz. */
 static constexpr int      ZUPT_MIN_SAMPLES      = 20;
 
-/** ONSET must reach PEAK within this window, else reset to IDLE (noise rejection). */
-static constexpr uint32_t ONSET_TIMEOUT_MS      = 300;
+/** ONSET must reach PEAK within this window, else reset to IDLE (noise rejection).
+ *  Increased from 300 → 600ms to allow slower movements to accumulate integral. */
+static constexpr uint32_t ONSET_TIMEOUT_MS      = 600;
 
 /** PEAK must see gyro drop below DECAY_THRESHOLD within this window, else reset to IDLE
  *  (held-position rejection — user held wrist still at peak angle). */

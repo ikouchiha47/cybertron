@@ -59,9 +59,9 @@ public:
     // all non-dominant candidates have zero integrals.
     static constexpr float DENOMINATOR_EPSILON = 0.001f;
     // Absolute minimum |integral| for any axis to be considered a real gesture.
-    // Values below this are sensor noise or cross-axis coupling. Calibrated from
-    // real-world logs: bleed events ≈0.32-0.35, intended turns ≥0.51.
-    static constexpr float MIN_INTEGRAL = 0.4f;
+    // Lowered from 0.40 → 0.20 rad (~11.5°) to allow gentler wrist movements
+    // to register as gestures. Bleed events still blocked by ratio test.
+    static constexpr float MIN_INTEGRAL = 0.20f;
 
     // arbitrate() may be called on every gyro sample or only when at least
     // one candidate is valid — the caller decides the cadence.

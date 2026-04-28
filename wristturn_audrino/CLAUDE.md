@@ -72,3 +72,21 @@ discovered and confirmed 2026-04-27.
 - `wristturn_nrf52840.ino.bkp` — archived LSM6DS3 version (nRF52840 Sense, 6DOF)
 - `wristturn_bno085.ino.bkp`   — earlier BNO085 iteration
 - `wristturn.ino.bkp2`         — prior art for angle tracking / baseline logic
+
+### BNO085 modeSleep() / shake-to-wake — architecture
+
+When `modeSleep()` puts the SH-2 hub to sleep, wake-enabled sensors (e.g.
+shake detector with `wakeupEnabled=true`) continue to run internally. On a
+wake event the BNO085 **asserts INT LOW**, but the SH-2 I2C transport is
+suspended — `getSensorEvent()` / `sh2_service()` cannot read data until
+`modeOn()` is called to wake the hub.
+
+**Correct wake sequence** (implemented 2026-04-28):
+1. Detect INT pin LOW in `loop()` while `sleeping == true`
+2. Call `imu.modeOn()` + delay(50ms) to wake the SH-2 transport
+3. Drain pending events from the FIFO via `getSensorEvent()` loop
+4. Call `exitSleep()` to restore normal sensor reports
+
+**Wrong approach** (the original bug): Trying to call `getSensorEvent()`
+while the hub is asleep → I2C reads return nothing → shake event is never
+decoded → `handleSleepShake()` never fires → device stays asleep forever.

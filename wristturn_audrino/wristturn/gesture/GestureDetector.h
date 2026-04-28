@@ -71,9 +71,9 @@ public:
         if (!evt.valid) return nullptr;
 
         switch (evt.axis) {
-            case GestureAxis::ROLL:  _lastIntegral = cr.integral; break;
-            case GestureAxis::PITCH: _lastIntegral = cp.integral; break;
-            case GestureAxis::YAW:   _lastIntegral = cy.integral; break;
+            case GestureAxis::ROLL:  _lastIntegral = cr.integral; _lastPeakRate = cr.peakRate; break;
+            case GestureAxis::PITCH: _lastIntegral = cp.integral; _lastPeakRate = cp.peakRate; break;
+            case GestureAxis::YAW:   _lastIntegral = cy.integral; _lastPeakRate = cy.peakRate; break;
         }
         switch (evt.axis) {
             case GestureAxis::ROLL:
@@ -86,7 +86,8 @@ public:
         return nullptr;
     }
 
-    float lastIntegral() const { return _lastIntegral; }
+    float lastIntegral()  const { return _lastIntegral; }
+    float lastPeakRate()  const { return _lastPeakRate; }
 
     /** Runtime tuning — lets BLE settings char update the integral threshold. */
     void setIntegralThreshold(float t) {
@@ -112,4 +113,5 @@ private:
     bool     _firstSample;
     float    _integralThreshold;
     float    _lastIntegral = 0.0f;
+    float    _lastPeakRate = 0.0f;
 };
