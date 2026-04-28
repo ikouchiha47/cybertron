@@ -17,9 +17,23 @@ type AxisState = { dir: string; time: number };
 const axisCooldown: Record<string, AxisState> = {};
 
 const RETURN_COOLDOWN_MS = 500;
+// After a shake fires, the wrist settles erratically — suppress follow-on noise.
+const SHAKE_GOBBLE_MS    = 500;
+
+let shakeGobbleUntil = 0;
 
 export function filterGesture(gesture: string): boolean {
-  const now  = Date.now();
+  const now = Date.now();
+
+  // Shake always passes through and arms the gobble window.
+  if (gesture === "shake") {
+    shakeGobbleUntil = now + SHAKE_GOBBLE_MS;
+    return true;
+  }
+
+  // Suppress all non-shake gestures inside the gobble window.
+  if (now < shakeGobbleUntil) return false;
+
   const axis = AXIS_OF[gesture];
   if (!axis) return true;
 
@@ -34,4 +48,5 @@ export function filterGesture(gesture: string): boolean {
 
 export function resetGestureFilter(): void {
   for (const key in axisCooldown) delete axisCooldown[key];
+  shakeGobbleUntil = 0;
 }

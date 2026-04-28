@@ -136,6 +136,29 @@ test("parses arm_evt pitch/armed/1.5°", () => {
   assert.deepEqual(pkt, { type: "arm_evt", axis: AXIS.PITCH, state: ARM_STATE.ARMED, delta: 1.5 });
 });
 
+// ── GravPacket ──────────────────────────────────────────────────────────────
+
+section("GravPacket (arm pose) parsing");
+
+test("parses pose=flat (0)", () => {
+  const pkt = parseStatePacket(new Uint8Array([PKT.GRAV, 0]));
+  assert.deepEqual(pkt, { type: "grav", pose: 0 });
+});
+
+test("parses pose=hanging (1)", () => {
+  const pkt = parseStatePacket(new Uint8Array([PKT.GRAV, 1]));
+  assert.deepEqual(pkt, { type: "grav", pose: 1 });
+});
+
+test("parses pose=raised (2)", () => {
+  const pkt = parseStatePacket(new Uint8Array([PKT.GRAV, 2]));
+  assert.deepEqual(pkt, { type: "grav", pose: 2 });
+});
+
+test("truncated GRAV returns null", () => {
+  assert.equal(parseStatePacket(new Uint8Array([PKT.GRAV])), null);
+});
+
 // ── Error cases ────────────────────────────────────────────────────────────
 
 section("Error handling");

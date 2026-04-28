@@ -9,11 +9,16 @@ import type { StackScreenProps } from "@react-navigation/stack";
 import type { BottomTabScreenProps } from "@react-navigation/bottom-tabs";
 import type { TabParams, RootStackParams } from "../navigation/AppNavigator";
 import { useBLE } from "../ble/useBLE";
+import { startCalibration, armDevice, disarmDevice, confirmBaselineReady, sendBaselineToFirmware } from "../ble/useBLE";
+import { BaselineStore } from "../storage/BaselineStore";
+import { CalibrationOverlay } from "./CalibrationOverlay";
 import { WRISTTURN_NAME } from "../ble/constants";
 import { registry } from "../devices/registry/DeviceRegistry";
 import { AndroidTV } from "../../modules/androidtv";
-import type { DeviceMetadata } from "../types";
+import type { DeviceMetadata, Baseline, DiscStateValue } from "../types";
+import { DiscState, Gesture, ArmPose } from "../types";
 import { BatteryWave } from "../ui/BatteryWave";
+import { PoseHUD } from "../ui/PoseHUD";
 
 type Props = CompositeScreenProps<
   BottomTabScreenProps<TabParams, "Home">,
@@ -27,6 +32,49 @@ const RING_CAPACITY = 8;
 // Radii for concentric rings (inner → outer)
 const RING_RADII = [SCREEN_W * 0.28, SCREEN_W * 0.42, SCREEN_W * 0.50];
 const CHAR_WIDTH_PX = 7; // approx px per character at fontSize 11
+
+const PULSE_COUNT    = 3;
+const PULSE_DURATION = 1800;
+const PULSE_STAGGER  = 600;
+const PULSE_RADIUS   = SCREEN_W * 0.40;
+
+function PulseRings({ active }: { active: boolean }) {
+  const anims = useRef(Array.from({ length: PULSE_COUNT }, () => new Animated.Value(0))).current;
+  const loops = useRef<Animated.CompositeAnimation[]>([]);
+
+  useEffect(() => {
+    loops.current.forEach(l => l.stop());
+    anims.forEach(a => a.setValue(0));
+    if (!active) return;
+
+    loops.current = anims.map((anim) =>
+      Animated.loop(Animated.timing(anim, { toValue: 1, duration: PULSE_DURATION, useNativeDriver: true }))
+    );
+    const timeouts = loops.current.map((loop, i) => setTimeout(() => loop.start(), i * PULSE_STAGGER));
+    return () => {
+      timeouts.forEach(clearTimeout);
+      loops.current.forEach(l => l.stop());
+    };
+  }, [active]);
+
+  const size = PULSE_RADIUS * 2;
+  return (
+    <View style={{ position: "absolute", width: size, height: size,
+                   left: -PULSE_RADIUS, top: -PULSE_RADIUS, pointerEvents: "none" }}>
+      {anims.map((anim, i) => {
+        const scale   = anim.interpolate({ inputRange: [0, 1], outputRange: [0.05, 1] });
+        const opacity = anim.interpolate({ inputRange: [0, 0.12, 0.75, 1], outputRange: [0, 0.55, 0.18, 0] });
+        return (
+          <Animated.View key={i} style={{
+            position: "absolute", width: size, height: size,
+            borderRadius: PULSE_RADIUS, borderWidth: 1.2, borderColor: "#4a9eff",
+            opacity, transform: [{ scale }],
+          }} />
+        );
+      })}
+    </View>
+  );
+}
 
 const TRANSPORT_ICON: Record<string, string> = {
   androidtv: "television-play",
@@ -87,7 +135,7 @@ function DeviceRow({
 
 // Circular ring view
 function CircleView({
-  devices, selectedIdx, onSelect, onOpen, onMap, batteryPct, wristConnected,
+  devices, selectedIdx, onSelect, onOpen, onMap, batteryPct, wristConnected, pulsing,
 }: {
   devices: DeviceMetadata[];
   selectedIdx: number;
@@ -96,6 +144,7 @@ function CircleView({
   onMap: (dev: DeviceMetadata) => void;
   batteryPct: number | null;
   wristConnected: boolean;
+  pulsing: boolean;
 }) {
   const rings = buildRings(devices);
   // flat index → ring + position
@@ -124,6 +173,11 @@ function CircleView({
           }}
         />
       ))}
+
+      {/* Pulse rings — behind everything, centered */}
+      <View style={{ position: "absolute", left: cx, top: cy }}>
+        <PulseRings active={pulsing} />
+      </View>
 
       {/* Center: battery wave when connected, dot otherwise */}
       {wristConnected && batteryPct !== null ? (
@@ -177,113 +231,73 @@ function CircleView({
   );
 }
 
-const BROWSE_TIMEOUT_MS = 3000;
+const RAISE_CONFIRM_MS = 1000;  // arm must stay not-hanging for 1s before entering browse
+const HANG_EXIT_MS     = 1500;  // hanging held for 1.5s exits browse
 
 export function DiscoveryScreen({ navigation }: Props) {
   const [viewMode, setViewMode] = useState<"circle" | "list">("circle");
   const [devices, setDevices]   = useState<DeviceMetadata[]>([]);
   const [selectedIdx, setSelected] = useState(0);
-  const [browsing, setBrowsing] = useState(false);
-  const [awake, setAwake]       = useState(false);
-  const [showPose, setShowPose] = useState(false);
+  const [discState, setDiscState] = useState<DiscStateValue>(DiscState.IDLE);
+  const [storedBaseline, setStoredBaseline] = useState<Baseline | null>(null);
   const connectingRef  = useRef(false);
   const devicesRef     = useRef<DeviceMetadata[]>([]);
   const selectedRef    = useRef(0);
-  const browsingRef    = useRef(false);
-  const awakeRef       = useRef(false);
-  const sleepTimerRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const inactivityRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const discStateRef   = useRef(discState);
+  const dropTimerRef   = useRef<ReturnType<typeof setTimeout> | null>(null);
   const insets         = useSafeAreaInsets();
   const iconRot        = useRef(new Animated.Value(0)).current;
 
-  const WAKE_TIMEOUT_MS = 10_000;
+  // ── State logger ─────────────────────────────────────────────────────────
+  const log = (...args: unknown[]) => console.log("[Discovery]", ...args);
 
-  function wakeUp(reason?: string) {
-    awakeRef.current = true;
-    setAwake(true);
-    resetSleepTimer();
-    console.log("[WAKE] wakeUp reason=" + (reason ?? "unknown"));
-  }
+  // Keep discStateRef in sync
+  useEffect(() => { discStateRef.current = discState; }, [discState]);
 
-  function goSleep(reason?: string) {
-    awakeRef.current = false;
-    setAwake(false);
-    clearSleepTimer();
-    exitBrowse();
-    console.log("[WAKE] goSleep reason=" + (reason ?? "unknown"));
-  }
-
-  function resetSleepTimer() {
-    clearSleepTimer();
-    sleepTimerRef.current = setTimeout(goSleep, WAKE_TIMEOUT_MS);
-  }
-
-  function clearSleepTimer() {
-    if (sleepTimerRef.current) { clearTimeout(sleepTimerRef.current); sleepTimerRef.current = null; }
-  }
-
-  function enterBrowse(reason?: string) {
-    browsingRef.current = true;
-    setBrowsing(true);
-    resetInactivity();
-    console.log("[BROWSE] enterBrowse reason=" + (reason ?? "unknown"));
-  }
-
-  function exitBrowse() {
-    browsingRef.current = false;
-    setBrowsing(false);
-    clearInactivity();
-  }
-
-  function resetInactivity() {
-    clearInactivity();
-    inactivityRef.current = setTimeout(exitBrowse, BROWSE_TIMEOUT_MS);
-  }
-
-  function clearInactivity() {
-    if (inactivityRef.current) { clearTimeout(inactivityRef.current); inactivityRef.current = null; }
-  }
-
-  // Clean up on unmount
-  useEffect(() => () => { clearInactivity(); clearSleepTimer(); }, []);
-
-  const { connected, wristName, batteryPct, pose } = useBLE({
-    onGesture: (g) => {
-      if (g === "shake") {
-        goSleep("shake");
-        return;
-      }
-
-      // pitch_up, tap, or pitch_down all wake the device
-      if (!awakeRef.current) {
-        if (g === "pitch_up" || g === "tap" || g === "pitch_down") {
-          wakeUp(g);
-          enterBrowse(g);
-        } else {
-          console.log("[WAKE] gesture ignored while asleep:", g);
+  // Stable gesture handler — reads discState via ref, no dependency churn
+  const handleGesture = React.useCallback((g: string) => {
+    const ds = discStateRef.current;
+    switch (ds) {
+      case "calibrating":
+        if (g === Gesture.SHAKE) {
+          disarmDevice().catch(() => {});
+          setDiscState(DiscState.IDLE);
         }
-        return;
-      }
-
-      resetSleepTimer();
-
-      if (g === "turn_right" || g === "turn_left") {
-        if (!browsingRef.current) return;
-        cycleDevice(g === "turn_right" ? 1 : -1);
-        resetInactivity();
-        return;
-      }
-      if (g === "tap" || g === "pitch_down") {
-        if (!browsingRef.current) { enterBrowse(); return; }
-        if (devicesRef.current.length > 0) {
-          exitBrowse();
+        break;
+      case "wait_raised":
+        if (g === Gesture.PITCH_DOWN && devicesRef.current.length > 0) {
+          setDiscState(DiscState.BROWSING);
           openDevice(devicesRef.current[selectedRef.current]);
         }
-        return;
-      }
-    },
-  });
+        break;
+      case "browsing":
+        if (g === Gesture.TURN_RIGHT || g === Gesture.TURN_LEFT) {
+          const dir = g === Gesture.TURN_RIGHT ? 1 : -1;
+          cycleDevice(dir);
+        } else if (g === Gesture.PITCH_DOWN && devicesRef.current.length > 0) {
+          openDevice(devicesRef.current[selectedRef.current]);
+        } else if (g === Gesture.SHAKE) {
+          setDiscState(DiscState.WAIT_RAISED);
+        }
+        break;
+      case "tracking":
+        if (g === Gesture.SHAKE) {
+          navigation.goBack();
+        }
+        break;
+      default:
+        break;
+    }
+  }, []); // stable — reads state via ref
 
+  const ble = useBLE({ onGesture: handleGesture });
+  const { connected, wristName, wristAddress, batteryPct, motionState, pose, sleeping, baselineCandidate, armPose } = ble;
+
+  useEffect(() => {
+    log(`discState → ${discState} | connected=${connected} | baseline=${!!storedBaseline} | motion=${motionState} | sleeping=${sleeping}`);
+  }, [discState, connected, storedBaseline, motionState, sleeping]);
+
+  // Icon rotation
   useEffect(() => {
     let current = 0;
     const id = setInterval(() => {
@@ -293,6 +307,7 @@ export function DiscoveryScreen({ navigation }: Props) {
     return () => clearInterval(id);
   }, []);
 
+  // Device registry: load on mount, refresh on focus
   useEffect(() => {
     registry.load().then(() => {
       const all = registry.all();
@@ -303,11 +318,132 @@ export function DiscoveryScreen({ navigation }: Props) {
       const all = registry.all();
       setDevices(all);
       devicesRef.current = all;
-      // Coming back from a device screen — user was active, wake + browse
-      if (all.length > 0) { wakeUp(); enterBrowse(); }
     });
     return unsub;
   }, [navigation]);
+
+  // E1: Connect/disconnect
+  useEffect(() => {
+    if (!connected) {
+      log("E1: disconnected → idle");
+      setStoredBaseline(null);
+      setDiscState(DiscState.IDLE);
+      return;
+    }
+    log(`E1: connected wristAddress=${wristAddress}, loading baseline...`);
+    BaselineStore.load(wristAddress).then((b) => {
+      log(`E1: baseline ${b ? "found" : "null"}`);
+      setStoredBaseline(b);
+      if (b) setDiscState(DiscState.WAIT_RAISED);
+    }).catch((e) => {
+      log(`E1: BaselineStore error: ${e}`);
+      setStoredBaseline(null);
+    });
+  }, [connected, wristAddress]);
+
+  // E2: No baseline → calibrate
+  useEffect(() => {
+    if (connected && !storedBaseline && discState !== DiscState.CALIBRATING) {
+      log("E2: no baseline → calibrating");
+      setDiscState(DiscState.CALIBRATING);
+      startCalibration();
+    }
+  }, [connected, storedBaseline, discState]);
+
+  // E3: Calibration complete
+  useEffect(() => {
+    if (discState !== DiscState.CALIBRATING || !baselineCandidate) return;
+    log("E3: baseline candidate received, saving");
+    const baseline: Baseline = {
+      roll: baselineCandidate.roll,
+      pitch: baselineCandidate.pitch,
+      yaw: baselineCandidate.yaw,
+      timestamp: Date.now(),
+      wristName: wristName || "",
+      wristAddress: wristAddress || "",
+    };
+    BaselineStore.save(wristAddress, baseline).then(() => {
+      setStoredBaseline(baseline);
+      return sendBaselineToFirmware(baseline);
+    }).then(() => {
+      confirmBaselineReady();
+      return armDevice();
+    }).then(() => {
+      log("E3: done → wait_raised");
+      setDiscState(DiscState.WAIT_RAISED);
+    }).catch((e) => log(`E3: ERROR: ${e}`));
+  }, [discState, baselineCandidate, wristName, wristAddress]);
+
+  // E4: wait_raised → browsing when arm is not hanging (flat or raised = device in use).
+  // "raised" (steep angle) and "flat" (horizontal use) both count — only hanging means done.
+  // Requires pose to hold for RAISE_CONFIRM_MS to avoid transient triggers.
+  useEffect(() => {
+    if (discState !== DiscState.WAIT_RAISED || armPose === null) return;
+    if (armPose === ArmPose.HANGING) return;
+    log(`E4: armPose=${armPose} → confirm ${RAISE_CONFIRM_MS}ms`);
+    const t = setTimeout(() => {
+      log("E4: confirmed → browsing");
+      setDiscState(DiscState.BROWSING);
+    }, RAISE_CONFIRM_MS);
+    return () => clearTimeout(t);
+  }, [armPose, discState]);
+
+  // E5: browsing → wait_raised when arm hangs by side (definitive done signal).
+  // flat = device still in use (on desk, armrest, pointing at screen) — don't exit.
+  // hanging = arm dropped fully to side — exit after HANG_EXIT_MS.
+  useEffect(() => {
+    if (discState !== DiscState.BROWSING) {
+      if (dropTimerRef.current) { clearTimeout(dropTimerRef.current); dropTimerRef.current = null; }
+      return;
+    }
+    if (armPose !== ArmPose.HANGING) {
+      if (dropTimerRef.current) { clearTimeout(dropTimerRef.current); dropTimerRef.current = null; }
+      return;
+    }
+    if (!dropTimerRef.current) {
+      log(`E5: armPose=hanging, exit timer ${HANG_EXIT_MS}ms`);
+      dropTimerRef.current = setTimeout(() => {
+        log("E5: timer fired → wait_raised");
+        dropTimerRef.current = null;
+        setDiscState(DiscState.WAIT_RAISED);
+      }, HANG_EXIT_MS);
+    }
+  }, [armPose, discState]);
+
+  // E6: Sleeping → idle
+  useEffect(() => {
+    if (sleeping && discState !== DiscState.IDLE) {
+      log("E6: sleeping → idle");
+      setDiscState(DiscState.IDLE);
+    }
+  }, [sleeping, discState]);
+
+  // E7: Arm control per discState
+  useEffect(() => {
+    if (discState === DiscState.IDLE) {
+      log("E7: idle → disarm");
+      disarmDevice().catch(() => {});
+    } else {
+      log(`E7: ${discState} → arm`);
+      armDevice().catch((e) => log(`E7: armDevice error: ${e}`));
+    }
+  }, [discState]);
+
+  // E8: Focus — re-send baseline to firmware; reset tracking → browsing on return
+  useEffect(() => {
+    const unsub = navigation.addListener("focus", () => {
+      if (connected && storedBaseline) sendBaselineToFirmware(storedBaseline).catch(() => {});
+      if (discStateRef.current === DiscState.TRACKING) setDiscState(DiscState.BROWSING);
+    });
+    return unsub;
+  }, [navigation, connected, storedBaseline]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (dropTimerRef.current) { clearTimeout(dropTimerRef.current); dropTimerRef.current = null; }
+    };
+  }, []);
 
   function cycleDevice(dir: 1 | -1) {
     const total = devicesRef.current.length;
@@ -318,8 +454,9 @@ export function DiscoveryScreen({ navigation }: Props) {
   }
 
   function openDevice(meta: DeviceMetadata) {
+    setDiscState(DiscState.TRACKING);
     if (meta.transport !== "androidtv") {
-      navigation.navigate("ActiveControl", { deviceId: meta.id });
+      navigation.navigate("ActiveControl", { deviceId: meta.id, homeBaseline: storedBaseline });
       return;
     }
     if (connectingRef.current) return;
@@ -328,7 +465,7 @@ export function DiscoveryScreen({ navigation }: Props) {
     const onReady = AndroidTV.onReady(() => {
       subs.forEach((s) => s.remove());
       connectingRef.current = false;
-      navigation.navigate("ActiveControl", { deviceId: meta.id });
+      navigation.navigate("ActiveControl", { deviceId: meta.id, homeBaseline: storedBaseline });
     });
     const onError = AndroidTV.onError(() => {
       subs.forEach((s) => s.remove());
@@ -343,8 +480,25 @@ export function DiscoveryScreen({ navigation }: Props) {
     });
   }
 
+  // Status text based on discState
+  function getStateHint(): string {
+    switch (discState) {
+      case "calibrating":  return "Calibrating... hold still";
+      case "wait_raised":  return connected ? "Raise arm to browse" : "Scanning...";
+      case "browsing":     return "Browse active • pitch down to select";
+      case "tracking":     return "Device selected";
+      default:             return connected ? "Connected" : "Scanning...";
+    }
+  }
+
   return (
     <View style={[s.container, { paddingTop: insets.top + 12 }]}>
+      {/* Calibration Overlay */}
+      <CalibrationOverlay
+        visible={discState === DiscState.CALIBRATING}
+        onSkip={() => { disarmDevice().catch(() => {}); setDiscState(DiscState.WAIT_RAISED); }}
+      />
+
       {/* Header */}
       <View style={s.headerRow}>
         <Animated.Image
@@ -393,21 +547,18 @@ export function DiscoveryScreen({ navigation }: Props) {
               onMap={(dev) => navigation.navigate("GestureMapping", { deviceId: dev.id })}
               batteryPct={batteryPct}
               wristConnected={connected}
+              pulsing={discState === DiscState.BROWSING}
             />
             {connected && (
-              <View style={[s.browseBar, browsing && s.browseBarActive]}>
-                <Text style={[s.hint, browsing && s.hintActive]}>
-                  {!awake
-                    ? "raise arm to wake"
-                    : browsing
-                    ? "roll ← → · tap or pitch down to open · shake to sleep"
-                    : "tap to browse · shake to sleep"}
+              <View style={[s.browseBar, discState === DiscState.BROWSING && s.browseBarActive]}>
+                <Text style={[s.hint, discState === DiscState.BROWSING && s.hintActive]}>
+                  {getStateHint()}
                 </Text>
               </View>
             )}
           </View>
-          {/* Pose HUD: floating in bottom-right of content area */}
-          {connected && pose && <PoseHUD pose={pose} onToggle={() => setShowPose(p => !p)} visible={showPose} />}
+          {/* Pose HUD */}
+          {connected && pose && storedBaseline && <PoseHUD pose={pose} />}
           </React.Fragment>
         ) : (
           <ScrollView style={s.listArea} showsVerticalScrollIndicator={false}>
@@ -423,49 +574,6 @@ export function DiscoveryScreen({ navigation }: Props) {
           </ScrollView>
         )}
       </View>
-    </View>
-  );
-}
-
-// ── Pose HUD: shows current roll/pitch vs baseline ──────────────────────────
-// Red line = baseline, blue dot = current position.
-// Tap the toggle button to expand/collapse the HUD.
-
-type PoseHUDProps = {
-  pose: { roll: number; pitch: number; yaw: number; baseRoll: number; basePitch: number; baseYaw: number };
-  onToggle: () => void;
-  visible: boolean;
-};
-
-function PoseHUD({ pose, onToggle, visible }: PoseHUDProps) {
-  const { roll, pitch, baseRoll, basePitch } = pose;
-  // Map roll/pitch to visual range: -90..+90 → 0..100%
-  const toPct = (v: number) => Math.max(0, Math.min(100, ((v + 90) / 180) * 100));
-  const cx = toPct(roll);
-  const cy = toPct(pitch);
-  const bx = toPct(baseRoll);
-  const by = toPct(basePitch);
-
-  return (
-    <View style={hudS.container}>
-      <TouchableOpacity onPress={onToggle} style={hudS.toggleBtn}>
-        <Text style={hudS.toggleText}>{visible ? "▾" : "▸"}</Text>
-      </TouchableOpacity>
-      {visible && (
-        <View style={hudS.hud}>
-          {/* Visual grid: roll (X) vs pitch (Y) */}
-          <View style={hudS.grid}>
-            {/* Baseline marker (red crosshair) */}
-            <View style={[hudS.crosshair, { left: `${bx}%`, top: `${by}%` }]} />
-            {/* Current position (blue dot) */}
-            <View style={[hudS.dot, { left: `${cx}%`, top: `${cy}%` }]} />
-            {/* Labels */}
-            <Text style={hudS.label} numberOfLines={1}>
-              r: {roll.toFixed(1)}° ({baseRoll.toFixed(1)}°)  p: {pitch.toFixed(1)}° ({basePitch.toFixed(1)}°)
-            </Text>
-          </View>
-        </View>
-      )}
     </View>
   );
 }
@@ -524,70 +632,3 @@ const s = StyleSheet.create({
   hintActive:     { color: "#4a9eff" },
 });
 
-// Pose HUD styles
-const hudS = StyleSheet.create({
-  container: {
-    position: "absolute",
-    right: 12,
-    bottom: 80,
-    zIndex: 200,
-    alignItems: "flex-end",
-  },
-  toggleBtn: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    backgroundColor: "#1c1c1c",
-    borderWidth: 1,
-    borderColor: "#333",
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  toggleText: { color: "#888", fontSize: 12 },
-  hud: {
-    marginTop: 6,
-    backgroundColor: "#1c1c1c",
-    borderRadius: 12,
-    padding: 10,
-    borderWidth: 1,
-    borderColor: "#333",
-    width: 160,
-  },
-  grid: {
-    width: "100%",
-    aspectRatio: 1,
-    position: "relative",
-    borderWidth: 1,
-    borderColor: "#2a2a2a",
-    borderRadius: 8,
-  },
-  crosshair: {
-    position: "absolute",
-    width: 14,
-    height: 14,
-    marginLeft: -7,
-    marginTop: -7,
-    borderWidth: 1.5,
-    borderColor: "#ff4444",
-    backgroundColor: "transparent",
-    borderRadius: 0,
-  },
-  dot: {
-    position: "absolute",
-    width: 8,
-    height: 8,
-    marginLeft: -4,
-    marginTop: -4,
-    borderRadius: 4,
-    backgroundColor: "#4a9eff",
-  },
-  label: {
-    position: "absolute",
-    bottom: -18,
-    left: 0,
-    right: 0,
-    fontSize: 8,
-    color: "#666",
-    textAlign: "center",
-  },
-});

@@ -1,52 +1,37 @@
 import React, { useEffect, useRef } from "react";
 import { View, Text, Animated, StyleSheet, TouchableOpacity } from "react-native";
-import { useBLE } from "../ble/useBLE";
+
+type Props = {
+  visible: boolean;
+  onSkip?: () => void;
+};
 
 /** Minimum time the overlay stays on-screen once it's shown, so a fast
  *  uncalibrated → calibrating → stable transition is still perceptible.
  */
 const MIN_VISIBLE_MS = 1000;
 
-export function CalibrationOverlay() {
-  const { connected, motionState } = useBLE();
-  const [userDismissed, setUserDismissed] = React.useState(false);
-  const dismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+export function CalibrationOverlay({ visible, onSkip }: Props) {
+  const prevVisibleRef = useRef(false);
   const opacity   = useRef(new Animated.Value(0)).current;
   const pulse     = useRef(new Animated.Value(1)).current;
   const pulseLoop = useRef<Animated.CompositeAnimation | null>(null);
+  const wasVisibleRef = useRef(false);
+  const dismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const inCalibratingState = motionState === "calibrating" || motionState === "uncalibrated";
-  const stable             = motionState === "stable";
-  const visible            = !userDismissed && connected && inCalibratingState;
-
-  // Arm a one-shot timer when we first enter the calibrating state.
-  // When it fires (MIN_VISIBLE_MS later), it auto-dismisses IF we're already stable.
+  // Track transitions into visible so we can enforce MIN_VISIBLE_MS
   useEffect(() => {
-    if (connected && inCalibratingState && !userDismissed && dismissTimerRef.current === null) {
-      setUserDismissed(false);
+    if (visible && !prevVisibleRef.current) {
+      // Just became visible — arm a minimum-visibility timer
+      wasVisibleRef.current = true;
+      if (dismissTimerRef.current) clearTimeout(dismissTimerRef.current);
       dismissTimerRef.current = setTimeout(() => {
         dismissTimerRef.current = null;
-        // Only auto-dismiss if the device has actually stabilized
-        if (motionState === "stable") {
-          setUserDismissed(true);
-        }
+        wasVisibleRef.current = false;
       }, MIN_VISIBLE_MS);
     }
-    // Clean up on unmount or when fully hidden
-    return () => {
-      if (dismissTimerRef.current) {
-        clearTimeout(dismissTimerRef.current);
-        dismissTimerRef.current = null;
-      }
-    };
-  }, [connected, inCalibratingState, userDismissed, motionState]);
-
-  // If stable arrives after the timer has already fired, dismiss immediately
-  useEffect(() => {
-    if (stable && !userDismissed && connected && dismissTimerRef.current === null) {
-      setUserDismissed(true);
-    }
-  }, [stable, userDismissed, connected]);
+    prevVisibleRef.current = visible;
+  }, [visible]);
 
   // Fade in/out
   useEffect(() => {
@@ -57,9 +42,9 @@ export function CalibrationOverlay() {
     }).start();
   }, [visible]);
 
-  // Pulse while calibrating, stop on stable
+  // Pulse while visible
   useEffect(() => {
-    if (visible && !stable) {
+    if (visible) {
       pulseLoop.current = Animated.loop(
         Animated.sequence([
           Animated.timing(pulse, { toValue: 1.15, duration: 800, useNativeDriver: true }),
@@ -72,9 +57,34 @@ export function CalibrationOverlay() {
       pulse.setValue(1);
     }
     return () => { pulseLoop.current?.stop(); };
-  }, [visible, stable]);
+  }, [visible]);
 
-  if (!visible) return null;
+  // Cleanup timers on unmount
+  useEffect(() => {
+    return () => {
+      if (dismissTimerRef.current) {
+        clearTimeout(dismissTimerRef.current);
+        dismissTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  // Don't render while in minimum-visibility grace period even if parent hid us
+  const actuallyVisible = visible && (!wasVisibleRef.current || wasVisibleRef.current);
+  // Actually, enforce MIN_VISIBLE_MS: if we just became visible, stay visible for at least MIN_VISIBLE_MS
+  // The parent will hide us when stable, but we keep showing for MIN_VISIBLE_MS
+  const effectiveVisible = visible || wasVisibleRef.current;
+
+  if (!effectiveVisible) return null;
+
+  const handleSkip = () => {
+    if (dismissTimerRef.current) {
+      clearTimeout(dismissTimerRef.current);
+      dismissTimerRef.current = null;
+    }
+    wasVisibleRef.current = false;
+    onSkip?.();
+  };
 
   return (
     <Animated.View style={[s.overlay, { opacity }]} pointerEvents="box-none">
@@ -87,7 +97,7 @@ export function CalibrationOverlay() {
         <View style={s.dots}>
           {[0, 1, 2].map((i) => <PulseDot key={i} delay={i * 200} />)}
         </View>
-        <TouchableOpacity onPress={() => setUserDismissed(true)} style={s.skip}>
+        <TouchableOpacity onPress={handleSkip} style={s.skip}>
           <Text style={s.skipText}>Skip</Text>
         </TouchableOpacity>
       </View>

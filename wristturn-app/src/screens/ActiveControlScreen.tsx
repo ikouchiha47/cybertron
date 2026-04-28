@@ -6,17 +6,20 @@ import MCI from "react-native-vector-icons/MaterialCommunityIcons";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { StackScreenProps } from "@react-navigation/stack";
 import type { RootStackParams } from "../navigation/AppNavigator";
-import { useBLE, setActiveComboMap } from "../ble/useBLE";
+import { useBLE, setActiveComboMap, startCalibration, sendBaselineToFirmware } from "../ble/useBLE";
 import { BatteryWave } from "../ui/BatteryWave";
+import { PoseHUD } from "../ui/PoseHUD";
+import { CalibrationOverlay } from "./CalibrationOverlay";
 import { SessionRecorder } from "../debug/SessionRecorder";
 import { registry } from "../devices/registry/DeviceRegistry";
 import { MappingStore } from "../mapping/MappingStore";
-import type { ComboMap } from "../types";
+import type { ComboMap, Baseline } from "../types";
+import { Gesture, Mode, ArmPose } from "../types";
 
 type Props = StackScreenProps<RootStackParams, "ActiveControl">;
 
 export function ActiveControlScreen({ route, navigation }: Props) {
-  const { deviceId }  = route.params;
+  const { deviceId, homeBaseline }  = route.params;
   const meta          = registry.get(deviceId);
   const proxy         = registry.getProxy(deviceId);
   const [map, setMap] = useState<ComboMap>({});
@@ -29,12 +32,20 @@ export function ActiveControlScreen({ route, navigation }: Props) {
   const [locked, setLocked] = useState(false);  // when true, idle timeout is disabled
   const insets = useSafeAreaInsets();
 
+  // Knob mode: always null on mount — triggers fresh calibration each session.
+  // Gesture mode: set from homeBaseline once interactionMode is known.
+  const [sessionBaseline, setSessionBaseline] = useState<Baseline | null>(null);
+  const [sessionCalibrating, setSessionCalibrating] = useState(false);
+
+  const armHangTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const opacity     = useRef(new Animated.Value(0)).current;
   const scale       = useRef(new Animated.Value(0.8)).current;
   const idleTimer   = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lockedRef   = useRef(false);
 
-  const IDLE_TIMEOUT_MS = 8000;
+  const IDLE_TIMEOUT_MS   = 8000;
+  const ARM_HANG_EXIT_MS  = 2000; // arm hanging for 2s → back to discovery
 
   function resetIdleTimer() {
     if (idleTimer.current) clearTimeout(idleTimer.current);
@@ -71,6 +82,7 @@ export function ActiveControlScreen({ route, navigation }: Props) {
     return () => { proxy.disconnect(); setDeviceConnected(false); };
   }, [deviceId]);
 
+  // ── Animation helper (must be before useBLE so onCombo closure can reference it without hoisting) ──
   function animateGesture() {
     scale.setValue(0.8);
     opacity.setValue(0);
@@ -84,10 +96,10 @@ export function ActiveControlScreen({ route, navigation }: Props) {
     ]).start();
   }
 
-  const { connected, lastGesture, lastCombo, batteryPct } = useBLE({
+  const { connected, lastGesture, lastCombo, batteryPct, interactionMode, pose, baselineCandidate, armPose } = useBLE({
     onGesture: (gesture) => {
       resetIdleTimer();
-      if (gesture === "shake" && !lockedRef.current) navigation.goBack();
+      if (gesture === Gesture.SHAKE && !lockedRef.current) navigation.goBack();
     },
     onCombo: async (combo) => {
       setActiveCombo(combo);
@@ -112,6 +124,85 @@ export function ActiveControlScreen({ route, navigation }: Props) {
     },
   });
 
+  // ── Session calibration for knob mode ──────────────────────────────────────
+  // Triggered when interactionMode becomes "knob" AND no session baseline yet.
+  // Handles async mode-settle race (ModeManager may set knob after mount).
+  useEffect(() => {
+    if (!interactionMode) return;
+    if (interactionMode === Mode.GESTURE && homeBaseline && !sessionBaseline) {
+      setSessionBaseline(homeBaseline);
+      return;
+    }
+    if (interactionMode !== Mode.KNOB || sessionBaseline) return;
+    setSessionCalibrating(true);
+    startCalibration();
+  }, [interactionMode, sessionBaseline]);
+
+  // Complete session calibration from the firmware baseline candidate.
+  useEffect(() => {
+    if (!sessionCalibrating || !baselineCandidate) return;
+    const baseline: Baseline = {
+      roll: baselineCandidate.roll,
+      pitch: baselineCandidate.pitch,
+      yaw: baselineCandidate.yaw,
+      timestamp: Date.now(),
+      wristName: "",
+      wristAddress: "",
+    };
+    setSessionBaseline(baseline);
+    sendBaselineToFirmware(baseline).catch(() => {});
+    setSessionCalibrating(false);
+  }, [sessionCalibrating, baselineCandidate]);
+
+  // While calibrating, keep resetting the idle timer so it never fires mid-calibration.
+  useEffect(() => {
+    if (!sessionCalibrating) return;
+    const iv = setInterval(() => resetIdleTimer(), (IDLE_TIMEOUT_MS / 2));
+    return () => clearInterval(iv);
+  }, [sessionCalibrating]);
+
+  // ── Arm-hang 2s auto-exit ─────────────────────────────────────────────────
+  // When the gravity vector says arm is hanging (user dropped arm to side),
+  // wait 2s then go back — same physical signal as DiscoveryScreen E5.
+  useEffect(() => {
+    if (!connected || armPose !== ArmPose.HANGING) {
+      if (armHangTimerRef.current) {
+        clearTimeout(armHangTimerRef.current);
+        armHangTimerRef.current = null;
+      }
+      return;
+    }
+    if (!armHangTimerRef.current) {
+      armHangTimerRef.current = setTimeout(() => {
+        armHangTimerRef.current = null;
+        if (!lockedRef.current && AppState.currentState === "active") {
+          navigation.goBack();
+        }
+      }, ARM_HANG_EXIT_MS);
+    }
+  }, [armPose, connected]);
+
+  // Clear hang timer when locked
+  useEffect(() => {
+    if (locked && armHangTimerRef.current) {
+      clearTimeout(armHangTimerRef.current);
+      armHangTimerRef.current = null;
+    }
+  }, [locked]);
+
+  // ── On unmount: restore home baseline to firmware ────────────────────────
+  useEffect(() => {
+    return () => {
+      if (armHangTimerRef.current) {
+        clearTimeout(armHangTimerRef.current);
+        armHangTimerRef.current = null;
+      }
+      if (homeBaseline) {
+        sendBaselineToFirmware(homeBaseline).catch(() => {});
+      }
+    };
+  }, [homeBaseline]);
+
   if (!meta) return <View style={s.container}><Text style={s.empty}>Device not found</Text></View>;
 
   const entries = Object.entries(map);
@@ -124,6 +215,12 @@ export function ActiveControlScreen({ route, navigation }: Props) {
 
   return (
     <View style={[s.container, { paddingBottom: insets.bottom + 16 }]}>
+      {/* Session calibration overlay (knob mode) */}
+      <CalibrationOverlay
+        visible={sessionCalibrating}
+        onSkip={() => setSessionCalibrating(false)}
+      />
+
       {/* Header */}
       <View style={s.header}>
         <Text style={s.deviceName} numberOfLines={1}>{meta.name}</Text>
@@ -159,6 +256,9 @@ export function ActiveControlScreen({ route, navigation }: Props) {
         )}
         {lastCmd ? <Text style={s.cmdText}>{lastCmd}</Text> : null}
       </Animated.View>
+
+      {/* Pose HUD — only when session baseline is established */}
+      {connected && pose && sessionBaseline && <PoseHUD pose={pose} />}
 
       {/* Mapping list */}
       <ScrollView style={s.mapList} showsVerticalScrollIndicator={false}>

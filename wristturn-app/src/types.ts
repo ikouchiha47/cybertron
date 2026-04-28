@@ -42,11 +42,12 @@ export type GestureName =
 
 export interface GestureEvent {
   name: GestureName;
-  roll?:  number;   // degrees, present for turn_*/pitch_*/yaw_*
-  pitch?: number;
-  yaw?:   number;
-  delta?: number;   // firmware-reported axis delta that triggered the gesture
-  value?: number;   // present for step (count)
+  roll?:     number;   // degrees, present for turn_*/pitch_*/yaw_*
+  pitch?:    number;
+  yaw?:      number;
+  delta?:    number;   // firmware-reported axis integral that triggered the gesture
+  peakRate?: number;   // peak gyro rate during the gesture window (rad/s) — for snap classification
+  value?:    number;   // present for step (count)
 }
 
 export interface RawSample {
@@ -75,6 +76,9 @@ export function parseGesturePayload(raw: string): GestureEvent | null {
   }
   if (parts.length >= 5) {
     g.delta = parseFloat(parts[4]);
+  }
+  if (parts.length >= 6) {
+    g.peakRate = parseFloat(parts[5]);
   }
   if (parts.length === 2) {
     g.value = parseFloat(parts[1]);
@@ -110,3 +114,61 @@ export const INTERACTION_MODE = {
   SYMBOL:  2,
 } as const;
 export type InteractionModeValue = typeof INTERACTION_MODE[keyof typeof INTERACTION_MODE];
+
+/** String mode names used throughout app logic */
+export const Mode = {
+  GESTURE: "gesture",
+  KNOB:    "knob",
+  SYMBOL:  "symbol",
+} as const;
+
+/** Arm pose from gravity vector */
+export const ArmPose = {
+  FLAT:    "flat",
+  HANGING: "hanging",
+  RAISED:  "raised",
+} as const;
+export type ArmPoseValue = typeof ArmPose[keyof typeof ArmPose];
+
+/** Motion classifier states */
+export const MotionState = {
+  UNCALIBRATED: "uncalibrated",
+  CALIBRATING:  "calibrating",
+  STABLE:       "stable",
+  MOVING:       "moving",
+} as const;
+
+/** Discovery screen FSM states */
+export const DiscState = {
+  IDLE:        "idle",
+  CALIBRATING: "calibrating",
+  WAIT_RAISED: "wait_raised",
+  BROWSING:    "browsing",
+  TRACKING:    "tracking",
+} as const;
+export type DiscStateValue = typeof DiscState[keyof typeof DiscState];
+
+/** Gesture name string constants */
+export const Gesture = {
+  TURN_RIGHT:      "turn_right",
+  TURN_LEFT:       "turn_left",
+  PITCH_UP:        "pitch_up",
+  PITCH_DOWN:      "pitch_down",
+  PITCH_DOWN_HOLD: "pitch_down_hold",
+  YAW_RIGHT:       "yaw_right",
+  YAW_LEFT:        "yaw_left",
+  TAP:             "tap",
+  SHAKE:           "shake",
+  STEP:            "step",
+  IDLE:            "idle",
+} as const;
+
+/** Calibrated home position baseline — stored per wrist device */
+export interface Baseline {
+  roll: number;
+  pitch: number;
+  yaw: number;
+  timestamp: number;
+  wristName: string;
+  wristAddress: string;
+}

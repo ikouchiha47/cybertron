@@ -42,7 +42,16 @@ export const PKT = {
   SLEEP:    0x04,
   WAKE:     0x05,
   ARM_EVT:  0x06,
+  GRAV:     0x07,
 } as const;
+
+/** Arm pose values carried in GravPacket. */
+export const GRAV_POSE = {
+  FLAT:    0,
+  HANGING: 1,
+  RAISED:  2,
+} as const;
+export type GravPoseValue = typeof GRAV_POSE[keyof typeof GRAV_POSE];
 
 /** Axis identifiers used in PKT.ARM_EVT. */
 export const AXIS = {
@@ -63,6 +72,7 @@ export const SIZE = {
   STAB:       2,
   ANGLES:     7,
   ARM_EVT:    5,
+  GRAV:       2,
 } as const;
 
 // ── Parsed-packet types ─────────────────────────────────────────────────────
@@ -73,6 +83,7 @@ export type PosePacket     = { type: "pose";     roll:  number; pitch: number; y
 export type SleepPacket    = { type: "sleep" };
 export type WakePacket     = { type: "wake" };
 export type ArmEvtPacket   = { type: "arm_evt"; axis: number; state: number; delta: number };
+export type GravPacket     = { type: "grav";    pose: GravPoseValue };
 
 export type StatePacket =
   | StabPacket
@@ -80,7 +91,8 @@ export type StatePacket =
   | PosePacket
   | SleepPacket
   | WakePacket
-  | ArmEvtPacket;
+  | ArmEvtPacket
+  | GravPacket;
 
 // ── Parsing ─────────────────────────────────────────────────────────────────
 
@@ -137,6 +149,10 @@ export function parseStatePacket(input: Uint8Array | string): StatePacket | null
         state: bytes[2],
         delta: readI16LEAngle(bytes, 3),
       };
+
+    case PKT.GRAV:
+      if (bytes.length < SIZE.GRAV) return null;
+      return { type: "grav", pose: bytes[1] as GravPoseValue };
 
     default:
       return null;

@@ -11,7 +11,7 @@ import { SettingsScreen } from "../screens/SettingsScreen";
 import { WizProvisionScreen } from "../screens/WizProvisionScreen";
 import { LogsScreen } from "../screens/LogsScreen";
 import { SessionScreen } from "../screens/SessionScreen";
-import { CalibrationOverlay } from "../screens/CalibrationOverlay";
+import type { Baseline } from "../types";
 
 export type TabParams = {
   Home:     undefined;
@@ -23,7 +23,7 @@ export type TabParams = {
 export type RootStackParams = {
   Tabs:          undefined;
   GestureMapping: { deviceId: string };
-  ActiveControl:  { deviceId: string };
+  ActiveControl:  { deviceId: string; homeBaseline?: Baseline | null };
   Pairing:        { deviceId: string };
   WizProvision:   undefined;
 };
@@ -81,7 +81,6 @@ export function AppNavigator() {
         <Stack.Screen name="Pairing"        component={PairingScreen}        options={{ title: "Pair Device" }} />
         <Stack.Screen name="WizProvision"   component={WizProvisionScreen}   options={{ title: "Add Smart Bulb" }} />
       </Stack.Navigator>
-      <CalibrationOverlay />
     </NavigationContainer>
   );
 }

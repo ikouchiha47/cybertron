@@ -10,7 +10,7 @@ import type { MotionState }  from "../gestures/MotionClassifier";
 import { SymbolCapture }     from "../gestures/SymbolCapture";
 import { DebugLog }          from "../debug/DebugLog";
 import { SessionRecorder }   from "../debug/SessionRecorder";
-import { parseGesturePayload, INTERACTION_MODE } from "../types";
+import { parseGesturePayload, INTERACTION_MODE, Mode, ArmPose, Gesture } from "../types";
 import type { RawSample, InteractionModeValue }  from "../types";
 import { BLEServiceNative }  from "./BLEServiceNative";
 import { PrefsStore }        from "../mapping/PrefsStore";
@@ -27,8 +27,13 @@ type SharedState = {
   knobEngaged:  boolean;
   symbolCapturing: boolean;
   motionState:  MotionState;
+  sleeping:     boolean;
+  baselineReady:boolean;
+  baselineCandidate: { roll: number; pitch: number; yaw: number } | null;
   // Live pose from firmware (current vs baseline) — for calibration HUD
   pose: { roll: number; pitch: number; yaw: number; baseRoll: number; basePitch: number; baseYaw: number } | null;
+  // Gravity-based arm pose — null until first PKT_GRAV arrives after connect
+  armPose: "flat" | "hanging" | "raised" | null;
 };
 
 const state: SharedState = {
@@ -42,8 +47,12 @@ const state: SharedState = {
   interactionMode: "gesture",
   knobEngaged:     false,
   symbolCapturing: false,
-  motionState:     "uncalibrated",
-  pose:            null,
+   motionState:     "uncalibrated",
+   sleeping:        false,
+   baselineReady:   false,
+   baselineCandidate: null,
+   pose:            null,
+   armPose:         null,
 };
 
 const listeners = new Set<(s: SharedState) => void>();
@@ -69,10 +78,10 @@ export function recalibrate(): void {
 }
 
 export function applyMode(mode: InteractionModeValue): void {
-  const modeStr = mode === INTERACTION_MODE.KNOB   ? "knob"
-                : mode === INTERACTION_MODE.SYMBOL ? "symbol"
-                : "gesture";
-  modeManager?.setMode(modeStr as "gesture" | "knob" | "symbol");
+  const modeStr = mode === INTERACTION_MODE.KNOB   ? Mode.KNOB
+                : mode === INTERACTION_MODE.SYMBOL ? Mode.SYMBOL
+                : Mode.GESTURE;
+  modeManager?.setMode(modeStr);
 }
 
 export function setActiveComboMap(combos: string[]): void {
@@ -139,18 +148,14 @@ function startRuntime() {
       notify();
       DebugLog.push("MODE", `switched to ${mode}`);
 
-      const modeVal = mode === "gesture" ? INTERACTION_MODE.GESTURE
-                    : mode === "knob"    ? INTERACTION_MODE.KNOB
-                    :                     INTERACTION_MODE.SYMBOL;
-      BLEServiceNative.setMode(modeVal).catch(() => {});
+       const modeVal = mode === Mode.GESTURE ? INTERACTION_MODE.GESTURE
+                     : mode === Mode.KNOB    ? INTERACTION_MODE.KNOB
+                     :                        INTERACTION_MODE.SYMBOL;
+       BLEServiceNative.setMode(modeVal).catch(() => {});
 
-      // Arm rotation vector for knob/symbol, disarm for gesture
-      const needsArm = mode !== "gesture";
-      BLEServiceNative.setArmed(needsArm).catch(() => {});
-
-      // Clean up engagement state on mode switch
-      knobEngagement?.forceExit();
-      symbolCapture?.cancel();
+       // Clean up engagement state on mode switch
+       knobEngagement?.forceExit();
+       symbolCapture?.cancel();
     },
   });
 
@@ -168,9 +173,9 @@ function startRuntime() {
 
   holdDetector = new HoldDetector((evt) => {
     DebugLog.push("GESTURE", evt);
-    const mode = modeManager?.getMode() ?? "gesture";
-    if (mode === "knob")   { knobEngagement?.commit(); return; }
-    if (mode === "symbol") { symbolCapture?.finalize(); return; }
+    const mode = modeManager?.getMode() ?? Mode.GESTURE;
+    if (mode === Mode.KNOB)   { knobEngagement?.commit(); return; }
+    if (mode === Mode.SYMBOL) { symbolCapture?.finalize(); return; }
     // In gesture mode, pitch_down_hold dispatches as a combo key
     dispatchSyntheticCombo(evt);
   });
@@ -184,8 +189,8 @@ function startRuntime() {
     onMotion(type) {
       // Only wrist rotation feeds the knob quantizer — arm resets are swallowed here
       if (type !== "wrist_rotating") return;
-      const mode = modeManager?.getMode() ?? "gesture";
-      if (mode === "knob") knobEngagement?.onDelta(lastDeltaSample);
+      const mode = modeManager?.getMode() ?? Mode.GESTURE;
+      if (mode === Mode.KNOB) knobEngagement?.onDelta(lastDeltaSample);
     },
   });
 
@@ -211,32 +216,39 @@ function startRuntime() {
   // ── BLE event subscriptions ──
 
   BLEServiceNative.onConnected((p) => {
-    console.log("[CAL] BLE_CONNECTED — starting calibration");
+    console.log("[CAL] BLE_CONNECTED");
     state.connected    = true;
     state.wristName    = p.name;
     state.wristAddress = p.address;
     state.batteryPct   = null;
-    motionClassifier?.startCalibration();
-    console.log("[CAL] motionClassifier.startCalibration() called, state now:", motionClassifier?.getState());
+    state.sleeping     = false;
+    state.baselineReady = false;
+    state.baselineCandidate = null;
+    state.armPose      = null;
+    // Do NOT start calibration here — DiscoveryScreen controls that
     DebugLog.push("BLE", `connected: ${p.name}`);
     notify();
     // Apply persisted default mode after connect
     PrefsStore.getDefaultMode().then((mode) => {
       if (mode !== INTERACTION_MODE.GESTURE) modeManager?.setMode(
-        mode === INTERACTION_MODE.KNOB ? "knob" : "symbol"
+        mode === INTERACTION_MODE.KNOB ? Mode.KNOB : Mode.SYMBOL
       );
     }).catch(() => {});
   });
 
   BLEServiceNative.onDisconnected(() => {
     console.log("[CAL] BLE_DISCONNECTED — resetting classifier");
-    state.connected    = false;
-    state.wristName    = "";
-    state.wristAddress = "";
-    state.batteryPct   = null;
+    state.connected       = false;
+    state.wristName       = "";
+    state.wristAddress    = "";
+    state.batteryPct      = null;
+    state.sleeping        = false;
+    state.baselineReady   = false;
+    state.baselineCandidate = null;
+    state.armPose         = null;
     motionClassifier?.reset();
     // Reset to gesture mode on disconnect
-    modeManager?.setMode("gesture");
+    modeManager?.setMode(Mode.GESTURE);
     knobEngagement?.forceExit();
     symbolCapture?.cancel();
     DebugLog.push("BLE", "disconnected");
@@ -255,43 +267,45 @@ function startRuntime() {
         .filter((v) => v !== undefined && v !== null)
         .join("|")
     );
-    if (!event || event.name === "idle") return;
+    if (!event || event.name === Gesture.IDLE) return;
 
-    const mode = modeManager?.getMode() ?? "gesture";
+    const mode = modeManager?.getMode() ?? Mode.GESTURE;
     const axesStr = event.roll !== undefined
-      ? ` r=${event.roll?.toFixed(1)} p=${event.pitch?.toFixed(1)} y=${event.yaw?.toFixed(1)}${event.delta !== undefined ? ` d=${event.delta?.toFixed(1)}` : ""}`
+      ? ` r=${event.roll?.toFixed(1)} p=${event.pitch?.toFixed(1)} y=${event.yaw?.toFixed(1)}${event.delta !== undefined ? ` d=${event.delta?.toFixed(2)}` : ""}${event.peakRate !== undefined ? ` pk=${event.peakRate?.toFixed(2)}` : ""}`
       : "";
     DebugLog.push("GESTURE_RAW", `${event.name}${axesStr} [${mode}]`);
 
     // Always track taps for mode-cycling (triple-tap)
-    if (event.name === "tap") handleTapForModeCycle();
+    if (event.name === Gesture.TAP) handleTapForModeCycle();
 
     // Always update hold detector
-    if (event.name === "pitch_down") {
+    if (event.name === Gesture.PITCH_DOWN) {
       holdDetector?.onPitchDown(lastRawSample);
     } else {
       holdDetector?.onOtherGesture();
     }
 
     // Mode-specific gesture routing
-    if (mode === "knob") {
-      if (event.name === "tap") {
+    if (mode === Mode.KNOB) {
+      if (event.name === Gesture.TAP) {
         knobEngagement?.engage(lastRawSample);
         return;
       }
-      if (event.name === "pitch_down") {
+      if (event.name === Gesture.PITCH_DOWN) {
         knobEngagement?.cancel();
+        state.lastGesture = event.name;
+        notify();
         return;
       }
       // Other gestures in knob mode fall through to gesture-mode dispatch
     }
 
-    if (mode === "symbol") {
-      if (event.name === "tap") {
+    if (mode === Mode.SYMBOL) {
+      if (event.name === Gesture.TAP) {
         symbolCapture?.startCapture();
         return;
       }
-      if (event.name === "pitch_down") {
+      if (event.name === Gesture.PITCH_DOWN) {
         symbolCapture?.cancel();
         return;
       }
@@ -304,6 +318,8 @@ function startRuntime() {
       ? ` r=${event.roll?.toFixed(1)} p=${event.pitch?.toFixed(1)} y=${event.yaw?.toFixed(1)}${event.delta !== undefined ? ` d=${event.delta?.toFixed(1)}` : ""}`
       : "";
     if (!filterGesture(event.name)) {
+      // DIAG: Log when a firmware gesture arrives but gets suppressed by snap-back cooldown
+      console.log(`[GestureFilter] SUPPRESSED: ${event.name} (snap-back cooldown)${axes}`);
       DebugLog.push("GESTURE", `suppressed (snap):${axes} ${event.name}`);
       return;
     }
@@ -317,8 +333,8 @@ function startRuntime() {
   BLEServiceNative.onRaw?.((p) => {
     lastRawSample = p;
     holdDetector?.onRaw(p);
-    const mode = modeManager?.getMode() ?? "gesture";
-    if (mode === "symbol") symbolCapture?.onRaw(p);
+    const mode = modeManager?.getMode() ?? Mode.GESTURE;
+    if (mode === Mode.SYMBOL) symbolCapture?.onRaw(p);
     SessionRecorder.recordRaw(p);
   });
 
@@ -350,6 +366,7 @@ function startRuntime() {
       }
       case "baseline": {
         lastBaseline = { r: pkt.roll, p: pkt.pitch, y: pkt.yaw };
+        state.baselineCandidate = { roll: pkt.roll, pitch: pkt.pitch, yaw: pkt.yaw };
         console.log(`[BASELINE] r=${pkt.roll} p=${pkt.pitch} y=${pkt.yaw}`);
         if (state.pose) {
           state.pose = {
@@ -360,6 +377,7 @@ function startRuntime() {
           };
           notify();
         }
+        notify();
         break;
       }
       case "pose": {
@@ -382,6 +400,16 @@ function startRuntime() {
         notify();
         break;
       }
+      case "grav": {
+        const poses = [ArmPose.FLAT, ArmPose.HANGING, ArmPose.RAISED] as const;
+        const label = poses[pkt.pose] ?? null;
+        if (label && label !== state.armPose) {
+          state.armPose = label;
+          console.log(`[GravPose] armPose → ${label}`);
+          notify();
+        }
+        break;
+      }
       case "sleep":
       case "wake":
       case "arm_evt":
@@ -395,23 +423,19 @@ function startRuntime() {
     DebugLog.push("BLE_ERR", p.msg);
   });
 
-  // Sync initial state. The Android foreground service persists BLE across app
-  // restarts, so on re-mount we may already be connected — in that case no
-  // BLE_CONNECTED event fires and startCalibration() would never be called,
-  // leaving MotionClassifier wedged in "uncalibrated" (see onStabilityClass gate).
-  BLEServiceNative.getState().then((s) => {
-    console.log("[CAL] getState() returned:", JSON.stringify(s));
-    if (s.connected) {
-      state.connected  = true;
-      state.wristName  = s.deviceName;
-      state.batteryPct = s.batteryPct >= 0 ? s.batteryPct : null;
-      motionClassifier?.startCalibration();
-      console.log("[CAL] getState reconciliation — startCalibration() called, state:", motionClassifier?.getState());
-      DebugLog.push("BLE", `already connected on startup: ${s.deviceName}`);
-      notify();
-    }
-  }).catch((e) => { console.log("[CAL] getState() error:", e); });
-}
+  // Sleep event: device is about to sleep; app should treat as disconnected
+  BLEServiceNative.onSleeping?.(() => {
+    state.sleeping = true;
+    notify();
+  });
+
+  // NOTE: Do NOT auto-start calibration here. DiscoveryScreen controls calibration
+   // based on presence of stored baseline. If no baseline, it will start calibration;
+   // if baseline exists, it will skip directly to wait_awake. This avoids race
+   // conditions and unnecessary recalibration on every connect.
+
+   // ── React hook ───────────────────────────────────────────────────────────────
+ }
 
 // ── React hook ───────────────────────────────────────────────────────────────
 
@@ -432,6 +456,10 @@ export function useBLE({ onGesture, onCombo }: UseBLEOptions = {}) {
   const [symbolCapturing,  setSymbolCapturing]  = useState(state.symbolCapturing);
   const [motionState,      setMotionState]      = useState(state.motionState);
   const [pose,             setPose]             = useState(state.pose);
+  const [sleeping,         setSleeping]         = useState(state.sleeping);
+  const [baselineReady,    setBaselineReady]    = useState(state.baselineReady);
+  const [baselineCandidate,setBaselineCandidate]= useState(state.baselineCandidate);
+  const [armPose,          setArmPose]          = useState(state.armPose);
 
   const lastGestureRef  = useRef(state.lastGesture);
   const lastComboSeqRef = useRef(state.comboSeq);
@@ -449,6 +477,10 @@ export function useBLE({ onGesture, onCombo }: UseBLEOptions = {}) {
       setSymbolCapturing(s.symbolCapturing);
       setMotionState(s.motionState);
       setPose(s.pose);
+      setSleeping(s.sleeping);
+      setBaselineReady(s.baselineReady);
+      setBaselineCandidate(s.baselineCandidate);
+      setArmPose(s.armPose);
 
       if (s.lastGesture && s.lastGesture !== lastGestureRef.current) {
         lastGestureRef.current = s.lastGesture;
@@ -467,8 +499,38 @@ export function useBLE({ onGesture, onCombo }: UseBLEOptions = {}) {
     return () => { listeners.delete(listener); };
   }, [onGesture, onCombo]);
 
-  return {
-    connected, wristName, wristAddress, lastGesture, lastCombo, batteryPct,
-    interactionMode, knobEngaged, symbolCapturing, motionState, pose,
-  };
+   return {
+     connected, wristName, wristAddress, lastGesture, lastCombo, batteryPct,
+     interactionMode, knobEngaged, symbolCapturing, motionState, pose,
+     sleeping, baselineReady, baselineCandidate, armPose,
+   };
+ }
+
+// ── Control functions for Discovery/ActiveControl ─────────────────────────────
+
+export function startCalibration(): void {
+  console.log("[BLE] startCalibration()");
+  motionClassifier?.reset();
+  motionClassifier?.startCalibration();
+}
+
+export function confirmBaselineReady(): void {
+  console.log("[BLE] confirmBaselineReady()");
+  state.baselineReady = true;
+  notify();
+}
+
+export function armDevice(): Promise<void> {
+  console.log("[BLE] armDevice() → setArmed(true)");
+  return BLEServiceNative.setArmed(true);
+}
+
+export function disarmDevice(): Promise<void> {
+  console.log("[BLE] disarmDevice() → setArmed(false)");
+  return BLEServiceNative.setArmed(false);
+}
+
+export function sendBaselineToFirmware(baseline: { roll: number; pitch: number; yaw: number }): Promise<void> {
+  console.log(`[BLE] sendBaselineToFirmware → r=${baseline.roll.toFixed(1)} p=${baseline.pitch.toFixed(1)} y=${baseline.yaw.toFixed(1)}`);
+  return BLEServiceNative.setBaseline(baseline);
 }

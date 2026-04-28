@@ -9,7 +9,8 @@ import type { BottomTabScreenProps } from "@react-navigation/bottom-tabs";
 import type { TabParams, RootStackParams } from "../navigation/AppNavigator";
 import { registry } from "../devices/registry/DeviceRegistry";
 import { useMDNSDiscovery } from "../discovery/useMDNSDiscovery";
-import { useBLE, recalibrate, applyMode } from "../ble/useBLE";
+import { useBLE, applyMode } from "../ble/useBLE";
+import { BaselineStore } from "../storage/BaselineStore";
 import { PrefsStore } from "../mapping/PrefsStore";
 import { INTERACTION_MODE } from "../types";
 import type { InteractionModeValue } from "../types";
@@ -31,8 +32,31 @@ const MODE_LABELS: Record<InteractionModeValue, string> = {
   [INTERACTION_MODE.SYMBOL]:  "Symbol",
 };
 
+export function handleRecalibrateHome(wristAddress: string) {
+  if (!wristAddress) return;
+  Alert.alert(
+    "Recalibrate Home Position?",
+    "This clears the stored baseline. You'll need to hold your arm still on next reconnect.",
+    [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Clear",
+        style: "destructive",
+        onPress: async () => {
+          try {
+            await BaselineStore.clear(wristAddress);
+            Alert.alert("Baseline Cleared", "Next reconnection will run the calibration ritual.");
+          } catch (e: any) {
+            Alert.alert("Error", String(e?.message ?? e));
+          }
+        },
+      },
+    ]
+  );
+}
+
 export function SettingsScreen({ navigation }: Props) {
-  const { connected, wristName, motionState } = useBLE();
+  const { connected, wristName, wristAddress, motionState } = useBLE();
   const [defaultMode, setDefaultMode] = useState<InteractionModeValue>(INTERACTION_MODE.GESTURE);
   const { devices: discovered, scanning, rescan } = useMDNSDiscovery();
 
@@ -84,6 +108,7 @@ export function SettingsScreen({ navigation }: Props) {
     setSaved(registry.all());
     setEditingId(null);
   }
+
   const connectingRef = useRef(false);
 
   // Load persisted devices
@@ -263,7 +288,7 @@ export function SettingsScreen({ navigation }: Props) {
           {connected && (
             <Pressable
               style={({ pressed }) => [s.iconBtn, pressed && s.iconBtnPressed]}
-              onPress={recalibrate}
+              onPress={() => handleRecalibrateHome(wristAddress)}
             >
               <Text style={s.iconBtnText}>⟳</Text>
             </Pressable>

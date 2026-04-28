@@ -10,6 +10,7 @@ const stub = {
   setRawMode: (_: boolean) => Promise.resolve(),
   setMode:    (_: number)  => Promise.resolve(),
   setArmed:   (_: boolean) => Promise.resolve(),
+  setBaseline: (_: { roll: number; pitch: number; yaw: number }) => Promise.resolve(),
   addListener: (_: string) => {},
   removeListeners: (_: number) => {},
 };
@@ -40,6 +41,9 @@ export const BLEServiceNative = {
   setMode:    (mode: number): Promise<void>       => native.setMode(mode),
   /** Write arm state: true=arm (enable rotation vector + baseline), false=disarm */
   setArmed:   (armed: boolean): Promise<void>     => native.setArmed(armed),
+  /** Write baseline from app to firmware (3 floats, little-endian) */
+  setBaseline: (baseline: { roll: number; pitch: number; yaw: number }): Promise<void> =>
+    native.setBaseline(baseline.roll, baseline.pitch, baseline.yaw),
 
   onGesture:     (cb: (p: BLEGesturePayload)    => void) => emitter?.addListener("BLE_GESTURE",      cb),
   onConnected:   (cb: (p: BLEConnectedPayload)  => void) => emitter?.addListener("BLE_CONNECTED",    cb),

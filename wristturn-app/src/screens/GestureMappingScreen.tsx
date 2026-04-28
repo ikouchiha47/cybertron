@@ -8,6 +8,8 @@ import type { RootStackParams } from "../navigation/AppNavigator";
 import { registry } from "../devices/registry/DeviceRegistry";
 import { MappingStore } from "../mapping/MappingStore";
 import type { ComboMap } from "../types";
+import { useBLE } from "../ble/useBLE";
+import { PoseHUD } from "../ui/PoseHUD";
 
 type Props = StackScreenProps<RootStackParams, "GestureMapping">;
 
@@ -23,6 +25,7 @@ export function GestureMappingScreen({ route, navigation }: Props) {
   const { deviceId } = route.params;
   const meta  = registry.get(deviceId);
   const proxy = registry.getProxy(deviceId);
+  const { pose, connected } = useBLE();
 
   const [map, setMap]           = useState<ComboMap>({});
   const [editEntry, setEditEntry] = useState<string | null>(null); // combo being edited, or "__new__"
@@ -121,6 +124,7 @@ export function GestureMappingScreen({ route, navigation }: Props) {
 
   return (
     <View style={{ flex: 1 }}>
+      {connected && pose && <PoseHUD pose={pose} />}
       <ScrollView style={s.container}>
         <Text style={s.deviceName}>{meta.name}</Text>
 
