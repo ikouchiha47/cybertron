@@ -187,7 +187,14 @@ bool baselineCaptured = false; // moved from static inside handleRotationVector
 
 // Rolling-window calibration accumulator (populates during first stable window)
 CalibrationBuffer calBuffer;
+CalibrationBuffer stableCalBuffer;   // samples collected only during stab=3
 bool calInProgress = false;
+bool inStableWindow = false;
+unsigned long calStartMs = 0;     // resets on every stab=3 — 3s from last stable moment
+unsigned long calDeadlineMs = 0;  // hard deadline: set once on calInProgress, never resets
+static constexpr unsigned long CAL_WINDOW_MS    = 3000;   // stable window length
+static constexpr unsigned long CAL_DEADLINE_MS  = 12000;  // max total cal time
+// #define CAL_LAST_WINDOW_ONLY  // uncomment to keep only the most recent stable window
 
 // Deferred flags — set in callbacks/event handlers, consumed in loop() where
 // I2C is safe. Never do I2C (enableReport, modeOn, etc.) from inside a BLE
@@ -237,6 +244,7 @@ const unsigned long SLEEP_TIMEOUT_MS =
 bool sleeping = false;
 unsigned long lastMotionMs = 0;
 unsigned long sleepStartMs = 0; // when enterSleep() was called
+static const unsigned long MIN_SLEEP_MS = 10000;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 float quaternionToRoll(float w, float x, float y, float z) {
@@ -272,7 +280,7 @@ void enableReports() {
   // Rotation vector needed for rawMode streaming or when armed (knob/symbol
   // modes)
   if (rawMode || armed) {
-    if (imu.enableRotationVector())
+    if (imu.enableRotationVector(20))
       LOG_I("[Reports] rotation vector enabled");
     else
       LOG_E("BNO085: could not enable Rotation Vector");
@@ -330,7 +338,7 @@ void onRawModeWrite(uint16_t conn_hdl, BLECharacteristic *chr, uint8_t *data,
     if (newMode != rawMode) {
       rawMode = newMode;
       if (rawMode) {
-        imu.enableRotationVector();
+        imu.enableRotationVector(20);
       } else {
         imu.enableReport(SENSOR_REPORTID_ROTATION_VECTOR, 0);
       }
@@ -410,7 +418,9 @@ void onArmWrite(uint16_t conn_hdl, BLECharacteristic *chr, uint8_t *data,
       publishBaseline(0, 0, 0);
       LOG_I("[Arm] disarmed — rotation vector disabled");
       calBuffer.reset();
+      stableCalBuffer.reset();
       calInProgress = false;
+      inStableWindow = false;
     } else {
       // Calibration already done: keep baseline, just disable rotation vector
       // if not rawMode
@@ -433,6 +443,19 @@ void onBaselineWrite(uint16_t conn_hdl, BLECharacteristic *chr, uint8_t *data,
   memcpy(&r, data, 4);
   memcpy(&p, data + 4, 4);
   memcpy(&y, data + 8, 4);
+
+  // Special magic value to trigger a fresh recalibration without disconnecting
+  if (r == -999.0f && p == -999.0f && y == -999.0f) {
+    calibrationComplete = false;
+    baselineCaptured = false;
+    calInProgress = false;
+    inStableWindow = false;
+    calBuffer.reset();
+    stableCalBuffer.reset();
+    LOG_I("[Cal] calibration cleared by app — awaiting new flat pose");
+    return;
+  }
+
   baselineRoll = r;
   basePitch_arm = p;
   baselineYaw = y;
@@ -455,7 +478,9 @@ void enterSleep() {
     return;
   sleeping = true;
   sleepStartMs = millis();
-  LOG_I("[Sleep] inactivity timeout — entering light sleep");
+  LOG_I("[Sleep] inactivity timeout — entering light sleep (armed=%d "
+        "lastMotionAge=%lums)",
+        armed, millis() - lastMotionMs);
   if (Bluefruit.Periph.connected()) {
     uint8_t sbuf[STATE_PACKET_MAX_LEN];
     uint8_t sn = pkt_sleep(sbuf);
@@ -560,6 +585,17 @@ void exitSleep() {
   }
 
   enableReports(); // restores all reports at their original rates
+  // Re-arm SHAKE_DETECTOR as wake source for the next sleep cycle.
+  // SHAKE_DETECTOR is one-shot — after it fires it must be explicitly
+  // re-configured with wakeupEnabled=true, or subsequent sleeps have no wake source.
+  {
+    sh2_SensorConfig_t cfg = {};
+    cfg.reportInterval_us = 200000; // 5 Hz evaluation rate
+    cfg.wakeupEnabled = true;
+    int status = sh2_setSensorConfig(SH2_SHAKE_DETECTOR, &cfg);
+    LOG_I("[Sleep] shake detector wakeup re-armed: %s (status=%d)",
+          status == SH2_OK ? "OK" : "FAIL", status);
+  }
   LOG_I("[Sleep] reports restored — restarting BLE advertising for reconnect");
   // Advertising was fully stopped in enterSleep() — restart at fast interval
   Bluefruit.Advertising.setInterval(32, 244);
@@ -570,6 +606,25 @@ void exitSleep() {
 // ── BLE callbacks
 // ─────────────────────────────────────────────────────────────
 void onConnect(uint16_t conn_hdl) {
+  // ── Guard: reject spurious reconnect right after sleep ────────────────
+  // Race condition: onDisconnect() restarts advertising, enterSleep() stops
+  // it ~50ms later. In that window the phone begins a BLE handshake that
+  // completes ~1-2s later, triggering onConnect while we're sleeping.
+  // Without this guard, exitSleep() fires, the phone auto-arms, and the
+  // next sleep cycle leaves the BNO085 shake detector in a bad state.
+  if (sleeping) {
+    unsigned long elapsed = millis() - sleepStartMs;
+    if (elapsed < MIN_SLEEP_MS) {
+      LOG_I("[Sleep] spurious BLE connect %lums after sleep — rejecting",
+            elapsed);
+      Bluefruit.disconnect(conn_hdl);
+      Bluefruit.Advertising.stop(); // prevent further reconnect attempts
+      return;
+    }
+    // Legitimate wake-then-connect: proceed with exitSleep
+    exitSleep();
+  }
+
   lastMotionMs = millis();
   lastPingMs = 0; // fire stab heartbeat within PING_INTERVAL_MS of connect
   lastStableGravPose =
@@ -577,11 +632,11 @@ void onConnect(uint16_t conn_hdl) {
   // Do NOT reset lastLoggedStab here — BNO085 only fires stab on class change,
   // so if the class didn't change across reconnect, no new event arrives and
   // the heartbeat (which guards on lastLoggedStab <= 4) would never re-emit.
-  if (sleeping)
-    exitSleep();
-  else
+  if (!sleeping) {
+    // Not sleeping (either we just exited, or we were never sleeping)
     pendingEnableReports =
         true; // defer I2C ops to loop() — unsafe in BLE callback
+  }
   LOG_I("BLE connected. conn_hdl=%u peers=%u", conn_hdl,
         Bluefruit.Periph.connected());
   LOG_I("[Settings] current: debounce=%lu ms", debounceMs);
@@ -593,11 +648,18 @@ void onDisconnect(uint16_t conn_hdl, uint8_t reason) {
   calibrationComplete = false;
   baselineCaptured = false;
   calInProgress = false;
+  inStableWindow = false;
   calBuffer.reset();
-  // Note: armed flag remains as-is; the app will disarm if needed. But for
-  // power, it's fine — device will eventually sleep and reset anyway.
-  Bluefruit.Advertising.start(0);
-  LOG_I("BLE advertising restarted.");
+  stableCalBuffer.reset();
+  // Don't restart advertising if we're sleeping — enterSleep() already
+  // stopped it, and restarting here creates a race where the phone
+  // reconnects before enterSleep() can stop advertising again.
+  if (sleeping) {
+    LOG_I("BLE disconnect while sleeping — advertising stays off.");
+  } else {
+    Bluefruit.Advertising.start(0);
+    LOG_I("BLE advertising restarted.");
+  }
 }
 
 // ── Setup
@@ -943,11 +1005,19 @@ static void handleGyroCalibrated() {
     _stabDetector.markMotion(lastMotionMs);
     LOG_I("[Gesture] %s gx=%.2f gy=%.2f gz=%.2f integ=%.2f peak=%.2f", gesture,
           gx, gy, gz, integ, peakRate);
+  } else {
+    const ArbDebug& d = gestureDetector.lastArbDebug();
+    if (d.hadCandidate && d.reject != ArbReject::NO_CAND) {
+      static const char* axName[] = {"roll", "pitch", "yaw"};
+      static const char* rejName[] = {"ok", "no_cand", "min_integ", "ratio"};
+      LOG_I("[ArbReject] axis=%s integ=%.3f otherSum=%.3f ratio=%.2f reason=%s",
+            axName[(uint8_t)d.dominantAxis],
+            d.dominantInteg, d.otherSum, d.ratio,
+            rejName[(uint8_t)d.reject]);
+    }
   }
 }
 #endif
-
-static const unsigned long MIN_SLEEP_MS = 10000;
 
 static void handleSleepShake() {
   // Hardware shake detector fired. Signal wakeup via flag — do NOT call
@@ -970,6 +1040,21 @@ static void handleRotationVector() {
   if (sleeping)
     return;
 
+  // [RVRate] Log rotation vector call rate every 10 samples.
+  {
+    static unsigned long rvCount = 0;
+    static unsigned long rvLastLogMs = 0;
+    rvCount++;
+    unsigned long now = millis();
+    if (rvCount % 10 == 0) {
+      unsigned long elapsed = now - rvLastLogMs;
+      LOG_I("[RVRate] sample=%lu elapsed_10=%lums (~%.1fHz) calBuf=%u armed=%d calDone=%d",
+            rvCount, elapsed, elapsed > 0 ? 10000.0f / elapsed : 0.0f,
+            calBuffer.count, (int)armed, (int)calibrationComplete);
+      rvLastLogMs = now;
+    }
+  }
+
   float w = imu.getQuatReal();
   float x = imu.getQuatI();
   float y = imu.getQuatJ();
@@ -978,6 +1063,7 @@ static void handleRotationVector() {
   float pitch = quaternionToPitch(w, x, y, z) * 57.296f;
   float yaw = quaternionToYaw(w, x, y, z) * 57.296f;
   mountAdapter.transform(roll, pitch, yaw);
+  lastRoll = roll; lastPitch = pitch; lastYaw = yaw;
 
   // ── Gravity-based arm pose classification ────────────────────────────────
   // Rotate Earth gravity [0,0,-9.81] into sensor frame via conjugate
@@ -1074,36 +1160,37 @@ static void handleRotationVector() {
     gestureChar.notify(buf, 40);
   }
 
-  // ── Calibration: accumulate stable samples in rolling window, then average
-  // ── baselineCaptured is a global (shared across functions)
+  // ── Calibration: accumulate samples for 3 seconds, finalize on timer expiry
+  // ── stableCalBuffer collects only during stab=3 windows; calBuffer is fallback
   if (armed) {
-    // Only accumulate new baseline if calibration not yet complete
     if (!calibrationComplete) {
       if (!baselineCaptured) {
         if (!calInProgress) {
           calBuffer.reset();
+          stableCalBuffer.reset();
+          inStableWindow = false;
+          calStartMs    = millis();
+          calDeadlineMs = calStartMs + CAL_DEADLINE_MS;
           calInProgress = true;
         }
-        calBuffer.push(roll, pitch, yaw);
-
-        if (calBuffer.isFull()) {
-          calInProgress = false;
-          baselineCaptured = true;
-          calBuffer.getAverage(baselineRoll, basePitch_arm, baselineYaw);
-          publishBaseline(baselineRoll, basePitch_arm, baselineYaw);
-          LOG_I("[Cal] baseline captured: r=%.1f p=%.1f y=%.1f (%d samples)",
-                baselineRoll, basePitch_arm, baselineYaw, MAX_CAL_SAMPLES);
-          // If already armed when capture completes, that also confirms
-          // calibration
-          if (armed && !calibrationComplete) {
-            calibrationComplete = true;
-            LOG_I("[Cal] calibration confirmed via capture");
+        if (millis() - calStartMs < CAL_WINDOW_MS) {
+          calBuffer.push(roll, pitch, yaw);
+          LOG_I("[CalBuf] count=%u/%u r=%.1f p=%.1f y=%.1f",
+                calBuffer.count, MAX_CAL_SAMPLES, roll, pitch, yaw);
+          if (inStableWindow) {
+            stableCalBuffer.push(roll, pitch, yaw);
+            LOG_I("[StabCal] count=%u r=%.1f p=%.1f y=%.1f",
+                  stableCalBuffer.count, roll, pitch, yaw);
           }
         }
       }
     }
 
     unsigned long now = millis();
+    // Any armed rotation data = user activity → keep device awake.
+    // Without this, knob mode never refreshes lastMotionMs and the
+    // device sleeps after SLEEP_TIMEOUT_MS even while actively in use.
+    lastMotionMs = now;
     if (now - lastDeltaMs >= 20) {
       lastDeltaMs = now;
       if (currentMode == MODE_KNOB) {
@@ -1142,6 +1229,8 @@ static void handleRotationVector() {
     if (!calibrationComplete) {
       baselineCaptured = false;
       calInProgress = false;
+      inStableWindow = false;
+      stableCalBuffer.reset();
     }
   }
 }
@@ -1152,10 +1241,31 @@ static void handleStabilityClassifier() {
 
   stillDetector->onStabilityClass(stab, now);
 
+  // 4=motion, 5=unreliable — treat as user activity
+  if (stab >= 4) {
+    lastMotionMs = now;
+  }
+
+  // Calibration stable-window gating
+  if (calInProgress && !baselineCaptured) {
+    if (stab == STABILITY_STABLE) {
+      inStableWindow = true;
+      // Restart the 3s collection window from this stable moment — arm just settled
+      calStartMs = now;
+      LOG_I("[Cal] stab=3: stable window started, calStartMs reset");
+    } else if (stab >= 4) {
+      inStableWindow = false;
+#ifdef CAL_LAST_WINDOW_ONLY
+      stableCalBuffer.reset();
+#endif
+    }
+  }
+
   // Only log + notify on class change — classifier fires ~25Hz.
   if (stab != lastLoggedStab) {
     lastLoggedStab = stab;
-    LOG_I("[Stab] stab=%u (0=unknown,1=table,2=stationary,3=stable)", stab);
+    LOG_I("[Stab] stab=%u (0=unknown,1=table,2=stationary,3=stable,4=motion)",
+          stab);
     if (Bluefruit.Periph.connected()) {
       uint8_t sbuf[STATE_PACKET_MAX_LEN];
       uint8_t sn = pkt_stab(sbuf, stab);
@@ -1197,6 +1307,42 @@ static void dispatchIMUEvent(uint8_t eventId) {
     }
   }
   LOG_I("[IMU] unhandled eventId=0x%02X", eventId);
+}
+
+// ── Calibration finalization
+// ─────────────────────────────────────────────────────
+void finalizeCalibration() {
+  calInProgress = false;
+  inStableWindow = false;
+  float r, p, y;
+  if (stableCalBuffer.count > 0) {
+    stableCalBuffer.getAverage(r, p, y);
+    LOG_I("[Cal] stable window: %u samples", stableCalBuffer.count);
+    for (uint8_t i = 0; i < stableCalBuffer.count; i++) {
+      LOG_I("[Cal]   [%u] r=%.1f p=%.1f y=%.1f",
+            i, stableCalBuffer.roll[i], stableCalBuffer.pitch[i], stableCalBuffer.yaw[i]);
+    }
+  } else if (calBuffer.count > 0) {
+    calBuffer.getAverage(r, p, y);
+    LOG_I("[Cal] fallback: %u samples", calBuffer.count);
+    for (uint8_t i = 0; i < calBuffer.count; i++) {
+      LOG_I("[Cal]   [%u] r=%.1f p=%.1f y=%.1f",
+            i, calBuffer.roll[i], calBuffer.pitch[i], calBuffer.yaw[i]);
+    }
+  } else {
+    LOG_E("[Cal] failed — no samples. App must retry.");
+    return;
+  }
+  baselineRoll = r;
+  basePitch_arm = p;
+  baselineYaw = y;
+  baselineCaptured = true;
+  if (armed && !calibrationComplete) {
+    calibrationComplete = true;
+  }
+  publishBaseline(r, p, y);
+  LOG_I("[Cal] baseline: r=%.1f p=%.1f y=%.1f (stable=%u all=%u)",
+        r, p, y, stableCalBuffer.count, calBuffer.count);
 }
 
 // ── Loop
@@ -1249,10 +1395,18 @@ void loop() {
             drained, digitalRead(BNO085_INT_PIN));
       pendingExitSleep = true;
     } else {
-      // Too soon after sleep — ignore. This is a residual INT assertion
-      // from pre-sleep config commands, not a real shake. Do NOT wake the
-      // hub (modeOn) or re-arm (setSensorConfig) here — that generates
-      // MORE events and creates an infinite loop.
+      // Too soon after sleep — ignore. This is likely a residual INT assertion
+      // from pre-sleep config commands, or a shake that happened too early.
+      // WE MUST DRAIN IT! If we leave INT LOW, the FALLING edge interrupt will
+      // never fire again, and waitForEvent() will hang the CPU permanently.
+      LOG_I("[Sleep] INT pin LOW during MIN_SLEEP_MS window (elapsed=%lums) — draining to clear INT", elapsed);
+      imu.modeOn();
+      delay(50);
+      while (digitalRead(BNO085_INT_PIN) == LOW) {
+        imu.getSensorEvent();
+        delayMicroseconds(2000);
+      }
+      imu.modeSleep(); // put SH-2 hub back to sleep
     }
   }
 
@@ -1271,8 +1425,19 @@ void loop() {
   }
   firstLoop = false;
   if (!imuReset && !sleeping) {
-    bool gotEvent = imu.getSensorEvent();
-    if (gotEvent) {
+    // Drain ALL pending events. If we only read one per wakeup, the INT pin 
+    // may stay LOW, which prevents the FALLING edge interrupt from firing 
+    // for the next waitForEvent(), causing the IMU reporting to crawl.
+    while (digitalRead(BNO085_INT_PIN) == LOW) {
+      if (imu.getSensorEvent()) {
+        uint8_t eid = imu.getSensorEventID();
+        dispatchIMUEvent(eid);
+      } else {
+        break; // INT is LOW but no event, prevent infinite loop
+      }
+    }
+    // Also try once even if INT is HIGH, as the library might have an event buffered
+    if (imu.getSensorEvent()) {
       uint8_t eid = imu.getSensorEventID();
       dispatchIMUEvent(eid);
     }
@@ -1333,5 +1498,22 @@ void loop() {
   // Yield CPU every loop — lets SoftDevice put nRF52840 to sleep between BLE
   // connection events and IMU interrupts.
   // When sleeping with advertising stopped, WFE only wakes on GPIO (INT pin).
+  // Only warn when actually sleeping — INT LOW during active IMU reporting is normal.
+  if (sleeping && digitalRead(BNO085_INT_PIN) == LOW) {
+    LOG_E("[DEADLOCK WARNING] CPU about to sleep (waitForEvent) but BNO085 INT is LOW! Wake interrupt will never fire!");
+  }
+
+  // Calibration timeout — fires regardless of IMU/BLE events
+  if (calInProgress && !baselineCaptured) {
+    unsigned long now = millis();
+    bool stableWindowDone = (now - calStartMs >= CAL_WINDOW_MS);
+    bool hardDeadline     = (now >= calDeadlineMs);
+    if (stableWindowDone || hardDeadline) {
+      if (hardDeadline && !stableWindowDone)
+        LOG_E("[Cal] hard deadline hit (%lums) — finalizing with partial data", CAL_DEADLINE_MS);
+      finalizeCalibration();
+    }
+  }
+
   waitForEvent();
 }

@@ -129,6 +129,7 @@ export function ActiveControlScreen({ route, navigation }: Props) {
   // Handles async mode-settle race (ModeManager may set knob after mount).
   useEffect(() => {
     if (!interactionMode) return;
+    console.log(`[AC] calibEff interactionMode=${interactionMode} homeBaseline=${!!homeBaseline} sessionBaseline=${!!sessionBaseline}`);
     if (interactionMode === Mode.GESTURE && homeBaseline && !sessionBaseline) {
       setSessionBaseline(homeBaseline);
       return;
@@ -138,13 +139,16 @@ export function ActiveControlScreen({ route, navigation }: Props) {
     startCalibration();
   }, [interactionMode, sessionBaseline]);
 
-  // Complete session calibration from the firmware baseline candidate.
+  // Complete session calibration — prefer fresh firmware PKT_BASELINE; fall back
+  // to homeBaseline when firmware hasn't re-sent one yet (cleared by reconnect).
   useEffect(() => {
-    if (!sessionCalibrating || !baselineCandidate) return;
+    if (!sessionCalibrating) return;
+    const candidate = baselineCandidate ?? homeBaseline;
+    if (!candidate) return;
     const baseline: Baseline = {
-      roll: baselineCandidate.roll,
-      pitch: baselineCandidate.pitch,
-      yaw: baselineCandidate.yaw,
+      roll: candidate.roll,
+      pitch: candidate.pitch,
+      yaw: candidate.yaw,
       timestamp: Date.now(),
       wristName: "",
       wristAddress: "",
@@ -152,7 +156,7 @@ export function ActiveControlScreen({ route, navigation }: Props) {
     setSessionBaseline(baseline);
     sendBaselineToFirmware(baseline).catch(() => {});
     setSessionCalibrating(false);
-  }, [sessionCalibrating, baselineCandidate]);
+  }, [sessionCalibrating, baselineCandidate, homeBaseline]);
 
   // While calibrating, keep resetting the idle timer so it never fires mid-calibration.
   useEffect(() => {

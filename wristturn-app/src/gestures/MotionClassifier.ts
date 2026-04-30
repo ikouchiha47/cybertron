@@ -139,8 +139,12 @@ export class MotionClassifier {
       return;
     }
 
-    if (!isCalibrationStill(stab)) {
-      // stab=1 (on_table) or stab=0 (unknown) — not useful, ignore
+    // After arm was moved (sawMotion), stab=1 (on_table) also counts as still
+    // enough to collect a baseline — BNO085 reports on_table for flat wrist
+    // orientation even when worn. Without motion seen, keep ignoring stab=1 so
+    // a device resting on a desk doesn't accidentally self-calibrate.
+    const stillEnough = isCalibrationStill(stab) || (this.sawMotion && stab === 1);
+    if (!stillEnough) {
       return;
     }
 

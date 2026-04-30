@@ -90,3 +90,47 @@ suspended — `getSensorEvent()` / `sh2_service()` cannot read data until
 **Wrong approach** (the original bug): Trying to call `getSensorEvent()`
 while the hub is asleep → I2C reads return nothing → shake event is never
 decoded → `handleSleepShake()` never fires → device stays asleep forever.
+
+---
+
+## Debugging with firmware logs
+
+Firmware logs come from the XIAO nRF52840's USB serial port (`Serial.printf` via `LOG_I`).
+Capture them with a serial monitor or redirect to a file, then analyze with:
+
+```bash
+python3 tools/analyze_firmware_log.py tmp/logs.NN.txt
+python3 tools/analyze_firmware_log.py tmp/logs.NN.txt --tags Cal Stab RVRate CalBuf
+```
+
+### Key log tags
+
+| Tag | What it means |
+|-----|--------------|
+| `[Reports]` | `enableReports()` called; shows `armed=` and whether rotation vector was enabled |
+| `[Arm]` | Device armed or disarmed by app |
+| `[Stab]` | BNO085 stability class change (0=unknown,1=table,2=stationary,3=stable,4=motion) |
+| `[GravPose]` | Arm pose classified (flat/hanging/raised) from rotation vector gravity projection |
+| `[GravDiag]` | Rotation vector gravity diag every 50 RV samples (~1/s at 50Hz) |
+| `[RVRate]` | Rotation vector call rate — every 10 samples; shows actual Hz and calBuf count |
+| `[CalBuf]` | Every calBuffer.push() during calibration; shows fill progress |
+| `[Cal]` | Calibration milestones: cleared / captured / confirmed |
+| `[Baseline]` | App wrote a baseline to firmware |
+
+### What to look for
+
+**Calibration takes too long:**
+1. Check `[RVRate]` — if Hz << 50, rotation vector is throttled. Expected ~50Hz.
+2. Check `[CalBuf]` — if samples trickle in slowly, confirms the RV rate issue.
+3. Check `[Arm]` — if armed/disarmed cycles appear, calBuffer resets each disarm.
+4. Check `[Reports]` — multiple enableReports() calls can restart RV, causing startup delay.
+
+**Normal expected flow (calibration in <1s):**
+```
+[Arm] armed
+[Reports] rotation vector enabled   ← armed=1
+[RVRate] sample=10 elapsed_10=200ms (~50Hz)  ← RV firing at 50Hz
+[CalBuf] count=1/25 ...             ← filling fast
+[CalBuf] count=25/25 ...            ← full after 25 samples (~500ms)
+[Cal] baseline captured             ← done
+```

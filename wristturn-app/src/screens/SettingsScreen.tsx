@@ -9,7 +9,7 @@ import type { BottomTabScreenProps } from "@react-navigation/bottom-tabs";
 import type { TabParams, RootStackParams } from "../navigation/AppNavigator";
 import { registry } from "../devices/registry/DeviceRegistry";
 import { useMDNSDiscovery } from "../discovery/useMDNSDiscovery";
-import { useBLE, applyMode } from "../ble/useBLE";
+import { useBLE, applyMode, sendBaselineToFirmware } from "../ble/useBLE";
 import { BaselineStore } from "../storage/BaselineStore";
 import { PrefsStore } from "../mapping/PrefsStore";
 import { INTERACTION_MODE } from "../types";
@@ -36,7 +36,7 @@ export function handleRecalibrateHome(wristAddress: string) {
   if (!wristAddress) return;
   Alert.alert(
     "Recalibrate Home Position?",
-    "This clears the stored baseline. You'll need to hold your arm still on next reconnect.",
+    "This clears the stored baseline and forces an immediate recalibration.",
     [
       { text: "Cancel", style: "cancel" },
       {
@@ -45,7 +45,8 @@ export function handleRecalibrateHome(wristAddress: string) {
         onPress: async () => {
           try {
             await BaselineStore.clear(wristAddress);
-            Alert.alert("Baseline Cleared", "Next reconnection will run the calibration ritual.");
+            await sendBaselineToFirmware({ roll: -999, pitch: -999, yaw: -999 }).catch(() => {});
+            Alert.alert("Baseline Cleared", "Please return to the Home screen to recalibrate.");
           } catch (e: any) {
             Alert.alert("Error", String(e?.message ?? e));
           }

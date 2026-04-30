@@ -334,7 +334,12 @@ export function DiscoveryScreen({ navigation }: Props) {
     BaselineStore.load(wristAddress).then((b) => {
       log(`E1: baseline ${b ? "found" : "null"}`);
       setStoredBaseline(b);
-      if (b) setDiscState(DiscState.WAIT_RAISED);
+      if (b) {
+        // E8 only fires on focus transitions — by the time this async load completes
+        // the screen is already focused and the event won't re-fire. Send here instead.
+        sendBaselineToFirmware(b).catch((e) => log(`E1: sendBaseline error: ${e}`));
+        setDiscState(DiscState.WAIT_RAISED);
+      }
     }).catch((e) => {
       log(`E1: BaselineStore error: ${e}`);
       setStoredBaseline(null);
@@ -429,14 +434,32 @@ export function DiscoveryScreen({ navigation }: Props) {
     }
   }, [discState]);
 
-  // E8: Focus — re-send baseline to firmware; reset tracking → browsing on return
+  // E8: Focus — re-send baseline to firmware, or trigger recalibration if cleared in settings
   useEffect(() => {
     const unsub = navigation.addListener("focus", () => {
-      if (connected && storedBaseline) sendBaselineToFirmware(storedBaseline).catch(() => {});
+      if (connected) {
+        BaselineStore.load(wristAddress).then((b) => {
+          setStoredBaseline(b);
+          if (b) {
+            sendBaselineToFirmware(b).catch(() => {});
+          } else if (discStateRef.current !== DiscState.CALIBRATING) {
+            log("E8: baseline missing on focus → triggering recalibration");
+            setDiscState(DiscState.CALIBRATING);
+            startCalibration();
+          } else {
+            // discState is already CALIBRATING — discState won't change so E7 won't
+            // re-fire. Call startCalibration() directly: it now arms the device, which
+            // is what may have been missing (e.g. user cleared baseline mid-session,
+            // or reconnect after sleep landed in an already-CALIBRATING discState).
+            log("E8: already calibrating on focus → re-arm device");
+            startCalibration();
+          }
+        });
+      }
       if (discStateRef.current === DiscState.TRACKING) setDiscState(DiscState.BROWSING);
     });
     return unsub;
-  }, [navigation, connected, storedBaseline]);
+  }, [navigation, connected, wristAddress]);
 
   // Cleanup on unmount
   useEffect(() => {

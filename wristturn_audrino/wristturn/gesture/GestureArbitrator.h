@@ -44,6 +44,25 @@ struct GestureEvent {
     int8_t      direction;  // +1 (positive integral) or -1 (negative integral)
 };
 
+// Rejection reason for debug logging.
+enum class ArbReject : uint8_t {
+    NONE       = 0,  // gesture fired — no rejection
+    NO_CAND    = 1,  // no valid axis candidate at all
+    MIN_INTEG  = 2,  // dominant integral below MIN_INTEGRAL
+    RATIO      = 3,  // dominant axis failed ratio test
+};
+
+// Debug info from the last arbitrate() call — populated whether or not a
+// gesture fires. Caller can log this when valid=true but rejected.
+struct ArbDebug {
+    bool        hadCandidate;   // at least one axis candidate was valid
+    GestureAxis dominantAxis;
+    float       dominantInteg;  // signed
+    float       otherSum;       // sum of |integral| of non-dominant axes
+    float       ratio;          // dominantAbs / (otherSum + EPSILON)
+    ArbReject   reject;
+};
+
 // ---------------------------------------------------------------------------
 // GestureArbitrator
 // ---------------------------------------------------------------------------
@@ -51,10 +70,9 @@ struct GestureEvent {
 class GestureArbitrator {
 public:
     // Tuneable constants — all named, no magic numbers in the algorithm body.
-    // Raised from 1.5→2.0 to reject cross-axis bleed (yaw firing during pure roll).
-    // Bleed integrals ~0.32-0.35 barely cleared 1.5; 2.0 keeps real gestures intact
-    // (0.51 / 0.05 ≈ 10x ratio) while blocking contaminated signals.
-    static constexpr float DOMINANT_RATIO_THRESHOLD = 2.0f;
+    // 1.5: roll passes easily (10x ratio); pitch passes with natural cross-axis coupling
+    // (~1.5-1.8x). 2.0 was too strict — blocked all pitch gestures in practice.
+    static constexpr float DOMINANT_RATIO_THRESHOLD = 1.5f;
     // Small epsilon added to the denominator to prevent divide-by-zero when
     // all non-dominant candidates have zero integrals.
     static constexpr float DENOMINATOR_EPSILON = 0.001f;
@@ -73,9 +91,11 @@ public:
     //   - the dominant axis fails the ratio test (ambiguous motion).
     GestureEvent arbitrate(AxisCandidate roll,
                            AxisCandidate pitch,
-                           AxisCandidate yaw) const
+                           AxisCandidate yaw,
+                           ArbDebug* dbg = nullptr) const
     {
         constexpr GestureEvent NO_EVENT = {false, GestureAxis::ROLL, 0};
+        ArbDebug localDbg = {false, GestureAxis::ROLL, 0.0f, 0.0f, 0.0f, ArbReject::NO_CAND};
 
         // ----------------------------------------------------------------
         // 1. Collect the three candidates into an indexed array so the
@@ -110,6 +130,7 @@ public:
 
         // No valid candidate at all.
         if (dominantIdx < 0) {
+            if (dbg) { localDbg.reject = ArbReject::NO_CAND; *dbg = localDbg; }
             return NO_EVENT;
         }
 
@@ -126,26 +147,37 @@ public:
             }
         }
 
+        float ratio = dominantAbs / (otherSum + DENOMINATOR_EPSILON);
+
+        localDbg.hadCandidate  = true;
+        localDbg.dominantAxis  = slots[dominantIdx].axis;
+        localDbg.dominantInteg = slots[dominantIdx].cand->integral;
+        localDbg.otherSum      = otherSum;
+        localDbg.ratio         = ratio;
+
         // ----------------------------------------------------------------
         // 4. Absolute minimum check — reject noise and cross-axis bleed.
         // ----------------------------------------------------------------
         if (dominantAbs < MIN_INTEGRAL) {
+            localDbg.reject = ArbReject::MIN_INTEG;
+            if (dbg) *dbg = localDbg;
             return NO_EVENT;
         }
 
         // ----------------------------------------------------------------
         // 5. Ratio test.
         // ----------------------------------------------------------------
-        float ratio = dominantAbs / (otherSum + DENOMINATOR_EPSILON);
-
         if (ratio < DOMINANT_RATIO_THRESHOLD) {
-            // Ambiguous — competing axes are too active relative to the leader.
+            localDbg.reject = ArbReject::RATIO;
+            if (dbg) *dbg = localDbg;
             return NO_EVENT;
         }
 
         // ----------------------------------------------------------------
         // 6. Emit event.
         // ----------------------------------------------------------------
+        localDbg.reject = ArbReject::NONE;
+        if (dbg) *dbg = localDbg;
         const AxisCandidate& winner = *slots[dominantIdx].cand;
         GestureEvent evt;
         evt.valid     = true;

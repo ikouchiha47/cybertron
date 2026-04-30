@@ -67,7 +67,7 @@ public:
             onQuiet();
         }
 
-        GestureEvent evt = _arb.arbitrate(cr, cp, cy);
+        GestureEvent evt = _arb.arbitrate(cr, cp, cy, &_lastArbDebug);
         if (!evt.valid) return nullptr;
 
         switch (evt.axis) {
@@ -86,8 +86,9 @@ public:
         return nullptr;
     }
 
-    float lastIntegral()  const { return _lastIntegral; }
-    float lastPeakRate()  const { return _lastPeakRate; }
+    float lastIntegral()        const { return _lastIntegral; }
+    float lastPeakRate()        const { return _lastPeakRate; }
+    const ArbDebug& lastArbDebug() const { return _lastArbDebug; }
 
     /** Runtime tuning — lets BLE settings char update the integral threshold. */
     void setIntegralThreshold(float t) {
@@ -114,4 +115,5 @@ private:
     float    _integralThreshold;
     float    _lastIntegral = 0.0f;
     float    _lastPeakRate = 0.0f;
+    ArbDebug _lastArbDebug = {false, GestureAxis::ROLL, 0.0f, 0.0f, 0.0f, ArbReject::NO_CAND};
 };

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ComboEngine }       from "../gestures/ComboEngine";
-import { filterGesture }     from "../gestures/GestureFilter";
+import { filterGesture, isSnap } from "../gestures/GestureFilter";
 import { validateComboMap }  from "../gestures/ComboValidator";
 import { HoldDetector }      from "../gestures/HoldDetector";
 import { KnobEngagement }    from "../gestures/KnobEngagement";
@@ -313,14 +313,22 @@ function startRuntime() {
       return;
     }
 
-    // GESTURE mode: normal refractory + combo dispatch
+    // GESTURE mode: refractory + snap classification + combo dispatch
     const axes = event.roll  !== undefined
       ? ` r=${event.roll?.toFixed(1)} p=${event.pitch?.toFixed(1)} y=${event.yaw?.toFixed(1)}${event.delta !== undefined ? ` d=${event.delta?.toFixed(1)}` : ""}`
       : "";
-    if (!filterGesture(event.name)) {
-      // DIAG: Log when a firmware gesture arrives but gets suppressed by snap-back cooldown
-      console.log(`[GestureFilter] SUPPRESSED: ${event.name} (snap-back cooldown)${axes}`);
-      DebugLog.push("GESTURE", `suppressed (snap):${axes} ${event.name}`);
+    const snap = isSnap(event.peakRate ?? 0);
+    if (!filterGesture(event.name, event.peakRate)) {
+      DebugLog.push("GESTURE", `suppressed:${axes} ${event.name}`);
+      return;
+    }
+    if (snap) {
+      // Snap: high-velocity reset gesture — log but don't dispatch as a command.
+      // Does not arm snap-back cooldown or refractory (filterGesture skipped those).
+      const snapName = event.name === Gesture.TURN_RIGHT ? "snap_right"
+                     : event.name === Gesture.TURN_LEFT  ? "snap_left"
+                     : event.name;
+      DebugLog.push("GESTURE", `snap ${snapName} pk=${event.peakRate?.toFixed(2)}${axes}`);
       return;
     }
     DebugLog.push("GESTURE", `${event.name}${axes}`);
@@ -512,6 +520,12 @@ export function startCalibration(): void {
   console.log("[BLE] startCalibration()");
   motionClassifier?.reset();
   motionClassifier?.startCalibration();
+  // Always arm explicitly: E7 only fires on discState *changes*, so if discState is
+  // already CALIBRATING (reconnect after sleep, return from Settings), E7 never
+  // re-fires and the firmware never enables rotation vector without this call.
+  BLEServiceNative.setArmed(true).catch((e) =>
+    console.warn("[BLE] startCalibration: arm failed", e)
+  );
 }
 
 export function confirmBaselineReady(): void {

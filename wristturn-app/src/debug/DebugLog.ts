@@ -1,3 +1,6 @@
+import * as FileSystem from "expo-file-system/legacy";
+import * as Sharing    from "expo-sharing";
+
 type Listener = (lines: string[]) => void;
 
 const MAX = 80;
@@ -16,13 +19,31 @@ export const DebugLog = {
     if (lines.length > MAX) lines.splice(0, lines.length - MAX);
     listeners.forEach((l) => l([...lines]));
   },
+
   subscribe(fn: Listener) {
     listeners.add(fn);
     fn([...lines]);
     return () => { listeners.delete(fn); };
   },
+
   clear() {
     lines.length = 0;
     listeners.forEach((l) => l([]));
+  },
+
+  async share(): Promise<void> {
+    if (lines.length === 0) throw new Error("No log lines to export");
+    const ok = await Sharing.isAvailableAsync();
+    if (!ok) throw new Error("Sharing unavailable on this device");
+
+    const dir  = FileSystem.documentDirectory + "logs/";
+    const info = await FileSystem.getInfoAsync(dir);
+    if (!info.exists) await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
+
+    const iso  = new Date().toISOString().replace(/[:.]/g, "-");
+    const name = `log-${iso}.txt`;
+    const path = dir + name;
+    await FileSystem.writeAsStringAsync(path, lines.join("\n") + "\n");
+    await Sharing.shareAsync(path, { mimeType: "text/plain", dialogTitle: name });
   },
 };
