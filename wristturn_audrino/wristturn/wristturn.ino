@@ -1440,13 +1440,13 @@ void loop() {
   // ── PowerManager tick while sleeping ──────────────────────────────────
   // ShakeSleepPolicy: wakes every 30s, calls modeOn() + drainFifo(), looks
   // for 0x19 (shake). If found → exitSleep(). If not → modeSleep() + reset timer.
-  // After 10 min, StagedPolicy advances to SigMotionSleepPolicy (INT-based deep sleep).
   if (sleeping) {
     if (powerMgr.tick(hw)) {
       LOG_I("[Sleep] PowerManager: wake event confirmed — exiting sleep");
       exitSleep();
     }
     delay(10);
+    return;  // skip dispatch, keepalive, DEADLOCK check, waitForEvent
   }
 
   bool imuReset = imu.wasReset();
