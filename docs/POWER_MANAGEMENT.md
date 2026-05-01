@@ -233,6 +233,132 @@ Key observations:
 
 ---
 
+## 4. History — What We Tried and Why It Failed
+
+### Approach 1: INT-pin wake with `wakeupEnabled=true` on shake detector (logs.34)
+
+**What we tried**: Enable `SH2_SHAKE_DETECTOR` with `wakeupEnabled=true` before
+`modeSleep()`. In `loop()`, poll INT pin — INT LOW while sleeping = shake event =
+wake up.
+
+**What happened**: INT pin stayed LOW continuously from the moment `modeSleep()`
+was called. The SHTP transport sends an ACK pulse (INT LOW) every time a sensor
+command is processed. With shake configured at 200ms intervals and wakeupEnabled,
+the BNO085 drove INT LOW again almost immediately after each drain. The sleep
+loop spent 9+ hours in a continuous "INT pin LOW during MIN_SLEEP_MS window —
+draining to clear INT" spin, never transitioning out of the guard window.
+
+```
+[04:21:42.827] [Sleep] INT pin LOW during MIN_SLEEP_MS window (elapsed=4335ms) — draining to clear INT
+[04:21:43.389] E [DEADLOCK WARNING] ...
+... (repeating every 63ms for ~9 hours)
+[13:11:04.152] [Sleep] INT pin LOW while sleeping (elapsed=417ms) — waking SH-2 hub
+[13:11:04.278] [Sleep] reports restored — restarting BLE advertising for reconnect
+```
+
+**Root cause**: `SH2_SHAKE_DETECTOR` with `wakeupEnabled=true` sends a report at
+its configured interval (~200ms) regardless of whether the device is shaking. It
+is not a latched edge-triggered interrupt — it is a periodic sensor report. INT
+never goes HIGH for long enough to sleep on.
+
+---
+
+### Approach 2: Longer guard window to absorb SHTP ACKs (logs.35)
+
+**What we tried**: After `modeSleep()`, enter a 10-second "guard window" where
+INT LOW → drain without waking. After the guard window expires, treat the next
+INT LOW as a real shake wake.
+
+**What happened**: The drain log showed 54 consecutive 0x19 (shake) events at
+~196ms spacing in the first 10 seconds:
+
+```
+[00:05:03.611] [Sleep] drain[5] event=0x19 elapsed=361ms
+[00:05:04.784] [Sleep] drain[11] event=0x19 elapsed=1534ms
+...
+[00:05:13.191] [Sleep] drain[53] event=0x19 elapsed=9746ms
+[00:05:13.247] [Sleep] drain window ended (elapsed=10000ms drainCycles=54) — re-sleeping hub
+[00:05:13.253] [Sleep] INT pin LOW after MIN_SLEEP_MS (elapsed=10006ms) — waking
+```
+
+Device woke immediately after the guard window because the next shake report
+arrived at ~10006ms — just 6ms after the window closed. The shake detector fires
+every ~196ms without pause; the guard window approach just delayed the false wake,
+it didn't solve it.
+
+**Root cause confirmed**: `SH2_SHAKE_DETECTOR` at any interval with
+`wakeupEnabled=true` is a periodic sensor, not an edge sensor. There is no way
+to distinguish a "real shake" from a "periodic report" via the INT pin alone.
+
+---
+
+### Approach 3: Guard window drain + INT-based wake after guard (logs.36, logs.37)
+
+**What we tried**: Change shake interval to 2s to reduce ACK frequency. Keep a
+shorter guard window (10s, ~6 drain cycles at ~2s each). After the guard window,
+treat the first INT LOW as a real shake wake.
+
+**What happened**: Pattern was consistent across all cycles. After guard window,
+device always woke at ~11.85s (6 guard drains × ~1.95s). The "wake event=0x19"
+was seen but `drained=0` — meaning the drain reported 0 events actually decoded
+from FIFO, yet still triggered exit:
+
+```
+[00:05:05.353] [Sleep] BNO085 SH-2 sleep — INT=0 after modeSleep (waiting for shake)
+[00:05:05.353] [Sleep] INT LOW in guard window (elapsed=125ms) — drain ACK, no re-sleep
+[00:05:05.443] [Sleep] guard drain done — INT=1, hub in modeOn, waiting for real shake
+[00:05:07.284] [Sleep] INT LOW in guard window (elapsed=2079ms) — drain ACK, no re-sleep
+... (4 more guard drains at ~2s intervals)
+[00:05:15.104] [Sleep] INT pin LOW while sleeping (elapsed=11854ms) — waking SH-2 hub
+[00:05:15.159] [Sleep] wake event=0x19 drained=0
+[00:05:15.161] [Sleep] wake drain: 1 cycles, INT=1 — scheduling exitSleep
+```
+
+Every sleep cycle woke after exactly ~12s regardless of user activity. Verified
+across 5+ sleep cycles in logs.37.
+
+**The actual wake trigger**: The 7th INT pulse (first one after the guard window)
+was just the next periodic shake report, not a real shake. The approach could not
+distinguish.
+
+---
+
+### Discovery: BNO085 manual — SigMotion and Shake are not always-on
+
+Reading the BNO085 SH-2 Application Note revealed:
+
+- **`SH2_SIGNIFICANT_MOTION`** (0x12): Requires a 5-step walking pattern with
+  acceleration crossing a threshold. Designed for "user picked up and started
+  walking" detection. Not "device moved" detection.
+
+- **`SH2_SHAKE_DETECTOR`** (0x19): Documented as requiring "significant
+  acceleration changes in rapid succession". In practice, sends periodic reports
+  at its configured interval — the report payload indicates shake direction, but
+  the report fires on schedule whether or not shaking occurred.
+
+Neither sensor was wired up correctly for the use case: user resting wrist after
+use, then picking it up and shaking to wake.
+
+---
+
+### Resolution: Software timer approach (logs.39 era)
+
+Inspired by SparkFun BNO08x Example20-Sleep. Instead of depending on the INT
+pin to signal a shake event, use a software timer:
+
+1. Configure shake detector with `wakeupEnabled=false` — no INT-pin dependency
+2. `modeSleep()` — hub sleeps, shake configured but not sending to MCU
+3. Every 30s: software timer fires → `modeOn()` + drain FIFO for 200ms → check
+   for 0x19 event → if found, full wake; else `modeSleep()` again
+
+This completely avoids the periodic-report-as-interrupt problem. The BNO085 only
+runs its fusion engine briefly during the 200ms sample window. Wake latency is
+0–30s (user must shake during the sample window).
+
+This is the approach encoded in `ShakeSleepPolicy` in `PowerManager.h`.
+
+---
+
 ## 5. Known Limitations (RUNE-I)
 
 **Shake detection is sampling-based.** `SH2_SHAKE_DETECTOR` does not run in
@@ -240,10 +366,11 @@ the BNO085 always-on domain during `modeSleep()`. The 30s software cycle wakes
 the BNO085 and samples for 200ms. The user must be shaking during that window.
 Typical wake latency: 0–30s. User should shake and hold a few seconds.
 
-**SigMotion not yet validated on hardware.** `SH2_SIGNIFICANT_MOTION` (0x12)
-is documented as an always-on sensor. Whether it actually asserts INT from
-`modeSleep()` on this specific BNO085 revision is unconfirmed — needs a flash
-and a log capture.
+**SigMotion requires walking, not just motion.** `SH2_SIGNIFICANT_MOTION` (0x12)
+uses a 5-step + acceleration pattern from the BNO085 always-on domain. It will
+not fire from picking up the device or flicking a wrist — only from walking-scale
+motion. Confirmed working from hardware log (stage transition + clean wake in
+logs.39 session).
 
 **nRF52840 WFE and software timer.** `waitForEvent()` uses `sd_app_evt_wait()`
 which wakes on any interrupt including the FreeRTOS RTC tick (~1ms). This is
