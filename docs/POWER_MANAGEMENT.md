@@ -162,7 +162,78 @@ powerMgr.tick() returns true
 
 ---
 
-## 3. Known Limitations (RUNE-I)
+## 3. Validated Behaviour (from hardware logs)
+
+### logs.39 — DEADLOCK bug (old firmware, pre-fix)
+
+This log captured the firmware before the `return` fix in the sleep loop.
+After `enterSleep()`, `loop()` fell through to the DEADLOCK check every
+iteration because there was no `return` after `delay(10)`. The modeSleep()
+SHTP ACK held INT LOW, triggering 301 consecutive warnings over ~3 seconds:
+
+```
+[00:05:03.247] [Sleep] inactivity timeout — entering light sleep
+[00:05:03.284] [Sleep] pre-sleep drain: 5 cycles, INT=1
+[00:05:03.376] E [DEADLOCK WARNING] CPU about to sleep but BNO085 INT is LOW!
+[00:05:03.386] E [DEADLOCK WARNING] ...   ← repeats 301 times over 3 seconds
+...
+[00:05:06.287] E [DEADLOCK WARNING] ...   ← last warning
+[00:10:00.312] E [DEADLOCK WARNING] ...   ← two more just before wake
+[00:10:00.462] E [DEADLOCK WARNING] ...
+[00:10:00.579] [Sleep] PowerManager: wake event confirmed — exiting sleep
+[00:10:00.641] [Sleep] reports restored — restarting BLE advertising
+```
+
+Key observations:
+- 301 DEADLOCK warnings fired in a ~3s burst immediately after sleep entry
+- Despite the spam, the device did NOT actually deadlock — FreeRTOS RTC tick
+  continued waking the CPU from WFE every ~1ms
+- Device eventually woke correctly (~5 min later) from the shake cycle
+- **Root cause**: missing `return` in sleep block → loop fell through to
+  DEADLOCK check and `waitForEvent()` on every 10ms iteration
+
+**Fix**: added `return` after `delay(10)` in the sleeping block. The DEADLOCK
+warning check and `waitForEvent()` are now skipped entirely while sleeping.
+
+---
+
+### Session log — stage transitions working (new firmware)
+
+Captured after PowerManager wiring was complete. Shows clean light→deep sleep
+transition and confirmed SigMotion wake:
+
+```
+[00:05:03.247] [Sleep] inactivity timeout — entering light sleep (armed=0 lastMotionAge=300004ms)
+[00:05:03.284] [Sleep] pre-sleep drain: 5 cycles, INT=1
+                        ↑ 5 min idle, clean drain, INT=1 before sleep
+
+[00:09:33.452] [Sleep] stage=1 deep sleep (SigMotion, INT-based)
+                        ↑ exactly 4.5 min after sleep entry → StagedPolicy
+                          disarmed ShakeSleepPolicy, armed SigMotionSleepPolicy
+
+[00:14:07.756] [Sleep] PowerManager: wake event confirmed — exiting sleep
+[00:14:07.756] [Sleep] waking — restoring reports
+[00:14:07.813] [Sleep] exitSleep drained 1 residual events, INT=1
+[00:14:07.813] [Reports] enable start rawMode=0 armed=0 sleeping=0
+[00:14:07.825] [Sleep] reports restored — restarting BLE advertising for reconnect
+[00:14:08.259] [Stab] stab=4
+                        ↑ ~4.5 min in deep sleep, SigMotion fired on motion
+```
+
+Key observations:
+- `stage=0` was never logged in this run — bug: `lastStage` initialised to `0`
+  same as `staged.currentStage`, so first stage change was never detected.
+  **Fixed**: initialise `lastStage = 0xFF` so stage 0 always logs on entry.
+- SigMotion (`SH2_SIGNIFICANT_MOTION`, 0x12) **confirmed working** on this
+  hardware revision — asserts INT from modeSleep with wakeupEnabled=true.
+- `exitSleep drained 1 residual events` — normal, the SigMotion event itself.
+- No DEADLOCK warnings — confirms the `return` fix works.
+- Light sleep duration changed to **10 min** after validation
+  (`staged.addStage(&shakePol, 600UL * 1000UL)`).
+
+---
+
+## 5. Known Limitations (RUNE-I)
 
 **Shake detection is sampling-based.** `SH2_SHAKE_DETECTOR` does not run in
 the BNO085 always-on domain during `modeSleep()`. The 30s software cycle wakes
@@ -181,7 +252,7 @@ in the sleep path rate-limits tick checks to ~100/s.
 
 ---
 
-## RUNE-II Direction
+## 6. RUNE-II Direction
 
 Push significant motion detection further onto the BNO085 always-on domain, or
 evaluate adding a dedicated low-power motion interrupt source external to the

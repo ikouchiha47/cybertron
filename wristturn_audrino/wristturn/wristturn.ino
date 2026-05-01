@@ -953,7 +953,7 @@ void setup() {
   // ── PowerManager: assemble staged sleep policy ──────────────────────────
   // Stage 0: light sleep (shake-based, software timer, 30s cycles) for 4.5 min.
   // Stage 1: deep sleep (SH2_SIGNIFICANT_MOTION with wakeupEnabled) forever.
-  staged.addStage(&shakePol, 270UL * 1000UL);  // 4.5 min = 270 s
+  staged.addStage(&shakePol, 600UL * 1000UL);  // 10 min = 600 s
   staged.addStage(&sigMotPol, 0);
   powerMgr.policy = &staged;
 
@@ -1440,10 +1440,22 @@ void loop() {
   // ── PowerManager tick while sleeping ──────────────────────────────────
   // ShakeSleepPolicy: wakes every 30s, calls modeOn() + drainFifo(), looks
   // for 0x19 (shake). If found → exitSleep(). If not → modeSleep() + reset timer.
+  // After 4.5 min, StagedPolicy advances to SigMotionSleepPolicy (deep sleep).
   if (sleeping) {
+    static uint8_t lastStage = 0xFF;
+    uint8_t curStage = staged.currentStage;
+    if (curStage != lastStage) {
+      lastStage = curStage;
+      if (curStage == 0)
+        LOG_I("[Sleep] stage=0 light sleep (shake, 30s cycles)");
+      else
+        LOG_I("[Sleep] stage=1 deep sleep (SigMotion, INT-based)");
+    }
+
     if (powerMgr.tick(hw)) {
       LOG_I("[Sleep] PowerManager: wake event confirmed — exiting sleep");
       exitSleep();
+      lastStage = 0;
     }
     delay(10);
     return;  // skip dispatch, keepalive, DEADLOCK check, waitForEvent
