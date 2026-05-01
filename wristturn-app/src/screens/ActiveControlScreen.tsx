@@ -6,11 +6,12 @@ import MCI from "react-native-vector-icons/MaterialCommunityIcons";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { StackScreenProps } from "@react-navigation/stack";
 import type { RootStackParams } from "../navigation/AppNavigator";
-import { useBLE, setActiveComboMap, startCalibration, sendBaselineToFirmware } from "../ble/useBLE";
+import { useBLE, setActiveComboMap, startCalibration, sendBaselineToFirmware, lastFireMs } from "../ble/useBLE";
 import { BatteryWave } from "../ui/BatteryWave";
 import { PoseHUD } from "../ui/PoseHUD";
 import { CalibrationOverlay } from "./CalibrationOverlay";
 import { SessionRecorder } from "../debug/SessionRecorder";
+import { DebugLog }        from "../debug/DebugLog";
 import { registry } from "../devices/registry/DeviceRegistry";
 import { MappingStore } from "../mapping/MappingStore";
 import type { ComboMap, Baseline } from "../types";
@@ -76,7 +77,7 @@ export function ActiveControlScreen({ route, navigation }: Props) {
     MappingStore.get(deviceId, proxy.defaultMapping()).then((m) => {
       setMap(m);
       mapRef.current = m;
-      setActiveComboMap(Object.keys(m));
+      setActiveComboMap(m);
     });
     proxy.connect().then(() => setDeviceConnected(true)).catch(console.error);
     return () => { proxy.disconnect(); setDeviceConnected(false); };
@@ -101,23 +102,26 @@ export function ActiveControlScreen({ route, navigation }: Props) {
       resetIdleTimer();
       if (gesture === Gesture.SHAKE && !lockedRef.current) navigation.goBack();
     },
-    onCombo: async (combo) => {
-      setActiveCombo(combo);
+    onCombo: async (action) => {
+      const tDispatch = Date.now();
+      DebugLog.push("TIMING", `dispatch ${action} +${tDispatch - lastFireMs()}ms`); // T4: fire→dispatch (React notify cycle)
+      setActiveCombo(action);
       animateGesture();
-      const commandId = mapRef.current[combo];
-      if (!commandId || !proxy || !meta) return;
-      SessionRecorder.recordCommand(commandId, meta.id);
-      if (commandId.startsWith("deeplink:")) {
-        const url = commandId.slice("deeplink:".length);
+      if (!proxy || !meta) return;
+      SessionRecorder.recordCommand(action, meta.id);
+      if (action.startsWith("deeplink:")) {
+        const url = action.slice("deeplink:".length);
         setLastCmd(url);
-        await proxy.sendCommand({ id: commandId, label: url, payload: { link: url } });
+        await proxy.sendCommand({ id: action, label: url, payload: { link: url } });
+        DebugLog.push("TIMING", `sent ${action} +${Date.now() - tDispatch}ms`); // T5: dispatch→sent
         return;
       }
-      const cmd = meta.availableCommands.find((c) => c.id === commandId);
+      const cmd = meta.availableCommands.find((c) => c.id === action);
       if (!cmd) return;
       setLastCmd(cmd.label);
       try {
         await proxy.sendCommand(cmd);
+        DebugLog.push("TIMING", `sent ${action} +${Date.now() - tDispatch}ms`); // T5: dispatch→sent
       } catch (e) {
         console.error("[ActiveControl] sendCommand error:", e);
       }

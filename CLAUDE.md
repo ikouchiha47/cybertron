@@ -1,10 +1,39 @@
-# WristTurn — Dev Cycle
+# RUNE
 
-Applies to all components: firmware, app (frontend/core), adapter (backend), hardware.
+Control smart devices at a distance using gestures. One can control tv, smart bulbs, smart plug.
+It is also possible to run a client on other devices, and map gestures to actions. This allows switching between desktops or screens and monitors.
+
+It's like an universal air-mouse. I mean you dont need an accent to control a smart device. (alexa :wink: :wink:)
+
+> Caution: Your grandma might start dancing to chammak challo.
+
+The initial version of this app uses a 9-axis DOF to handle only gesture based recognisiton.
+The whole system has been divided into two parts.
+
+- The device firmware is responsible for gesture segmentation and handling events sent from the client.
+- The mobile application is the client which acts as a bridge between: `gesture - device + execution`
+
+This has been done, because it allows:
+- Quickly experimenting with matching algorithms, (cpp is not my forte rn, and I aint trusting an llm with things i d k)
+- Running some AI or pattern matching system, reduce complex operations to reduce battery consumption and heating.
+- Deaing with optimizations for space and stuff.
+
+However as a con, the device needs to be able to be connected to BLE. And that's not great, especially on a bare, `nRF52840`
+
+Delivery Targets:
+
+|-------|---------------|
+| **RUNE-I** |  Might just ship to real users with this. Needing the mobile device reachable. Have OTA updates. |
+| **RUNE-II** | Push more of computation and device storage stuff on device or an added memory module. OTA and APP updates |
+| **RUNE-III** | Complex gestures, or DMT running either in firmware or on device. Might split it into `3A` and `3B` |
+| **RUNE-IV** | Custom PCB with a lower profile and maybe an IR transmitter receiver|
+| **RUNE-V** | Introducing EMG pads to enable |
 
 ---
 
 ## Dev cycle
+
+Applies to all components: firmware, app (frontend/core), adapter (backend), hardware.
 
 1. **Understand the problem in the real world first.** What does a real user actually
    do? What are the physical constraints, edge cases, failure modes? Write those down

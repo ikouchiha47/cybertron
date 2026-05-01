@@ -1,5 +1,19 @@
 # WristTurn Firmware — Claude instructions
 
+## Hardware
+
+| Component | Part | Notes |
+|-----------|------|-------|
+| MCU | Seeed XIAO nRF52840 Sense | BLE 5.0, ARM Cortex-M4, 256KB RAM, 1MB flash |
+| IMU | Bosch BNO085 (SH-2) | 9-DOF fusion, rotation vector, shake/tap/step/sig-motion |
+| Battery | LiPo single-cell | Managed by onboard BQ25101 charger (CHRG pin = P0.17) |
+| Interface | I2C (QWIIC) | BNO085 SDA→D4, SCL→D5, addr 0x4B |
+| INT pin | BNO085 → XIAO D1 (P0.03) | FALLING edge, INPUT_PULLUP. Used for WFE wake and sleep/wake detection |
+
+**Nothing else on the board is used.** No LSM6DS3, no PDM mic (powered down in setup), no external flash.
+
+---
+
 ## Flashing
 
 Use the Arduino IDE or `arduino-cli`. Target board: **Seeed XIAO nRF52840 Sense**.

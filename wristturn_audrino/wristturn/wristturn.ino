@@ -15,6 +15,7 @@
  *   - bluefruit.h (built into Seeed nRF52840 board package – no install needed)
  */
 
+#include "PowerManager.h"
 #include "StillnessDetector.h"
 #include "gesture/GestureDetector.h"
 #include "log.h"
@@ -231,6 +232,15 @@ unsigned long lastPingMs = 0;
 const unsigned long PING_INTERVAL_MS = 3000;
 ShakeDetector shake;
 
+// ── Adaptive rotation-vector rate ────────────────────────────────────────────
+// 50Hz (20ms) when motion detected; drops to 10Hz (100ms) after device has
+// been still (stab ≤ 2) for IDLE_RATE_DROP_MS.
+static constexpr uint32_t RV_INTERVAL_ACTIVE_MS = 20;   // 50Hz
+static constexpr uint32_t RV_INTERVAL_IDLE_MS   = 100;  // 10Hz
+static constexpr unsigned long IDLE_RATE_DROP_MS = 5000; // 5s still → drop rate
+static bool     rvAtIdleRate    = false;
+static unsigned long rvIdleSinceMs = 0; // when device first went still
+
 // ── Sleep / wake
 // ────────────────────────────────────────────────────────────── Define
 // DEBUG_SLEEP to use 30s timeout for bench testing sleep/wake via serial.
@@ -245,6 +255,54 @@ bool sleeping = false;
 unsigned long lastMotionMs = 0;
 unsigned long sleepStartMs = 0; // when enterSleep() was called
 static const unsigned long MIN_SLEEP_MS = 10000;
+
+// ── PowerManager wiring ──────────────────────────────────────────────────────
+// Concrete IHardware that delegates to the BNO085 driver.
+// drainFifo(): polls getSensorEvent() for msMax ms, tracking the last event ID.
+// Breaks early on INT going HIGH (all events drained) to avoid over-spinning.
+struct WristTurnHW : IHardware {
+  uint8_t _lastId = 0;
+
+  void modeSleep() override { imu.modeSleep(); }
+
+  void modeOn() override { imu.modeOn(); delay(50); }
+
+  void drainFifo(uint32_t msMax) override {
+    _lastId = 0;
+    unsigned long start = millis();
+    while ((millis() - start) < msMax) {
+      if (imu.getSensorEvent()) {
+        uint8_t eid = imu.getSensorEventID();
+        if (eid) {
+          _lastId = eid;
+          if (eid == WAKE_SENSOR_SHAKE || eid == WAKE_SENSOR_SIGMOTION)
+            break;
+        }
+      }
+      if (digitalRead(BNO085_INT_PIN) == HIGH && (millis() - start) > 20)
+        break;
+      delayMicroseconds(2000);
+    }
+  }
+
+  bool configureSensor(uint8_t sensorId, uint32_t intervalUs,
+                       bool wakeupEnabled) override {
+    sh2_SensorConfig_t cfg = {};
+    cfg.reportInterval_us = intervalUs;
+    cfg.wakeupEnabled = wakeupEnabled;
+    return sh2_setSensorConfig((sh2_SensorId_t)sensorId, &cfg) == SH2_OK;
+  }
+
+  uint8_t lastDrainedEventId() override { return _lastId; }
+  bool    intPinLow()          override { return digitalRead(BNO085_INT_PIN) == LOW; }
+  uint32_t nowMs()             override { return (uint32_t)millis(); }
+};
+
+WristTurnHW         hw;
+ShakeSleepPolicy    shakePol(30000);   // 30 s light-sleep cycles
+SigMotionSleepPolicy sigMotPol;
+StagedPolicy        staged;
+PowerManager        powerMgr;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 float quaternionToRoll(float w, float x, float y, float z) {
@@ -272,7 +330,29 @@ float quaternionToYaw(float w, float x, float y, float z) {
 // #define ENABLE_STEP
 #define ENABLE_GRYO
 
+// ── Shake-to-wake report interval ────────────────────────────────────────────
+// Controls the BNO085 native shake detector's reportInterval_us in modeSleep().
+//
+// OPTION A (default): 2000000 µs (0.5 Hz). Longer interval → fewer ack events
+//   during the MIN_SLEEP_MS drain window → less spurious activity. Max wake
+//   latency after a real shake: ~2 s.
+//
+// OPTION B (#define SOFT_SHAKE_WAKE): 200000 µs (5 Hz). Original behaviour —
+//   same code as before logs.35. Use this to compare against Option A.
+//
+// #define SOFT_SHAKE_WAKE
+
+#ifdef SOFT_SHAKE_WAKE
+static constexpr uint32_t SHAKE_WAKE_INTERVAL_US = 200000;  // 5 Hz — original
+#else
+static constexpr uint32_t SHAKE_WAKE_INTERVAL_US = 2000000; // 0.5 Hz — Option A
+#endif
+
 void enableReports() {
+  // Reset adaptive rate state — always start at 50Hz on arm/wake.
+  rvAtIdleRate  = false;
+  rvIdleSinceMs = 0;
+
   LOG_I("[Reports] enable start rawMode=%d armed=%d sleeping=%d", rawMode,
         armed, sleeping);
   LOG_I("[Reports] INT pin %d level before config=%d", BNO085_INT_PIN,
@@ -280,8 +360,9 @@ void enableReports() {
   // Rotation vector needed for rawMode streaming or when armed (knob/symbol
   // modes)
   if (rawMode || armed) {
-    if (imu.enableRotationVector(20))
-      LOG_I("[Reports] rotation vector enabled");
+    if (imu.enableRotationVector(RV_INTERVAL_ACTIVE_MS))
+      LOG_I("[Reports] rotation vector enabled at %ums (%uHz)",
+            RV_INTERVAL_ACTIVE_MS, 1000 / RV_INTERVAL_ACTIVE_MS);
     else
       LOG_E("BNO085: could not enable Rotation Vector");
   }
@@ -490,14 +571,10 @@ void enterSleep() {
     delay(50);
   }
   // ── Power-optimised sleep: stop advertising entirely ──────────────────
-  // With the INT pin shake-to-wake path, BLE advertising is no longer needed
-  // as a CPU wake source. Stopping advertising drops nRF52840 sleep current
-  // from ~1.5mA (SoftDevice active + periodic advertising) to ~5-7µA
-  // (SoftDevice idle, WFE with GPIO-only wake).
-  //
-  // Wake path: BNO085 shake detector asserts INT LOW → GPIO interrupt wakes
-  // nRF52840 from WFE → loop() detects INT LOW → modeOn() + exitSleep()
-  // → advertising restarts at fast interval for phone reconnection.
+  // Wake path: PowerManager.tick() runs a software timer (30s cycles).
+  // On each cycle: modeOn() + drain FIFO + check for shake (0x19). If found
+  // → exitSleep() + advertising restarts at fast interval for reconnect.
+  // After 4.5 min: transitions to SigMotion deep sleep (always-on INT wake).
   //
   // Trade-off: phone cannot reconnect via BLE while sleeping. User must
   // shake to wake first, then the phone can reconnect within a few seconds.
@@ -518,29 +595,12 @@ void enterSleep() {
   imu.enableReport(SENSOR_REPORTID_LINEAR_ACCELERATION, 0);
   imu.enableReport(SENSOR_REPORTID_STABILITY_CLASSIFIER, 0);
   imu.enableReport(SENSOR_REPORTID_GYROSCOPE_CALIBRATED, 0);
-  // Arm hardware shake detector as wake source via sh2_setSensorConfig()
-  // directly. imu.enableReport() hardcodes wakeupEnabled=false — without
-  // wakeupEnabled=true the BNO085 runs the detector internally but never
-  // asserts INT to wake the nRF52840.
-  {
-    sh2_SensorConfig_t cfg = {};
-    cfg.reportInterval_us = 200000; // 5Hz evaluation rate
-    cfg.wakeupEnabled =
-        true; // assert INT on event to wake host from modeSleep()
-    int status = sh2_setSensorConfig(SH2_SHAKE_DETECTOR, &cfg);
-    LOG_I("[Sleep] shake detector wakeup armed: %s (status=%d)",
-          status == SH2_OK ? "OK" : "FAIL", status);
-  }
-
-  // Drain residual events from the FIFO before sleeping.
-  // The enableReport(..., 0) and sh2_setSensorConfig() calls above generate
-  // acknowledgment events that assert INT LOW. If we modeSleep() with INT
-  // still LOW, the loop() INT check fires immediately on the next iteration
-  // and tries to wake the hub — defeating the purpose of sleep.
+  // Drain FIFO: clear any ack events from the enableReport(0) calls above
+  // so INT goes HIGH before modeSleep(). This prevents immediate false wakes.
   {
     uint8_t preDrained = 0;
     unsigned long drainStart = millis();
-    while (digitalRead(BNO085_INT_PIN) == 0 && (millis() - drainStart) < 300) {
+    while (digitalRead(BNO085_INT_PIN) == LOW && (millis() - drainStart) < 300) {
       imu.getSensorEvent();
       preDrained++;
       delayMicroseconds(2000);
@@ -550,10 +610,8 @@ void enterSleep() {
   }
 
   blinkLED(LED_BLUE, 1, 80, 0);
-  // Put SH-2 hub into low-power sleep. Must be matched by modeOn() in
-  // exitSleep().
-  imu.modeSleep();
-  LOG_I("[Sleep] BNO085 SH-2 sleep — waiting for shake to wake");
+  // Hand off to PowerManager: starts staged policy (ShakeSleepPolicy → SigMotion)
+  powerMgr.onInactivity(hw);
 }
 
 void exitSleep() {
@@ -563,15 +621,13 @@ void exitSleep() {
   lastMotionMs = millis();
   LOG_I("[Sleep] waking — restoring reports");
 
-  // NOTE: modeOn() and event drain have already been done by the INT pin
-  // detection code in loop() (or by onConnect()). The SH-2 hub is awake
-  // and the FIFO is drained by the time we get here.
-  // If called from onConnect() (BLE reconnect wakes device), we still need
-  // to ensure the hub is on — modeOn() is idempotent, safe to call twice.
+  // PowerManager.tick() already called modeOn() + drainFifo() before returning
+  // true. If exitSleep is called from onConnect() (BLE reconnect path), the hub
+  // may not have been woken yet — modeOn() is idempotent, safe to call again.
   imu.modeOn();
   delay(50); // settle time
 
-  // Drain any remaining events (safety net)
+  // Safety-net drain in case onConnect() woke us without a prior modeOn/drain.
   uint8_t drained = 0;
   unsigned long drainStart = millis();
   while (digitalRead(BNO085_INT_PIN) == 0 && (millis() - drainStart) < 200) {
@@ -585,17 +641,6 @@ void exitSleep() {
   }
 
   enableReports(); // restores all reports at their original rates
-  // Re-arm SHAKE_DETECTOR as wake source for the next sleep cycle.
-  // SHAKE_DETECTOR is one-shot — after it fires it must be explicitly
-  // re-configured with wakeupEnabled=true, or subsequent sleeps have no wake source.
-  {
-    sh2_SensorConfig_t cfg = {};
-    cfg.reportInterval_us = 200000; // 5 Hz evaluation rate
-    cfg.wakeupEnabled = true;
-    int status = sh2_setSensorConfig(SH2_SHAKE_DETECTOR, &cfg);
-    LOG_I("[Sleep] shake detector wakeup re-armed: %s (status=%d)",
-          status == SH2_OK ? "OK" : "FAIL", status);
-  }
   LOG_I("[Sleep] reports restored — restarting BLE advertising for reconnect");
   // Advertising was fully stopped in enterSleep() — restart at fast interval
   Bluefruit.Advertising.setInterval(32, 244);
@@ -904,6 +949,14 @@ void setup() {
   Bluefruit.Advertising.restartOnDisconnect(true);
   Bluefruit.Advertising.start(0);
   lastMotionMs = millis();
+
+  // ── PowerManager: assemble staged sleep policy ──────────────────────────
+  // Stage 0: light sleep (shake-based, software timer, 30s cycles) for 4.5 min.
+  // Stage 1: deep sleep (SH2_SIGNIFICANT_MOTION with wakeupEnabled) forever.
+  staged.addStage(&shakePol, 270UL * 1000UL);  // 4.5 min = 270 s
+  staged.addStage(&sigMotPol, 0);
+  powerMgr.policy = &staged;
+
   LOG_I("BLE advertising as 'RUNE-I'.");
   blinkLED(LED_BLUE, 4, 100, 100); // ★ 4 blinks = setup complete, entering loop
 }
@@ -1236,6 +1289,7 @@ static void handleRotationVector() {
 }
 
 static void handleStabilityClassifier() {
+  if (sleeping) return;
   uint8_t stab = imu.getStabilityClassifier();
   unsigned long now = millis();
 
@@ -1271,6 +1325,34 @@ static void handleStabilityClassifier() {
       uint8_t sn = pkt_stab(sbuf, stab);
       stateChar.notify(sbuf, sn);
     }
+  }
+
+  // ── Adaptive RV rate ───────────────────────────────────────────────────
+  // MOTION (stab=4) → snap to 50Hz immediately.
+  // STATIONARY/TABLE (stab≤2) → drop to 10Hz after 5s, but only in non-gesture
+  //   modes. In gesture mode the arm rests at stab=3 between gestures — dropping
+  //   rate there would clip the start of the next gesture.
+  // STABLE (stab=3) → reset idle timer in all modes; user is holding arm up.
+  if (!armed) return;
+
+  if (stab >= 4) { // MOTION
+    rvIdleSinceMs = 0;
+    if (rvAtIdleRate) {
+      rvAtIdleRate = false;
+      imu.enableRotationVector(RV_INTERVAL_ACTIVE_MS);
+      LOG_I("[RVRate] motion → 50Hz");
+    }
+  } else if (stab <= STABILITY_STATIONARY && currentMode != MODE_GESTURE) {
+    // knob/symbol mode + device on table → allow rate drop
+    if (rvIdleSinceMs == 0) rvIdleSinceMs = now;
+    if (!rvAtIdleRate && (now - rvIdleSinceMs) >= IDLE_RATE_DROP_MS) {
+      rvAtIdleRate = true;
+      imu.enableRotationVector(RV_INTERVAL_IDLE_MS);
+      LOG_I("[RVRate] still >5s (mode=%u) → 10Hz", currentMode);
+    }
+  } else {
+    // stab=3, or stab≤2 in gesture mode — reset idle timer, stay at current rate
+    rvIdleSinceMs = 0;
   }
 }
 
@@ -1355,59 +1437,16 @@ void loop() {
     enableReports();
   }
 
-  // Deferred wakeup — significant motion sets this flag inside getSensorEvent()
-  // dispatch; we consume it here in clean loop() context before the next I2C
-  // poll.
-  if (pendingExitSleep) {
-    pendingExitSleep = false;
-    LOG_I("[Sleep] pendingExitSleep consumed — calling exitSleep()");
-    if (sleeping)
+  // ── PowerManager tick while sleeping ──────────────────────────────────
+  // ShakeSleepPolicy: wakes every 30s, calls modeOn() + drainFifo(), looks
+  // for 0x19 (shake). If found → exitSleep(). If not → modeSleep() + reset timer.
+  // After 10 min, StagedPolicy advances to SigMotionSleepPolicy (INT-based deep sleep).
+  if (sleeping) {
+    if (powerMgr.tick(hw)) {
+      LOG_I("[Sleep] PowerManager: wake event confirmed — exiting sleep");
       exitSleep();
-  }
-
-  // ── Shake-to-wake: INT pin check while SH-2 hub is asleep ─────────────
-  // When the BNO085 is in modeSleep(), wake-enabled sensors (shake detector)
-  // continue to run internally. On a wake event the BNO085 asserts INT LOW.
-  // However the SH-2 transport is asleep — getSensorEvent()/sh2_service()
-  // cannot read I2C until we first send modeOn(). So we detect the wake
-  // event via the raw INT pin level, wake the hub, then drain the event.
-  if (sleeping && digitalRead(BNO085_INT_PIN) == LOW) {
-    unsigned long elapsed = millis() - sleepStartMs;
-    if (elapsed >= MIN_SLEEP_MS) {
-      LOG_I("[Sleep] INT pin LOW while sleeping (elapsed=%lums) — waking SH-2 "
-            "hub");
-      // Wake the SH-2 hub so I2C reads work again
-      imu.modeOn();
-      delay(50); // settle time for hub wake
-      // Drain the pending shake event from the FIFO
-      uint8_t drained = 0;
-      unsigned long drainStart = millis();
-      while (digitalRead(BNO085_INT_PIN) == 0 &&
-             (millis() - drainStart) < 200) {
-        if (imu.getSensorEvent()) {
-          uint8_t eid = imu.getSensorEventID();
-          LOG_I("[Sleep] drained event 0x%02X during wake", eid);
-        }
-        drained++;
-        delayMicroseconds(2000);
-      }
-      LOG_I("[Sleep] wake drain: %u cycles, INT=%d — scheduling exitSleep",
-            drained, digitalRead(BNO085_INT_PIN));
-      pendingExitSleep = true;
-    } else {
-      // Too soon after sleep — ignore. This is likely a residual INT assertion
-      // from pre-sleep config commands, or a shake that happened too early.
-      // WE MUST DRAIN IT! If we leave INT LOW, the FALLING edge interrupt will
-      // never fire again, and waitForEvent() will hang the CPU permanently.
-      LOG_I("[Sleep] INT pin LOW during MIN_SLEEP_MS window (elapsed=%lums) — draining to clear INT", elapsed);
-      imu.modeOn();
-      delay(50);
-      while (digitalRead(BNO085_INT_PIN) == LOW) {
-        imu.getSensorEvent();
-        delayMicroseconds(2000);
-      }
-      imu.modeSleep(); // put SH-2 hub back to sleep
     }
+    delay(10);
   }
 
   bool imuReset = imu.wasReset();

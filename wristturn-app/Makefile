@@ -60,6 +60,7 @@ clean:
 test:
 	bun src/gestures/__tests__/MotionClassifier.test.ts
 	bun src/ble/__tests__/StatePacket.test.ts
+	bun src/gestures/__tests__/InteractionEngine.test.ts
 
 # Full wipe — node_modules + native cache + rebuild from scratch
 nuke:

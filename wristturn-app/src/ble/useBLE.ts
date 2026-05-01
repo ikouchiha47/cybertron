@@ -1,8 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { ComboEngine }       from "../gestures/ComboEngine";
-import { filterGesture, isSnap } from "../gestures/GestureFilter";
+import { InteractionEngine } from "../gestures/InteractionEngine";
+import type { InteractionRule } from "../gestures/InteractionEngine";
 import { validateComboMap }  from "../gestures/ComboValidator";
-import { HoldDetector }      from "../gestures/HoldDetector";
 import { KnobEngagement }    from "../gestures/KnobEngagement";
 import { ModeManager }       from "../gestures/ModeManager";
 import { MotionClassifier }  from "../gestures/MotionClassifier";
@@ -11,7 +10,7 @@ import { SymbolCapture }     from "../gestures/SymbolCapture";
 import { DebugLog }          from "../debug/DebugLog";
 import { SessionRecorder }   from "../debug/SessionRecorder";
 import { parseGesturePayload, INTERACTION_MODE, Mode, ArmPose, Gesture } from "../types";
-import type { RawSample, InteractionModeValue }  from "../types";
+import type { RawSample, InteractionModeValue, ComboMap }  from "../types";
 import { BLEServiceNative }  from "./BLEServiceNative";
 import { PrefsStore }        from "../mapping/PrefsStore";
 
@@ -62,13 +61,86 @@ function notify() {
   listeners.forEach((l) => l(snapshot));
 }
 
-// ── Singleton gesture/combo engine ───────────────────────────────────────────
+// ── Snap classification (pre-filter, before engine) ──────────────────────────
 
-const engine = new ComboEngine((combo) => {
-  // tap,tap,tap is reserved for mode cycling — handled by tap counter below
-  state.lastCombo = combo;
+const SNAP_PEAK_THRESHOLD = 4.5; // rad/s — above this = snap, not a command
+
+// ── ComboMap → InteractionRule conversion ────────────────────────────────────
+
+const _OPPOSITE: Record<string, string> = {
+  turn_right: "turn_left",  turn_left:  "turn_right",
+  pitch_up:   "pitch_down", pitch_down: "pitch_up",
+  yaw_right:  "yaw_left",   yaw_left:   "yaw_right",
+};
+
+function comboMapToRules(map: ComboMap): InteractionRule[] {
+  const rules: InteractionRule[] = [];
+
+  // shake is always highest priority, no refractory, arms gobble window
+  if (map["shake"]) {
+    rules.push({ type: "terminal", token: "shake", action: map["shake"], refractoryMs: 0, gobbleMs: 500 });
+  }
+
+  const multi: Array<[string[], string]> = [];
+  const single: Array<[string, string]>  = [];
+
+  for (const [combo, action] of Object.entries(map)) {
+    if (combo === "shake") continue;
+    if (combo.startsWith("knob_tick") || combo.startsWith("symbol:")) continue;
+    const parts = combo.split(",");
+    if (parts.length > 1) multi.push([parts, action]);
+    else single.push([combo, action]);
+  }
+
+  // Longer sequences first so a 3-token rule takes priority over a 2-token prefix.
+  multi.sort((a, b) => b[0].length - a[0].length);
+
+  for (const [parts, action] of multi) {
+    const allSame = parts.every((p) => p === parts[0]);
+    if (allSame && parts.length >= 3) {
+      // Triple same gesture = repeat rule (hold intent)
+      const opp = _OPPOSITE[parts[0]];
+      rules.push({ type: "repeat", tokens: parts, windowMs: 600, action, intervalMs: 300, cancelOn: opp ? [opp] : [] });
+    } else {
+      rules.push({ type: "sequence", tokens: parts, windowMs: 300, action });
+    }
+  }
+
+  for (const [token, action] of single) {
+    rules.push({ type: "terminal", token, action, refractoryMs: 200, snapBackMs: 500 });
+  }
+
+  return rules;
+}
+
+// ── Pipeline timing ───────────────────────────────────────────────────────────
+// Tracks T1→T2→T3 within useBLE. T4 (dispatch) and T5 (sent) are logged by
+// ActiveControlScreen which calls markDispatch() / markSent().
+
+let _tRecv = 0;  // T1: BLE packet arrived (set at onGesture entry)
+let _tPush = 0;  // T2: token entered engine
+
+export function lastFireMs(): number { return _tFire; }
+let _tFire = 0;  // T3: engine fired — exported so ActiveControlScreen can compute T3→T4
+
+function _logTiming(stage: string, label: string, since: number) {
+  const now = Date.now();
+  DebugLog.push("TIMING", `${stage} ${label} +${now - since}ms`);
+  return now;
+}
+
+// ── Singleton gesture engine ──────────────────────────────────────────────────
+
+let gestureRules: InteractionRule[] = [];
+
+const engine = new InteractionEngine((action) => {
+  // Internal mode-commit actions are routed directly, not dispatched to device
+  if (action === "knob_commit")     { knobEngagement?.commit(); return; }
+  if (action === "symbol_finalize") { symbolCapture?.finalize(); return; }
+  _tFire = _logTiming("fire", action, _tPush);
+  state.lastCombo = action;
   state.comboSeq += 1;
-  SessionRecorder.recordCombo(combo);
+  SessionRecorder.recordCombo(action);
   notify();
 });
 
@@ -84,26 +156,42 @@ export function applyMode(mode: InteractionModeValue): void {
   modeManager?.setMode(modeStr);
 }
 
-export function setActiveComboMap(combos: string[]): void {
+export function setActiveComboMap(map: ComboMap): void {
   if (__DEV__) {
-    const map = Object.fromEntries(combos.map((c) => [c, true]));
     const errors = validateComboMap(map);
     if (errors.length > 0) {
       console.warn("[ComboValidator] invalid combos in active map:\n" + errors.join("\n"));
     }
   }
-  engine.setRegisteredCombos(combos);
+  gestureRules = comboMapToRules(map);
+  const mode = modeManager?.getMode() ?? Mode.GESTURE;
+  if (mode === Mode.GESTURE) engine.setRules(gestureRules);
 }
 
 // ── Singleton mode + interaction modules (created once in startRuntime) ──────
 
 let modeManager:       ModeManager       | null = null;
 let knobEngagement:    KnobEngagement    | null = null;
-let holdDetector:      HoldDetector      | null = null;
 let symbolCapture:     SymbolCapture     | null = null;
 let motionClassifier:  MotionClassifier  | null = null;
 let lastRawSample:     RawSample = { roll: 0, pitch: 0, yaw: 0 };
 let lastDeltaSample:   RawSample = { roll: 0, pitch: 0, yaw: 0 };
+
+// Triple pitch_down = commit intent for KNOB/SYMBOL modes
+let pitchDownCount = 0;
+let pitchDownTimer: ReturnType<typeof setTimeout> | null = null;
+
+function handlePitchDownForHold(onTriple: () => void) {
+  pitchDownCount++;
+  if (pitchDownTimer) clearTimeout(pitchDownTimer);
+  if (pitchDownCount >= 3) {
+    pitchDownCount = 0;
+    pitchDownTimer = null;
+    onTriple();
+    return;
+  }
+  pitchDownTimer = setTimeout(() => { pitchDownCount = 0; pitchDownTimer = null; }, 600);
+}
 
 // Simple triple-tap detector (separate from combo engine so it's always active)
 let tapCount = 0;
@@ -140,22 +228,36 @@ function startRuntime() {
 
   // ── Interaction mode modules ──
 
+  const KNOB_RULES: InteractionRule[] = [
+    { type: "sequence", tokens: ["pitch_down","pitch_down","pitch_down"], windowMs: 600, action: "knob_commit" },
+  ];
+  const SYMBOL_RULES: InteractionRule[] = [
+    { type: "sequence", tokens: ["pitch_down","pitch_down","pitch_down"], windowMs: 600, action: "symbol_finalize" },
+  ];
+
   modeManager = new ModeManager({
     onModeChange(mode) {
       state.interactionMode = mode;
       state.knobEngaged     = false;
       state.symbolCapturing = false;
+      pitchDownCount = 0;
+      if (pitchDownTimer) { clearTimeout(pitchDownTimer); pitchDownTimer = null; }
       notify();
       DebugLog.push("MODE", `switched to ${mode}`);
 
-       const modeVal = mode === Mode.GESTURE ? INTERACTION_MODE.GESTURE
-                     : mode === Mode.KNOB    ? INTERACTION_MODE.KNOB
-                     :                        INTERACTION_MODE.SYMBOL;
-       BLEServiceNative.setMode(modeVal).catch(() => {});
+      const modeVal = mode === Mode.GESTURE ? INTERACTION_MODE.GESTURE
+                    : mode === Mode.KNOB    ? INTERACTION_MODE.KNOB
+                    :                        INTERACTION_MODE.SYMBOL;
+      BLEServiceNative.setMode(modeVal).catch(() => {});
 
-       // Clean up engagement state on mode switch
-       knobEngagement?.forceExit();
-       symbolCapture?.cancel();
+      // Swap engine rule set for the new mode
+      if (mode === Mode.KNOB)        engine.setRules(KNOB_RULES);
+      else if (mode === Mode.SYMBOL) engine.setRules(SYMBOL_RULES);
+      else                           engine.setRules(gestureRules);
+
+      // Clean up engagement state on mode switch
+      knobEngagement?.forceExit();
+      symbolCapture?.cancel();
     },
   });
 
@@ -171,14 +273,8 @@ function startRuntime() {
     },
   });
 
-  holdDetector = new HoldDetector((evt) => {
-    DebugLog.push("GESTURE", evt);
-    const mode = modeManager?.getMode() ?? Mode.GESTURE;
-    if (mode === Mode.KNOB)   { knobEngagement?.commit(); return; }
-    if (mode === Mode.SYMBOL) { symbolCapture?.finalize(); return; }
-    // In gesture mode, pitch_down_hold dispatches as a combo key
-    dispatchSyntheticCombo(evt);
-  });
+  // Tick the engine every 100ms so repeat rules fire even between gesture events
+  setInterval(() => engine.tick(Date.now()), 100);
 
   motionClassifier = new MotionClassifier({
     onStateChange(mcState) {
@@ -262,6 +358,7 @@ function startRuntime() {
   });
 
   BLEServiceNative.onGesture((p) => {
+    _tRecv = Date.now(); // T1: BLE packet received by app
     const event = parseGesturePayload(
       [p.name, p.roll, p.pitch, p.yaw, p.delta]
         .filter((v) => v !== undefined && v !== null)
@@ -278,11 +375,17 @@ function startRuntime() {
     // Always track taps for mode-cycling (triple-tap)
     if (event.name === Gesture.TAP) handleTapForModeCycle();
 
-    // Always update hold detector
-    if (event.name === Gesture.PITCH_DOWN) {
-      holdDetector?.onPitchDown(lastRawSample);
-    } else {
-      holdDetector?.onOtherGesture();
+    // Snap: high-velocity reset gesture — log and discard, never reaches engine
+    const snap = (event.peakRate ?? 0) >= SNAP_PEAK_THRESHOLD;
+    if (snap) {
+      const snapName = event.name === Gesture.TURN_RIGHT ? "snap_right"
+                     : event.name === Gesture.TURN_LEFT  ? "snap_left"
+                     : event.name;
+      const axes = event.roll !== undefined
+        ? ` r=${event.roll.toFixed(1)} p=${event.pitch?.toFixed(1)} y=${event.yaw?.toFixed(1)}`
+        : "";
+      DebugLog.push("GESTURE", `snap ${snapName} pk=${event.peakRate?.toFixed(2)}${axes}`);
+      return;
     }
 
     // Mode-specific gesture routing
@@ -292,7 +395,8 @@ function startRuntime() {
         return;
       }
       if (event.name === Gesture.PITCH_DOWN) {
-        knobEngagement?.cancel();
+        // Triple pitch_down = commit; single/double time out silently
+        handlePitchDownForHold(() => knobEngagement?.commit());
         state.lastGesture = event.name;
         notify();
         return;
@@ -306,41 +410,27 @@ function startRuntime() {
         return;
       }
       if (event.name === Gesture.PITCH_DOWN) {
-        symbolCapture?.cancel();
+        handlePitchDownForHold(() => symbolCapture?.finalize());
         return;
       }
       // Suppress other gestures while capturing
       return;
     }
 
-    // GESTURE mode: refractory + snap classification + combo dispatch
-    const axes = event.roll  !== undefined
-      ? ` r=${event.roll?.toFixed(1)} p=${event.pitch?.toFixed(1)} y=${event.yaw?.toFixed(1)}${event.delta !== undefined ? ` d=${event.delta?.toFixed(1)}` : ""}`
+    // GESTURE mode — engine handles refractory, snap-back, gobble, sequences, repeats
+    const axes = event.roll !== undefined
+      ? ` r=${event.roll.toFixed(1)} p=${event.pitch?.toFixed(1)} y=${event.yaw?.toFixed(1)}${event.delta !== undefined ? ` d=${event.delta.toFixed(1)}` : ""}`
       : "";
-    const snap = isSnap(event.peakRate ?? 0);
-    if (!filterGesture(event.name, event.peakRate)) {
-      DebugLog.push("GESTURE", `suppressed:${axes} ${event.name}`);
-      return;
-    }
-    if (snap) {
-      // Snap: high-velocity reset gesture — log but don't dispatch as a command.
-      // Does not arm snap-back cooldown or refractory (filterGesture skipped those).
-      const snapName = event.name === Gesture.TURN_RIGHT ? "snap_right"
-                     : event.name === Gesture.TURN_LEFT  ? "snap_left"
-                     : event.name;
-      DebugLog.push("GESTURE", `snap ${snapName} pk=${event.peakRate?.toFixed(2)}${axes}`);
-      return;
-    }
     DebugLog.push("GESTURE", `${event.name}${axes}`);
     SessionRecorder.recordGesture(event);
     state.lastGesture = event.name;
     notify();
-    engine.push(event.name);
+    _tPush = _logTiming("push", event.name, _tRecv); // T2: recv→push (parse + mode routing)
+    engine.push(event.name, _tPush);
   });
 
   BLEServiceNative.onRaw?.((p) => {
     lastRawSample = p;
-    holdDetector?.onRaw(p);
     const mode = modeManager?.getMode() ?? Mode.GESTURE;
     if (mode === Mode.SYMBOL) symbolCapture?.onRaw(p);
     SessionRecorder.recordRaw(p);
