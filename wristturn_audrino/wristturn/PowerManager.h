@@ -53,7 +53,7 @@ struct ISleepPolicy {
 
 static constexpr uint8_t  WAKE_SENSOR_SHAKE   = 0x19;
 static constexpr uint8_t  WAKE_SENSOR_SIGMOTION = 0x12;
-static constexpr uint32_t SHAKE_POLL_INTERVAL_US  = 200000UL;   // 200ms
+static constexpr uint32_t SHAKE_POLL_INTERVAL_US  = 10000UL;    // 10ms — must be << drainFifo window so event arrives before INT-HIGH early exit
 static constexpr uint32_t SIGMOTION_INTERVAL_US   = 2000000UL;  // 2s
 
 // ── Concrete policies ────────────────────────────────────────────────────────

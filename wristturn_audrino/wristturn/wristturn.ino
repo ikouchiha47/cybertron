@@ -279,7 +279,7 @@ struct WristTurnHW : IHardware {
             break;
         }
       }
-      if (digitalRead(BNO085_INT_PIN) == HIGH && (millis() - start) > 20)
+      if (digitalRead(BNO085_INT_PIN) == HIGH && (millis() - start) > 150)
         break;
       delayMicroseconds(2000);
     }
