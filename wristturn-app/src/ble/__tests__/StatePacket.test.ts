@@ -159,6 +159,73 @@ test("truncated GRAV returns null", () => {
   assert.equal(parseStatePacket(new Uint8Array([PKT.GRAV])), null);
 });
 
+// ── PKT_POSE_EXT ───────────────────────────────────────────────────────────
+//
+// Extended pose packet that adds per-sample gyro magnitude. Required by
+// HoldDetector's SettleGate (UNIFIED_GESTURE_DESIGN.md §"Core primitive").
+// Wire layout: u8 tag | i16 roll_dd | i16 pitch_dd | i16 yaw_dd | u16 gyro_mag_ddps
+// 9 bytes total. Magnitude in deci-dps (divide by 10 → dps), range 0–6553 dps.
+
+section("PKT_POSE_EXT (Loop C.0 contract)");
+
+test("SIZE.ANGLES_EXT === 9", () => assert.equal(SIZE.ANGLES_EXT, 9));
+
+test("PKT.POSE_EXT === 0x08", () => assert.equal(PKT.POSE_EXT, 0x08));
+
+test("parses pose_ext with zero gyro", () => {
+  const bytes = new Uint8Array(SIZE.ANGLES_EXT);
+  bytes[0] = PKT.POSE_EXT;
+  writeI16LE(bytes, 1, 100);   // roll = 10.0°
+  writeI16LE(bytes, 3, -200);  // pitch = -20.0°
+  writeI16LE(bytes, 5, 50);    // yaw = 5.0°
+  writeI16LE(bytes, 7, 0);     // gyro_mag = 0.0 dps
+  const pkt = parseStatePacket(bytes);
+  assert.deepEqual(pkt, { type: "pose_ext", roll: 10.0, pitch: -20.0, yaw: 5.0, gyroMagDps: 0.0 });
+});
+
+test("parses pose_ext with mid-range gyro", () => {
+  const bytes = new Uint8Array(SIZE.ANGLES_EXT);
+  bytes[0] = PKT.POSE_EXT;
+  writeI16LE(bytes, 1, 0);
+  writeI16LE(bytes, 3, 0);
+  writeI16LE(bytes, 5, 0);
+  // u16 magnitude = 250 ddps → 25.0 dps
+  bytes[7] = 250 & 0xFF;
+  bytes[8] = (250 >> 8) & 0xFF;
+  const pkt = parseStatePacket(bytes);
+  assert.equal((pkt as any).gyroMagDps, 25.0);
+});
+
+test("parses pose_ext with high gyro near u16 max", () => {
+  const bytes = new Uint8Array(SIZE.ANGLES_EXT);
+  bytes[0] = PKT.POSE_EXT;
+  writeI16LE(bytes, 1, 0);
+  writeI16LE(bytes, 3, 0);
+  writeI16LE(bytes, 5, 0);
+  // u16 = 6000 ddps → 600 dps (typical fast flick peak)
+  bytes[7] = 6000 & 0xFF;
+  bytes[8] = (6000 >> 8) & 0xFF;
+  const pkt = parseStatePacket(bytes);
+  assert.equal((pkt as any).gyroMagDps, 600.0);
+});
+
+test("truncated pose_ext returns null", () => {
+  const bytes = new Uint8Array([PKT.POSE_EXT, 0, 0, 0, 0, 0, 0, 0]); // 8 bytes, need 9
+  assert.equal(parseStatePacket(bytes), null);
+});
+
+test("pose_ext over the latin1 bridge", () => {
+  const bytes = new Uint8Array(SIZE.ANGLES_EXT);
+  bytes[0] = PKT.POSE_EXT;
+  writeI16LE(bytes, 1, 50);
+  writeI16LE(bytes, 3, 0);
+  writeI16LE(bytes, 5, 0);
+  bytes[7] = 100 & 0xFF;
+  bytes[8] = (100 >> 8) & 0xFF;
+  const pkt = parseStatePacket(bytesToLatin1(bytes));
+  assert.deepEqual(pkt, { type: "pose_ext", roll: 5.0, pitch: 0, yaw: 0, gyroMagDps: 10.0 });
+});
+
 // ── Error cases ────────────────────────────────────────────────────────────
 
 section("Error handling");

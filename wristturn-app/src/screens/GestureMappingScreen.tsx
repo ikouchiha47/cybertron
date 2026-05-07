@@ -7,6 +7,7 @@ import type { StackScreenProps } from "@react-navigation/stack";
 import type { RootStackParams } from "../navigation/AppNavigator";
 import { registry } from "../devices/registry/DeviceRegistry";
 import { MappingStore } from "../mapping/MappingStore";
+import { validateCombo } from "../gestures/ComboValidator";
 import type { ComboMap } from "../types";
 import { useBLE } from "../ble/useBLE";
 import { PoseHUD } from "../ui/PoseHUD";
@@ -25,7 +26,13 @@ export function GestureMappingScreen({ route, navigation }: Props) {
   const { deviceId } = route.params;
   const meta  = registry.get(deviceId);
   const proxy = registry.getProxy(deviceId);
-  const { pose, connected } = useBLE();
+  const { pose, connected, lastGesture } = useBLE();
+
+  // Canary: trace whether the screen is actually receiving gesture updates so a
+  // future regression where `lastGesture` stops propagating is visible in adb.
+  useEffect(() => {
+    if (lastGesture) console.log(`[CANARY:GMS] lastGesture=${lastGesture}`);
+  }, [lastGesture]);
 
   const [map, setMap]           = useState<ComboMap>({});
   const [editEntry, setEditEntry] = useState<string | null>(null); // combo being edited, or "__new__"
@@ -78,6 +85,12 @@ export function GestureMappingScreen({ route, navigation }: Props) {
     const combo = editCombo.trim();
     if (!combo) {
       Alert.alert("Error", "Gesture/combo cannot be empty");
+      return;
+    }
+    const validationErr = validateCombo(combo);
+    if (validationErr) {
+      console.log("[CV] reject combo on save:", combo, validationErr);
+      Alert.alert("Invalid combo", validationErr);
       return;
     }
     const commandId = actionType === "deeplink"

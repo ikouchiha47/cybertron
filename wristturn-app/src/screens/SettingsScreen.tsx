@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
   View, Text, FlatList, TouchableOpacity, Pressable, TextInput,
-  StyleSheet, Alert, ActivityIndicator,
+  StyleSheet, Alert, ActivityIndicator, Switch,
 } from "react-native";
 import type { CompositeScreenProps } from "@react-navigation/native";
 import type { StackScreenProps } from "@react-navigation/stack";
@@ -9,11 +9,9 @@ import type { BottomTabScreenProps } from "@react-navigation/bottom-tabs";
 import type { TabParams, RootStackParams } from "../navigation/AppNavigator";
 import { registry } from "../devices/registry/DeviceRegistry";
 import { useMDNSDiscovery } from "../discovery/useMDNSDiscovery";
-import { useBLE, applyMode, sendBaselineToFirmware } from "../ble/useBLE";
+import { useBLE, sendBaselineToFirmware, setSymbolMode } from "../ble/useBLE";
 import { BaselineStore } from "../storage/BaselineStore";
 import { PrefsStore } from "../mapping/PrefsStore";
-import { INTERACTION_MODE } from "../types";
-import type { InteractionModeValue } from "../types";
 import { AndroidTV } from "../../modules/androidtv";
 import { ANDROIDTV_COMMANDS } from "../devices/adapters/AndroidTVAdapter";
 import { WIZ_COMMANDS } from "../devices/adapters/WizAdapter";
@@ -25,12 +23,6 @@ type Props = CompositeScreenProps<
   BottomTabScreenProps<TabParams, "Settings">,
   StackScreenProps<RootStackParams>
 >;
-
-const MODE_LABELS: Record<InteractionModeValue, string> = {
-  [INTERACTION_MODE.GESTURE]: "Gesture",
-  [INTERACTION_MODE.KNOB]:    "Knob",
-  [INTERACTION_MODE.SYMBOL]:  "Symbol",
-};
 
 export function handleRecalibrateHome(wristAddress: string) {
   if (!wristAddress) return;
@@ -45,9 +37,15 @@ export function handleRecalibrateHome(wristAddress: string) {
         onPress: async () => {
           try {
             await BaselineStore.clear(wristAddress);
-            await sendBaselineToFirmware({ roll: -999, pitch: -999, yaw: -999 }).catch(() => {});
+            // -999 tells firmware to drop its baseline. The actual capture
+            // ceremony (with overlay UI) runs when user returns to Home and
+            // Discovery's focus listener arms the device + listens for the
+            // resulting PKT_BASELINE. Settings does NOT arm — that would
+            // start a ceremony invisibly while user is on this screen.
+            await sendBaselineToFirmware({ roll: -999, pitch: -999, yaw: -999 });
             Alert.alert("Baseline Cleared", "Please return to the Home screen to recalibrate.");
           } catch (e: any) {
+            console.error("[Settings] recalibrate error:", e);
             Alert.alert("Error", String(e?.message ?? e));
           }
         },
@@ -58,12 +56,24 @@ export function handleRecalibrateHome(wristAddress: string) {
 
 export function SettingsScreen({ navigation }: Props) {
   const { connected, wristName, wristAddress, motionState } = useBLE();
-  const [defaultMode, setDefaultMode] = useState<InteractionModeValue>(INTERACTION_MODE.GESTURE);
+  const [symbolMode, setSymbolModeState] = useState<boolean>(false);
+  const [holdDetectorEnabled, setHoldDetectorEnabled] = useState<boolean>(false);
   const { devices: discovered, scanning, rescan } = useMDNSDiscovery();
 
   useEffect(() => {
-    PrefsStore.getDefaultMode().then(setDefaultMode).catch(() => {});
+    PrefsStore.getSymbolModeEnabled().then(setSymbolModeState).catch(() => {});
+    PrefsStore.getExperimentalHoldDetector().then(setHoldDetectorEnabled).catch(() => {});
   }, []);
+
+  function toggleSymbolMode(next: boolean) {
+    setSymbolModeState(next);
+    setSymbolMode(next).catch(() => {});
+  }
+
+  function toggleHoldDetector(next: boolean) {
+    setHoldDetectorEnabled(next);
+    PrefsStore.setExperimentalHoldDetector(next).catch(() => {});
+  }
   const [saved, setSaved] = useState<DeviceMetadata[]>([]);
   const [showAddForm, setShowAddForm] = useState(false);
   const [wizScanning, setWizScanning] = useState(false);
@@ -296,21 +306,38 @@ export function SettingsScreen({ navigation }: Props) {
           )}
         </View>
         <View style={[s.editPanel, { paddingTop: 10 }]}>
-          <Text style={[s.label, { marginTop: 0, marginBottom: 6 }]}>Default mode on connect</Text>
-          <View style={s.segmented}>
-            {([INTERACTION_MODE.GESTURE, INTERACTION_MODE.KNOB, INTERACTION_MODE.SYMBOL] as const).map((m) => (
-              <TouchableOpacity
-                key={m}
-                style={[s.seg, defaultMode === m && s.segActive]}
-                onPress={() => {
-                  setDefaultMode(m);
-                  PrefsStore.setDefaultMode(m).catch(() => {});
-                  if (connected) applyMode(m);
-                }}
-              >
-                <Text style={[s.segText, defaultMode === m && s.segTextActive]}>{MODE_LABELS[m]}</Text>
-              </TouchableOpacity>
-            ))}
+          <View style={s.toggleRow}>
+            <View style={{ flex: 1 }}>
+              <Text style={s.toggleTitle}>Symbol mode</Text>
+              <Text style={s.toggleSub}>
+                Tap to start a symbol capture; triple pitch-down to finalize.
+                While on, flick combos and holds are suppressed.
+              </Text>
+            </View>
+            <Switch
+              value={symbolMode}
+              onValueChange={toggleSymbolMode}
+              trackColor={{ false: "#2a2a2a", true: "#1e3a5f" }}
+              thumbColor={symbolMode ? "#4a9eff" : "#666"}
+            />
+          </View>
+
+          {/* Experimental: position-domain hold detector. Requires firmware
+              that emits PKT_POSE_EXT (already flashed if you can read this). */}
+          <View style={s.toggleRow}>
+            <View style={{ flex: 1 }}>
+              <Text style={s.toggleTitle}>Hold detector (experimental)</Text>
+              <Text style={s.toggleSub}>
+                Position-domain auto-repeat & cruise-lock for sustained
+                deflections. Reads PKT_POSE_EXT (gyro magnitude on the wire).
+              </Text>
+            </View>
+            <Switch
+              value={holdDetectorEnabled}
+              onValueChange={toggleHoldDetector}
+              trackColor={{ false: "#2a2a2a", true: "#1e3a5f" }}
+              thumbColor={holdDetectorEnabled ? "#4a9eff" : "#666"}
+            />
           </View>
         </View>
       </View>
@@ -431,4 +458,7 @@ const s = StyleSheet.create({
   segTextActive:{ color: "#4a9eff", fontSize: 12 },
   empty:        { color: "#444", fontSize: 14 },
   dot:          { width: 7, height: 7, borderRadius: 4 },
+  toggleRow:    { flexDirection: "row", alignItems: "center", marginTop: 12, gap: 12 },
+  toggleTitle:  { color: "#fff", fontSize: 14 },
+  toggleSub:    { color: "#666", fontSize: 11, marginTop: 2 },
 });

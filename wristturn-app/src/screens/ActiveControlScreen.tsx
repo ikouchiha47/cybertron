@@ -6,7 +6,7 @@ import MCI from "react-native-vector-icons/MaterialCommunityIcons";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { StackScreenProps } from "@react-navigation/stack";
 import type { RootStackParams } from "../navigation/AppNavigator";
-import { useBLE, setActiveComboMap, startCalibration, sendBaselineToFirmware, lastFireMs } from "../ble/useBLE";
+import { useBLE, setActiveComboMap, sendBaselineToFirmware, armDevice, requestRecalibration, lastFireMs, recalibrate, resetMotionClassifier } from "../ble/useBLE";
 import { BatteryWave } from "../ui/BatteryWave";
 import { PoseHUD } from "../ui/PoseHUD";
 import { CalibrationOverlay } from "./CalibrationOverlay";
@@ -15,7 +15,7 @@ import { DebugLog }        from "../debug/DebugLog";
 import { registry } from "../devices/registry/DeviceRegistry";
 import { MappingStore } from "../mapping/MappingStore";
 import type { ComboMap, Baseline } from "../types";
-import { Gesture, Mode, ArmPose } from "../types";
+import { Gesture, ArmPose } from "../types";
 
 type Props = StackScreenProps<RootStackParams, "ActiveControl">;
 
@@ -33,10 +33,20 @@ export function ActiveControlScreen({ route, navigation }: Props) {
   const [locked, setLocked] = useState(false);  // when true, idle timeout is disabled
   const insets = useSafeAreaInsets();
 
-  // Knob mode: always null on mount — triggers fresh calibration each session.
-  // Gesture mode: set from homeBaseline once interactionMode is known.
-  const [sessionBaseline, setSessionBaseline] = useState<Baseline | null>(null);
+  // Per-session calibration. Every AC entry captures a fresh PKT_BASELINE
+  // from firmware. homeBaseline is taken as a hint (Discovery passes it) but
+  // we still re-arm + recalibrate so the baseline reflects the user's *current*
+  // wrist pose, not the one captured at home-screen time.
+  const [sessionBaseline,    setSessionBaseline]    = useState<Baseline | null>(null);
   const [sessionCalibrating, setSessionCalibrating] = useState(false);
+
+  // Fence: snapshot of baselineCandidate.seq taken when we issue the recalib
+  // request. The completion effect ignores any candidate with seq ≤ this.
+  const calibSnapshotSeqRef = useRef<number | null>(null);
+  // Fires *once* per mount. Without this, the safety timeout flipping
+  // sessionCalibrating back to false would re-trigger the calibration effect
+  // and keep clearing firmware state — baseline would never finish capturing.
+  const calibAttemptedRef = useRef(false);
 
   const armHangTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -97,7 +107,7 @@ export function ActiveControlScreen({ route, navigation }: Props) {
     ]).start();
   }
 
-  const { connected, lastGesture, lastCombo, batteryPct, interactionMode, pose, baselineCandidate, armPose } = useBLE({
+  const { connected, lastGesture, lastCombo, batteryPct, pose, baselineCandidate, armPose } = useBLE({
     onGesture: (gesture) => {
       resetIdleTimer();
       if (gesture === Gesture.SHAKE && !lockedRef.current) navigation.goBack();
@@ -128,46 +138,82 @@ export function ActiveControlScreen({ route, navigation }: Props) {
     },
   });
 
-  // ── Session calibration for knob mode ──────────────────────────────────────
-  // Triggered when interactionMode becomes "knob" AND no session baseline yet.
-  // Handles async mode-settle race (ModeManager may set knob after mount).
+  // ── Per-device-selection-session MotionClassifier lifecycle ───────────────
+  // The persistent home baseline (Discovery) restores firmware orientation
+  // across reboots, but the app-side MotionClassifier is ephemeral: a fresh
+  // ceremony runs on every session entry, and its state is forgotten on exit.
+  // Without this, MC would stay `uncalibrated` after the first ever connect,
+  // silently breaking the delta path (knob ticks, motionState transitions).
   useEffect(() => {
-    if (!interactionMode) return;
-    console.log(`[AC] calibEff interactionMode=${interactionMode} homeBaseline=${!!homeBaseline} sessionBaseline=${!!sessionBaseline}`);
-    if (interactionMode === Mode.GESTURE && homeBaseline && !sessionBaseline) {
-      setSessionBaseline(homeBaseline);
-      return;
-    }
-    if (interactionMode !== Mode.KNOB || sessionBaseline) return;
-    setSessionCalibrating(true);
-    startCalibration();
-  }, [interactionMode, sessionBaseline]);
+    console.log("[CANARY:AC_MC_ENTER] session start — recalibrate()");
+    recalibrate();
+    return () => {
+      console.log("[CANARY:AC_MC_EXIT] session end — resetMotionClassifier()");
+      resetMotionClassifier();
+    };
+  }, []);
 
-  // Complete session calibration — prefer fresh firmware PKT_BASELINE; fall back
-  // to homeBaseline when firmware hasn't re-sent one yet (cleared by reconnect).
+  // Session baseline acquisition. Two paths:
+  //  1. homeBaseline passed via route params (Discovery flow): adopt directly.
+  //  2. No homeBaseline (Settings → openDevice flow, or post-wipe): arm the
+  //     device and request a fresh PKT_BASELINE; adopt when it arrives.
+  // The firmware-only path is also what knob mode used to do, generalised
+  // here because every active session now needs a baseline.
   useEffect(() => {
-    if (!sessionCalibrating) return;
-    const candidate = baselineCandidate ?? homeBaseline;
-    if (!candidate) return;
-    const baseline: Baseline = {
-      roll: candidate.roll,
-      pitch: candidate.pitch,
-      yaw: candidate.yaw,
+    if (sessionBaseline) return;
+    if (homeBaseline) { setSessionBaseline(homeBaseline); return; }
+    if (calibAttemptedRef.current) return;       // already tried this mount
+    calibAttemptedRef.current = true;
+
+    console.log("[AC] no homeBaseline — requesting firmware recalibration");
+    setSessionCalibrating(true);
+    armDevice()
+      .then(() => requestRecalibration())
+      .then((snapshot) => {
+        calibSnapshotSeqRef.current = snapshot;
+        console.log(`[AC] recalibration snapshot seq=${snapshot}`);
+      })
+      .catch((e) => console.error("[AC] requestRecalibration failed:", e));
+  }, [homeBaseline, sessionBaseline]);
+
+  // Adopt fresh PKT_BASELINE that arrives after our request (seq > snapshot).
+  useEffect(() => {
+    if (!sessionCalibrating || !baselineCandidate) return;
+    const snap = calibSnapshotSeqRef.current;
+    if (snap === null || baselineCandidate.seq <= snap) return;
+    console.log(`[AC] adopting fresh baseline seq=${baselineCandidate.seq}`);
+    setSessionBaseline({
+      roll:  baselineCandidate.roll,
+      pitch: baselineCandidate.pitch,
+      yaw:   baselineCandidate.yaw,
       timestamp: Date.now(),
       wristName: "",
       wristAddress: "",
-    };
-    setSessionBaseline(baseline);
-    sendBaselineToFirmware(baseline).catch(() => {});
+    });
     setSessionCalibrating(false);
-  }, [sessionCalibrating, baselineCandidate, homeBaseline]);
+    calibSnapshotSeqRef.current = null;
+  }, [sessionCalibrating, baselineCandidate]);
 
-  // While calibrating, keep resetting the idle timer so it never fires mid-calibration.
+  // Safety timeout: if firmware never sends a fresh baseline, give up and
+  // either fall through to homeBaseline (if any) or just hide the overlay so
+  // the user isn't stuck. 8s mirrors Discovery's E3b (firmware finalizes via
+  // 3s stable window or 12s hard deadline; the calibAttemptedRef guard above
+  // prevents re-fire on the (false→true) flip when this expires).
   useEffect(() => {
     if (!sessionCalibrating) return;
-    const iv = setInterval(() => resetIdleTimer(), (IDLE_TIMEOUT_MS / 2));
-    return () => clearInterval(iv);
-  }, [sessionCalibrating]);
+    const t = setTimeout(() => {
+      calibSnapshotSeqRef.current = null;
+      setSessionCalibrating(false);
+      if (homeBaseline) {
+        console.log("[AC] calibration timeout — falling back to homeBaseline");
+        setSessionBaseline({ ...homeBaseline, timestamp: Date.now() });
+        sendBaselineToFirmware(homeBaseline).catch(() => {});
+      } else {
+        console.warn("[AC] calibration timeout — no homeBaseline; hiding overlay");
+      }
+    }, 8000);
+    return () => clearTimeout(t);
+  }, [sessionCalibrating, homeBaseline]);
 
   // ── Arm-hang 2s auto-exit ─────────────────────────────────────────────────
   // When the gravity vector says arm is hanging (user dropped arm to side),
@@ -223,10 +269,14 @@ export function ActiveControlScreen({ route, navigation }: Props) {
 
   return (
     <View style={[s.container, { paddingBottom: insets.bottom + 16 }]}>
-      {/* Session calibration overlay (knob mode) */}
+      {/* Visible while we're waiting for a session baseline (either adopting
+          homeBaseline or capturing a fresh one from firmware). */}
       <CalibrationOverlay
-        visible={sessionCalibrating}
-        onSkip={() => setSessionCalibrating(false)}
+        visible={sessionCalibrating || !sessionBaseline}
+        onSkip={() => {
+          calibSnapshotSeqRef.current = null;
+          setSessionCalibrating(false);
+        }}
       />
 
       {/* Header */}

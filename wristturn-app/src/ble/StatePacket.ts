@@ -30,6 +30,19 @@
 //     u8  state
 //     i16 delta_dd
 //
+//   AnglesExtPacket (PKT.POSE_EXT)               9 bytes
+//     u8  tag
+//     i16 roll_dd       (little-endian, deci-degrees)
+//     i16 pitch_dd
+//     i16 yaw_dd
+//     u16 gyro_mag_ddps (little-endian, deci-dps; divide by 10 → dps)
+//
+//   POSE_EXT extends PKT.POSE with per-sample gyro magnitude. Required by
+//   HoldDetector's SettleGate (UNIFIED_GESTURE_DESIGN.md §"Core primitive").
+//   Firmware emission is added in Loop C.0 — until then, parser handles the
+//   shape but the firmware never sends it. App falls back to PKT.POSE if no
+//   POSE_EXT arrives.
+//
 // All multi-byte integers are little-endian. Angles are divided by 10 on parse.
 //
 // ────────────────────────────────────────────────────────────────────────────
@@ -43,6 +56,7 @@ export const PKT = {
   WAKE:     0x05,
   ARM_EVT:  0x06,
   GRAV:     0x07,
+  POSE_EXT: 0x08,  // pose + per-sample gyro magnitude (Loop C.0 firmware contract)
 } as const;
 
 /** Arm pose values carried in GravPacket. */
@@ -68,11 +82,12 @@ export const ARM_STATE = {
 
 /** Exact byte sizes of each packed wire struct. */
 export const SIZE = {
-  TAG_ONLY:   1,
-  STAB:       2,
-  ANGLES:     7,
-  ARM_EVT:    5,
-  GRAV:       2,
+  TAG_ONLY:    1,
+  STAB:        2,
+  ANGLES:      7,
+  ARM_EVT:     5,
+  GRAV:        2,
+  ANGLES_EXT:  9,   // ANGLES + u16 gyro_mag_ddps
 } as const;
 
 // ── Parsed-packet types ─────────────────────────────────────────────────────
@@ -80,6 +95,7 @@ export const SIZE = {
 export type StabPacket     = { type: "stab";     stab:  number };
 export type BaselinePacket = { type: "baseline"; roll:  number; pitch: number; yaw: number };
 export type PosePacket     = { type: "pose";     roll:  number; pitch: number; yaw: number };
+export type PoseExtPacket  = { type: "pose_ext"; roll:  number; pitch: number; yaw: number; gyroMagDps: number };
 export type SleepPacket    = { type: "sleep" };
 export type WakePacket     = { type: "wake" };
 export type ArmEvtPacket   = { type: "arm_evt"; axis: number; state: number; delta: number };
@@ -89,6 +105,7 @@ export type StatePacket =
   | StabPacket
   | BaselinePacket
   | PosePacket
+  | PoseExtPacket
   | SleepPacket
   | WakePacket
   | ArmEvtPacket
@@ -102,6 +119,13 @@ function readI16LEAngle(bytes: Uint8Array, offset: number): number {
   const hi = bytes[offset + 1];
   const raw = (((hi << 8) | lo) << 16) >> 16;   // sign-extend
   return raw / 10.0;
+}
+
+/** Read a little-endian uint16 and convert deci-dps → dps. */
+function readU16LEDps(bytes: Uint8Array, offset: number): number {
+  const lo = bytes[offset];
+  const hi = bytes[offset + 1];
+  return ((hi << 8) | lo) / 10.0;
 }
 
 /** Decode an AnglesPacket payload starting at offset 1 (skip tag). */
@@ -137,6 +161,14 @@ export function parseStatePacket(input: Uint8Array | string): StatePacket | null
     case PKT.POSE:
       if (bytes.length < SIZE.ANGLES) return null;
       return { type: "pose", ...parseAngles(bytes) };
+
+    case PKT.POSE_EXT:
+      if (bytes.length < SIZE.ANGLES_EXT) return null;
+      return {
+        type: "pose_ext",
+        ...parseAngles(bytes),
+        gyroMagDps: readU16LEDps(bytes, 7),
+      };
 
     case PKT.SLEEP: return { type: "sleep" };
     case PKT.WAKE:  return { type: "wake"  };

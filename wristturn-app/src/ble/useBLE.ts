@@ -2,15 +2,15 @@ import { useEffect, useRef, useState } from "react";
 import { InteractionEngine } from "../gestures/InteractionEngine";
 import type { InteractionRule } from "../gestures/InteractionEngine";
 import { validateComboMap }  from "../gestures/ComboValidator";
-import { KnobEngagement }    from "../gestures/KnobEngagement";
-import { ModeManager }       from "../gestures/ModeManager";
 import { MotionClassifier }  from "../gestures/MotionClassifier";
 import type { MotionState }  from "../gestures/MotionClassifier";
 import { SymbolCapture }     from "../gestures/SymbolCapture";
+import { HoldDetector }      from "../gestures/HoldDetector";
+import type { PoseSample }   from "../gestures/PoseSample";
 import { DebugLog }          from "../debug/DebugLog";
 import { SessionRecorder }   from "../debug/SessionRecorder";
-import { parseGesturePayload, INTERACTION_MODE, Mode, ArmPose, Gesture } from "../types";
-import type { RawSample, InteractionModeValue, ComboMap }  from "../types";
+import { parseGesturePayload, ArmPose, Gesture } from "../types";
+import type { ComboMap }  from "../types";
 import { BLEServiceNative }  from "./BLEServiceNative";
 import { PrefsStore }        from "../mapping/PrefsStore";
 
@@ -22,13 +22,17 @@ type SharedState = {
   lastCombo:    string;
   comboSeq:     number;
   batteryPct:   number | null;
-  interactionMode: "gesture" | "knob" | "symbol";
-  knobEngaged:  boolean;
+  symbolModeEnabled: boolean;
   symbolCapturing: boolean;
   motionState:  MotionState;
   sleeping:     boolean;
   baselineReady:boolean;
-  baselineCandidate: { roll: number; pitch: number; yaw: number } | null;
+  // `seq` is a monotonic counter bumped on every PKT_BASELINE. Consumers track
+  // the last `seq` they processed and ignore anything ≤ that — fencing tokens.
+  // Without this, a candidate captured during one calibration round (e.g. on
+  // DiscoveryScreen) would be re-consumed by a later calibration request (e.g.
+  // ActiveControlScreen knob mode) without firmware ever sending a fresh one.
+  baselineCandidate: { roll: number; pitch: number; yaw: number; seq: number } | null;
   // Live pose from firmware (current vs baseline) — for calibration HUD
   pose: { roll: number; pitch: number; yaw: number; baseRoll: number; basePitch: number; baseYaw: number } | null;
   // Gravity-based arm pose — null until first PKT_GRAV arrives after connect
@@ -43,8 +47,7 @@ const state: SharedState = {
   lastCombo:       "",
   comboSeq:        0,
   batteryPct:      null,
-  interactionMode: "gesture",
-  knobEngaged:     false,
+  symbolModeEnabled: false,
   symbolCapturing: false,
    motionState:     "uncalibrated",
    sleeping:        false,
@@ -60,6 +63,16 @@ function notify() {
   const snapshot = { ...state };
   listeners.forEach((l) => l(snapshot));
 }
+
+// ── Timing constants ─────────────────────────────────────────────────────────
+
+/** Engine + HoldDetector tick cadence (ms). 50ms worst-case latency on a 200ms
+ *  HoldDetector repeat interval is acceptable per UNIFIED_GESTURE_DESIGN.md. */
+const RUNTIME_TICK_MS         = 100;
+/** Window within which 3 pitch_down events are treated as a hold-commit. */
+const PITCH_DOWN_TRIPLE_MS    = 600;
+/** Sample rate at which a pose log line is emitted (1 in N). */
+const POSE_LOG_SAMPLE_RATE    = 0.05;
 
 // ── Snap classification (pre-filter, before engine) ──────────────────────────
 
@@ -86,7 +99,9 @@ function comboMapToRules(map: ComboMap): InteractionRule[] {
 
   for (const [combo, action] of Object.entries(map)) {
     if (combo === "shake") continue;
-    if (combo.startsWith("knob_tick") || combo.startsWith("symbol:")) continue;
+    // Synthetic keys (symbols, holds) bypass the engine — handled via direct
+    // dispatch in dispatchSyntheticCombo below.
+    if (combo.startsWith("symbol:") || combo.startsWith("hold:")) continue;
     const parts = combo.split(",");
     if (parts.length > 1) multi.push([parts, action]);
     else single.push([combo, action]);
@@ -132,10 +147,15 @@ function _logTiming(stage: string, label: string, since: number) {
 // ── Singleton gesture engine ──────────────────────────────────────────────────
 
 let gestureRules: InteractionRule[] = [];
+/**
+ * Snapshot of the active ComboMap. Held alongside `gestureRules` so synthetic
+ * keys (`symbol:*`, `hold:*`) — which the engine doesn't process — can still
+ * resolve to actions via direct lookup in dispatchSyntheticCombo.
+ */
+let activeMap: ComboMap = {};
 
 const engine = new InteractionEngine((action) => {
   // Internal mode-commit actions are routed directly, not dispatched to device
-  if (action === "knob_commit")     { knobEngagement?.commit(); return; }
   if (action === "symbol_finalize") { symbolCapture?.finalize(); return; }
   _tFire = _logTiming("fire", action, _tPush);
   state.lastCombo = action;
@@ -144,17 +164,54 @@ const engine = new InteractionEngine((action) => {
   notify();
 });
 
+/**
+ * Reset and re-run MotionClassifier's calibration ceremony.
+ *
+ * Called on every device-select session entry so the app-side classifier
+ * starts fresh — environment, wear, baseline drift may all have shifted
+ * since last session. Stab events from the firmware drive the ceremony
+ * to completion (1-2s typical) without any user prompt.
+ *
+ * Canary tag lets adb confirm this path actually ran on a given session.
+ */
 export function recalibrate(): void {
+  console.log("[CANARY:MC_RECAL] recalibrate() called — fresh MC ceremony");
   motionClassifier?.reset();
   motionClassifier?.startCalibration();
 }
 
-export function applyMode(mode: InteractionModeValue): void {
-  const modeStr = mode === INTERACTION_MODE.KNOB   ? Mode.KNOB
-                : mode === INTERACTION_MODE.SYMBOL ? Mode.SYMBOL
-                : Mode.GESTURE;
-  modeManager?.setMode(modeStr);
+/**
+ * Forget MotionClassifier state. Called on session exit so the next
+ * device-select doesn't inherit stale classifier state from a prior
+ * session — pairs with `recalibrate()` to bracket a session lifecycle.
+ */
+export function resetMotionClassifier(): void {
+  console.log("[CANARY:MC_RESET] resetMotionClassifier() called — session exit");
+  motionClassifier?.reset();
 }
+
+/**
+ * Toggle symbol-capture mode. Persisted via PrefsStore. While on, all gestures
+ * except TAP (start capture) and PITCH_DOWN×3 (finalize) are suppressed.
+ */
+export async function setSymbolMode(enabled: boolean): Promise<void> {
+  await PrefsStore.setSymbolModeEnabled(enabled);
+  state.symbolModeEnabled = enabled;
+  state.symbolCapturing   = false;
+  pitchDownCount = 0;
+  if (pitchDownTimer) { clearTimeout(pitchDownTimer); pitchDownTimer = null; }
+  engine.setRules(enabled ? SYMBOL_RULES : gestureRules);
+  symbolCapture?.cancel();
+  notify();
+  DebugLog.push("MODE", `symbolMode=${enabled}`);
+}
+
+// Pre-built rule set used while symbol mode is active. Matches the prior
+// in-startRuntime constant; promoted to module scope so setSymbolMode can
+// reuse it without re-running startRuntime.
+const SYMBOL_RULES: InteractionRule[] = [
+  { type: "sequence", tokens: ["pitch_down", "pitch_down", "pitch_down"], windowMs: 600, action: "symbol_finalize" },
+];
 
 export function setActiveComboMap(map: ComboMap): void {
   if (__DEV__) {
@@ -163,19 +220,28 @@ export function setActiveComboMap(map: ComboMap): void {
       console.warn("[ComboValidator] invalid combos in active map:\n" + errors.join("\n"));
     }
   }
+  activeMap    = map;
   gestureRules = comboMapToRules(map);
-  const mode = modeManager?.getMode() ?? Mode.GESTURE;
-  if (mode === Mode.GESTURE) engine.setRules(gestureRules);
+  if (!PrefsStore.symbolModeEnabledSync()) engine.setRules(gestureRules);
 }
 
-// ── Singleton mode + interaction modules (created once in startRuntime) ──────
+// ── Singleton interaction modules (created once in startRuntime) ─────────────
 
-let modeManager:       ModeManager       | null = null;
-let knobEngagement:    KnobEngagement    | null = null;
 let symbolCapture:     SymbolCapture     | null = null;
 let motionClassifier:  MotionClassifier  | null = null;
-let lastRawSample:     RawSample = { roll: 0, pitch: 0, yaw: 0 };
-let lastDeltaSample:   RawSample = { roll: 0, pitch: 0, yaw: 0 };
+let holdDetector:      HoldDetector      | null = null;
+/**
+ * Last per-sample gyro magnitude (dps). Sourced from PKT.POSE_EXT once
+ * firmware Loop C.0 lands. Until then, stays 0 → HoldDetector's transit gate
+ * never trips → detector silently no-ops, even with the experimental flag on.
+ */
+let lastGyroMagDps:    number = 0;
+
+// Monotonic across the lifetime of the JS runtime, including BLE reconnects.
+// Consumers snapshot this when initiating a calibration request and wait for
+// `state.baselineCandidate.seq > snapshot` to confirm a fresh capture.
+let _baselineSeq = 0;
+export function currentBaselineSeq(): number { return _baselineSeq; }
 
 // Triple pitch_down = commit intent for KNOB/SYMBOL modes
 let pitchDownCount = 0;
@@ -190,29 +256,25 @@ function handlePitchDownForHold(onTriple: () => void) {
     onTriple();
     return;
   }
-  pitchDownTimer = setTimeout(() => { pitchDownCount = 0; pitchDownTimer = null; }, 600);
+  pitchDownTimer = setTimeout(() => { pitchDownCount = 0; pitchDownTimer = null; }, PITCH_DOWN_TRIPLE_MS);
 }
 
-// Simple triple-tap detector (separate from combo engine so it's always active)
-let tapCount = 0;
-let tapTimer: ReturnType<typeof setTimeout> | null = null;
-
-function handleTapForModeCycle() {
-  tapCount++;
-  if (tapTimer) clearTimeout(tapTimer);
-  tapTimer = setTimeout(() => {
-    if (tapCount === 3 && modeManager) {
-      modeManager.cycleMode();
-    }
-    tapCount = 0;
-    tapTimer = null;
-  }, 350);
-}
-
-// Dispatch a synthesized event name directly as a combo (bypasses gesture filter)
-function dispatchSyntheticCombo(name: string) {
-  state.lastCombo = name;
+/**
+ * Dispatch a synthesized combo by *key*: looks up the active map, sets
+ * `state.lastCombo` to the resolved action (so onCombo subscribers receive an
+ * action — same shape as engine matches), bumps the seq, notifies. Used for
+ * symbol matches (`symbol:M`) and HoldDetector repeat fires (`hold:turn_right`).
+ * If no mapping exists, logs and skips — no spurious notifies.
+ */
+function dispatchSyntheticCombo(comboKey: string) {
+  const action = activeMap[comboKey];
+  if (!action) {
+    DebugLog.push("DISPATCH", `no map for ${comboKey}`);
+    return;
+  }
+  state.lastCombo = action;
   state.comboSeq += 1;
+  SessionRecorder.recordCombo(action);
   notify();
 }
 
@@ -226,55 +288,46 @@ function startRuntime() {
   if (runtimeStarted) return;
   runtimeStarted = true;
 
-  // ── Interaction mode modules ──
+  // Hydrate sync-readable prefs cache (experimentalHoldDetector flag) before
+  // any BLE callbacks fire. Failures here just leave the flag default-off.
+  PrefsStore.hydrate().catch(() => {});
 
-  const KNOB_RULES: InteractionRule[] = [
-    { type: "sequence", tokens: ["pitch_down","pitch_down","pitch_down"], windowMs: 600, action: "knob_commit" },
-  ];
-  const SYMBOL_RULES: InteractionRule[] = [
-    { type: "sequence", tokens: ["pitch_down","pitch_down","pitch_down"], windowMs: 600, action: "symbol_finalize" },
-  ];
+  // ── Interaction modules ──
 
-  modeManager = new ModeManager({
-    onModeChange(mode) {
-      state.interactionMode = mode;
-      state.knobEngaged     = false;
-      state.symbolCapturing = false;
-      pitchDownCount = 0;
-      if (pitchDownTimer) { clearTimeout(pitchDownTimer); pitchDownTimer = null; }
-      notify();
-      DebugLog.push("MODE", `switched to ${mode}`);
+  // Sync engine rules with the persisted symbol-mode flag once hydrated.
+  PrefsStore.hydrate().then(() => {
+    state.symbolModeEnabled = PrefsStore.symbolModeEnabledSync();
+    engine.setRules(state.symbolModeEnabled ? SYMBOL_RULES : gestureRules);
+    notify();
+  }).catch(() => {});
 
-      const modeVal = mode === Mode.GESTURE ? INTERACTION_MODE.GESTURE
-                    : mode === Mode.KNOB    ? INTERACTION_MODE.KNOB
-                    :                        INTERACTION_MODE.SYMBOL;
-      BLEServiceNative.setMode(modeVal).catch(() => {});
-
-      // Swap engine rule set for the new mode
-      if (mode === Mode.KNOB)        engine.setRules(KNOB_RULES);
-      else if (mode === Mode.SYMBOL) engine.setRules(SYMBOL_RULES);
-      else                           engine.setRules(gestureRules);
-
-      // Clean up engagement state on mode switch
-      knobEngagement?.forceExit();
-      symbolCapture?.cancel();
+  // Position-domain hold detector. Gated by PrefsStore.experimentalHoldDetector
+  // — when off, samples are still fed but the detector is bypassed at dispatch.
+  // Requires firmware that emits PKT_POSE_EXT (Loop C.0); on older firmware,
+  // lastGyroMagDps stays 0 so the transit gate never trips even with the flag on.
+  holdDetector = new HoldDetector({
+    onFire(token) {
+      DebugLog.push("HOLD", token);
+      // Hold fires resolve via the `hold:<token>` synthetic key in the active
+      // map. Same-axis flick combos are banned (Loop A) so there's no shadow.
+      dispatchSyntheticCombo(`hold:${token}`);
+    },
+    onStateChange(axis, dir, state2) {
+      console.log(`[HD] ${axis}${dir} → ${state2}`);
     },
   });
 
-  knobEngagement = new KnobEngagement({
-    onTick(direction) {
-      const tickName = direction > 0 ? "knob_tick+" : "knob_tick-";
-      DebugLog.push("KNOB", tickName);
-      dispatchSyntheticCombo(tickName);
-    },
-    onStateChange(knobState) {
-      state.knobEngaged = knobState === "engaged";
-      notify();
-    },
-  });
-
-  // Tick the engine every 100ms so repeat rules fire even between gesture events
-  setInterval(() => engine.tick(Date.now()), 100);
+  // Tick the engine every 100ms so repeat rules fire even between gesture events.
+  // HoldDetector piggybacks the same interval — see UNIFIED_GESTURE_DESIGN.md
+  // §"Visual feedback" / plan Loop C.2 for cadence rationale (50ms worst-case
+  // latency on a 200ms repeat is acceptable).
+  setInterval(() => {
+    const now = Date.now();
+    engine.tick(now);
+    if (PrefsStore.experimentalHoldDetectorSync()) {
+      holdDetector?.tick(now);
+    }
+  }, RUNTIME_TICK_MS);
 
   motionClassifier = new MotionClassifier({
     onStateChange(mcState) {
@@ -282,11 +335,10 @@ function startRuntime() {
       notify();
       DebugLog.push("MOTION", `state→${mcState}`);
     },
-    onMotion(type) {
-      // Only wrist rotation feeds the knob quantizer — arm resets are swallowed here
-      if (type !== "wrist_rotating") return;
-      const mode = modeManager?.getMode() ?? Mode.GESTURE;
-      if (mode === Mode.KNOB) knobEngagement?.onDelta(lastDeltaSample);
+    onMotion(_type) {
+      // Knob mode is gone — MotionClassifier still drives MOTION/STABLE state
+      // transitions for the calibration overlay, but no longer routes deltas.
+      // HoldDetector consumes deltas directly in BLEServiceNative.onDelta.
     },
   });
 
@@ -323,13 +375,13 @@ function startRuntime() {
     state.armPose      = null;
     // Do NOT start calibration here — DiscoveryScreen controls that
     DebugLog.push("BLE", `connected: ${p.name}`);
-    notify();
-    // Apply persisted default mode after connect
-    PrefsStore.getDefaultMode().then((mode) => {
-      if (mode !== INTERACTION_MODE.GESTURE) modeManager?.setMode(
-        mode === INTERACTION_MODE.KNOB ? Mode.KNOB : Mode.SYMBOL
-      );
+    // Apply persisted symbol-mode flag after connect.
+    PrefsStore.hydrate().then(() => {
+      state.symbolModeEnabled = PrefsStore.symbolModeEnabledSync();
+      engine.setRules(state.symbolModeEnabled ? SYMBOL_RULES : gestureRules);
+      notify();
     }).catch(() => {});
+    notify();
   });
 
   BLEServiceNative.onDisconnected(() => {
@@ -343,9 +395,7 @@ function startRuntime() {
     state.baselineCandidate = null;
     state.armPose         = null;
     motionClassifier?.reset();
-    // Reset to gesture mode on disconnect
-    modeManager?.setMode(Mode.GESTURE);
-    knobEngagement?.forceExit();
+    holdDetector?.reset();
     symbolCapture?.cancel();
     DebugLog.push("BLE", "disconnected");
     notify();
@@ -366,14 +416,27 @@ function startRuntime() {
     );
     if (!event || event.name === Gesture.IDLE) return;
 
-    const mode = modeManager?.getMode() ?? Mode.GESTURE;
+    // ── Engagement gate ──────────────────────────────────────────────────────
+    // Drop every gesture except shake when the arm is hanging at the user's
+    // side. Shake is reserved as the always-on system abort signal so the user
+    // can still escape from any screen even while disengaged. Knob ticks are
+    // synthesised from delta samples elsewhere and do not flow through here —
+    // gating them is a separate change inside MotionClassifier.
+    if (state.armPose === ArmPose.HANGING && event.name !== Gesture.SHAKE) {
+      DebugLog.push("GESTURE_DROP", `${event.name} dropped (armPose=hanging)`);
+      return;
+    }
+
+    const symbolMode = PrefsStore.symbolModeEnabledSync();
     const axesStr = event.roll !== undefined
       ? ` r=${event.roll?.toFixed(1)} p=${event.pitch?.toFixed(1)} y=${event.yaw?.toFixed(1)}${event.delta !== undefined ? ` d=${event.delta?.toFixed(2)}` : ""}${event.peakRate !== undefined ? ` pk=${event.peakRate?.toFixed(2)}` : ""}`
       : "";
-    DebugLog.push("GESTURE_RAW", `${event.name}${axesStr} [${mode}]`);
+    DebugLog.push("GESTURE_RAW", `${event.name}${axesStr}${symbolMode ? " [symbol]" : ""}`);
 
-    // Always track taps for mode-cycling (triple-tap)
-    if (event.name === Gesture.TAP) handleTapForModeCycle();
+    // Universal exit: shake resets the position FSM regardless of state.
+    // Engine-mapped shake action still fires through the normal terminal path
+    // — the FSM reset and engine fire are independent (design doc Q4).
+    if (event.name === Gesture.SHAKE) holdDetector?.onShake();
 
     // Snap: high-velocity reset gesture — log and discard, never reaches engine
     const snap = (event.peakRate ?? 0) >= SNAP_PEAK_THRESHOLD;
@@ -384,27 +447,12 @@ function startRuntime() {
       const axes = event.roll !== undefined
         ? ` r=${event.roll.toFixed(1)} p=${event.pitch?.toFixed(1)} y=${event.yaw?.toFixed(1)}`
         : "";
-      DebugLog.push("GESTURE", `snap ${snapName} pk=${event.peakRate?.toFixed(2)}${axes}`);
+      DebugLog.push("GESTURE", `SNAP_DISCARD ${snapName} pk=${event.peakRate?.toFixed(2)}${axes}`);
+      console.log(`[SNAP] Discarded ${snapName} with peakRate=${event.peakRate?.toFixed(2)} >= ${SNAP_PEAK_THRESHOLD}`);
       return;
     }
 
-    // Mode-specific gesture routing
-    if (mode === Mode.KNOB) {
-      if (event.name === Gesture.TAP) {
-        knobEngagement?.engage(lastRawSample);
-        return;
-      }
-      if (event.name === Gesture.PITCH_DOWN) {
-        // Triple pitch_down = commit; single/double time out silently
-        handlePitchDownForHold(() => knobEngagement?.commit());
-        state.lastGesture = event.name;
-        notify();
-        return;
-      }
-      // Other gestures in knob mode fall through to gesture-mode dispatch
-    }
-
-    if (mode === Mode.SYMBOL) {
+    if (symbolMode) {
       if (event.name === Gesture.TAP) {
         symbolCapture?.startCapture();
         return;
@@ -417,7 +465,7 @@ function startRuntime() {
       return;
     }
 
-    // GESTURE mode — engine handles refractory, snap-back, gobble, sequences, repeats
+    // Default routing — engine handles refractory, snap-back, gobble, sequences, repeats
     const axes = event.roll !== undefined
       ? ` r=${event.roll.toFixed(1)} p=${event.pitch?.toFixed(1)} y=${event.yaw?.toFixed(1)}${event.delta !== undefined ? ` d=${event.delta.toFixed(1)}` : ""}`
       : "";
@@ -425,22 +473,32 @@ function startRuntime() {
     SessionRecorder.recordGesture(event);
     state.lastGesture = event.name;
     notify();
-    _tPush = _logTiming("push", event.name, _tRecv); // T2: recv→push (parse + mode routing)
+    _tPush = _logTiming("push", event.name, _tRecv); // T2: recv→push (parse + routing)
     engine.push(event.name, _tPush);
   });
 
   BLEServiceNative.onRaw?.((p) => {
-    lastRawSample = p;
-    const mode = modeManager?.getMode() ?? Mode.GESTURE;
-    if (mode === Mode.SYMBOL) symbolCapture?.onRaw(p);
+    if (PrefsStore.symbolModeEnabledSync()) symbolCapture?.onRaw(p);
     SessionRecorder.recordRaw(p);
   });
 
   BLEServiceNative.onDelta?.((p) => {
-    lastDeltaSample = p;
-    // MotionClassifier classifies and routes to KnobEngagement via onMotion callback
     motionClassifier?.onDelta(p);
+    // Feed HoldDetector with the same delta + the most recent gyro magnitude.
+    // gyroMagDps comes from PKT_POSE_EXT (firmware Loop C.0); on older firmware
+    // it stays 0 and the detector silently no-ops via the transit gate.
+    if (PrefsStore.experimentalHoldDetectorSync()) {
+      const sample: PoseSample = {
+        delta: p,
+        gyroMagDps: lastGyroMagDps,
+        nowMs: Date.now(),
+      };
+      holdDetector?.onSample(sample);
+    }
   });
+
+  // ── DEBUG: Log gesture snap threshold ──
+  console.log(`[BLE] Snap threshold: ${SNAP_PEAK_THRESHOLD} rad/s`);
 
   // Baseline is published on PKT_BASELINE and held until it changes or disarm.
   // Pose packets only carry current r/p/y; we merge them with the last-known
@@ -462,22 +520,24 @@ function startRuntime() {
         motionClassifier?.onStabilityClass(pkt.stab, Date.now());
         break;
       }
-      case "baseline": {
-        lastBaseline = { r: pkt.roll, p: pkt.pitch, y: pkt.yaw };
-        state.baselineCandidate = { roll: pkt.roll, pitch: pkt.pitch, yaw: pkt.yaw };
-        console.log(`[BASELINE] r=${pkt.roll} p=${pkt.pitch} y=${pkt.yaw}`);
-        if (state.pose) {
-          state.pose = {
-            ...state.pose,
-            baseRoll:  pkt.roll,
-            basePitch: pkt.pitch,
-            baseYaw:   pkt.yaw,
-          };
-          notify();
-        }
-        notify();
-        break;
-      }
+  case "baseline": {
+    lastBaseline = { r: pkt.roll, p: pkt.pitch, y: pkt.yaw };
+    _baselineSeq += 1;
+    state.baselineCandidate = { roll: pkt.roll, pitch: pkt.pitch, yaw: pkt.yaw, seq: _baselineSeq };
+    console.log(`[BASELINE] FIRMWARE SENT baseline: r=${pkt.roll.toFixed(1)} p=${pkt.pitch.toFixed(1)} y=${pkt.yaw.toFixed(1)} seq=${_baselineSeq}`);
+    if (state.pose) {
+      state.pose = {
+        ...state.pose,
+        baseRoll:  pkt.roll,
+        basePitch: pkt.pitch,
+        baseYaw:   pkt.yaw,
+      };
+      notify();
+    }
+    notify();
+    console.log(`[BASELINE] notify() called, listeners updated`);
+    break;
+  }
       case "pose": {
         state.pose = {
           roll:  pkt.roll,
@@ -488,7 +548,7 @@ function startRuntime() {
           baseYaw:   lastBaseline?.y ?? 0,
         };
         // Sample log ~1/20 to avoid flooding (pose fires ~10Hz)
-        if (Math.random() < 0.05) {
+        if (Math.random() < POSE_LOG_SAMPLE_RATE) {
           const po = state.pose;
           console.log(
             `[POSE] r=${po.roll.toFixed(1)} p=${po.pitch.toFixed(1)} y=${po.yaw.toFixed(1)}` +
@@ -498,12 +558,37 @@ function startRuntime() {
         notify();
         break;
       }
+      case "pose_ext": {
+        // Loop C.0 firmware contract — pose + per-sample gyro magnitude.
+        // Update HUD pose AND cache gyro magnitude for HoldDetector input.
+        state.pose = {
+          roll:  pkt.roll,
+          pitch: pkt.pitch,
+          yaw:   pkt.yaw,
+          baseRoll:  lastBaseline?.r ?? 0,
+          basePitch: lastBaseline?.p ?? 0,
+          baseYaw:   lastBaseline?.y ?? 0,
+        };
+        lastGyroMagDps = pkt.gyroMagDps;
+        if (Math.random() < POSE_LOG_SAMPLE_RATE) {
+          console.log(
+            `[POSE_EXT] r=${pkt.roll.toFixed(1)} p=${pkt.pitch.toFixed(1)} y=${pkt.yaw.toFixed(1)}` +
+            ` gyro=${pkt.gyroMagDps.toFixed(1)} dps`
+          );
+        }
+        notify();
+        break;
+      }
       case "grav": {
         const poses = [ArmPose.FLAT, ArmPose.HANGING, ArmPose.RAISED] as const;
         const label = poses[pkt.pose] ?? null;
         if (label && label !== state.armPose) {
+          const prev = state.armPose;
           state.armPose = label;
           console.log(`[GravPose] armPose → ${label}`);
+          // HoldDetector universal exits on pose change
+          holdDetector?.onArmPoseChange(prev ?? "unknown", label);
+          holdDetector?.onGravPoseChange();
           notify();
         }
         break;
@@ -519,6 +604,7 @@ function startRuntime() {
 
   BLEServiceNative.onError?.((p) => {
     DebugLog.push("BLE_ERR", p.msg);
+    DebugLog.error(`BLE: ${p.msg}`);
   });
 
   // Sleep event: device is about to sleep; app should treat as disconnected
@@ -549,8 +635,7 @@ export function useBLE({ onGesture, onCombo }: UseBLEOptions = {}) {
   const [lastGesture,      setLastGesture]      = useState(state.lastGesture);
   const [lastCombo,        setLastCombo]        = useState(state.lastCombo);
   const [batteryPct,       setBatteryPct]       = useState(state.batteryPct);
-  const [interactionMode,  setInteractionMode]  = useState(state.interactionMode);
-  const [knobEngaged,      setKnobEngaged]      = useState(state.knobEngaged);
+  const [symbolModeEnabled, setSymbolModeEnabled] = useState(state.symbolModeEnabled);
   const [symbolCapturing,  setSymbolCapturing]  = useState(state.symbolCapturing);
   const [motionState,      setMotionState]      = useState(state.motionState);
   const [pose,             setPose]             = useState(state.pose);
@@ -570,8 +655,7 @@ export function useBLE({ onGesture, onCombo }: UseBLEOptions = {}) {
       setLastGesture(s.lastGesture);
       setLastCombo(s.lastCombo);
       setBatteryPct(s.batteryPct);
-      setInteractionMode(s.interactionMode);
-      setKnobEngaged(s.knobEngaged);
+      setSymbolModeEnabled(s.symbolModeEnabled);
       setSymbolCapturing(s.symbolCapturing);
       setMotionState(s.motionState);
       setPose(s.pose);
@@ -599,7 +683,7 @@ export function useBLE({ onGesture, onCombo }: UseBLEOptions = {}) {
 
    return {
      connected, wristName, wristAddress, lastGesture, lastCombo, batteryPct,
-     interactionMode, knobEngaged, symbolCapturing, motionState, pose,
+     symbolModeEnabled, symbolCapturing, motionState, pose,
      sleeping, baselineReady, baselineCandidate, armPose,
    };
  }
@@ -607,15 +691,18 @@ export function useBLE({ onGesture, onCombo }: UseBLEOptions = {}) {
 // ── Control functions for Discovery/ActiveControl ─────────────────────────────
 
 export function startCalibration(): void {
-  console.log("[BLE] startCalibration()");
+  console.log("[BLE] startCalibration() called");
   motionClassifier?.reset();
   motionClassifier?.startCalibration();
+  console.log("[BLE] startCalibration: setArmed(true)");
   // Always arm explicitly: E7 only fires on discState *changes*, so if discState is
   // already CALIBRATING (reconnect after sleep, return from Settings), E7 never
   // re-fires and the firmware never enables rotation vector without this call.
-  BLEServiceNative.setArmed(true).catch((e) =>
-    console.warn("[BLE] startCalibration: arm failed", e)
-  );
+  BLEServiceNative.setArmed(true).then(() => {
+    console.log("[BLE] startCalibration: armDevice() succeeded");
+  }).catch((e) => {
+    console.warn("[BLE] startCalibration: arm failed", e);
+  });
 }
 
 export function confirmBaselineReady(): void {
@@ -637,4 +724,15 @@ export function disarmDevice(): Promise<void> {
 export function sendBaselineToFirmware(baseline: { roll: number; pitch: number; yaw: number }): Promise<void> {
   console.log(`[BLE] sendBaselineToFirmware → r=${baseline.roll.toFixed(1)} p=${baseline.pitch.toFixed(1)} y=${baseline.yaw.toFixed(1)}`);
   return BLEServiceNative.setBaseline(baseline);
+}
+
+// Force a fresh baseline capture on firmware. Caller should snapshot
+// `currentBaselineSeq()` *before* calling this and then wait for the next
+// baselineCandidate with `seq > snapshot`. The magic (-999,-999,-999) write
+// is recognised by firmware (wristturn.ino:530) — it clears calibration state
+// and re-runs the rolling-window capture once stillness is detected.
+export function requestRecalibration(): Promise<number> {
+  const snapshot = _baselineSeq;
+  console.log(`[BLE] requestRecalibration: snapshot seq=${snapshot}`);
+  return BLEServiceNative.setBaseline({ roll: -999, pitch: -999, yaw: -999 }).then(() => snapshot);
 }

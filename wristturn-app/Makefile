@@ -1,7 +1,7 @@
 ANDROID_HOME := $(HOME)/Library/Android/sdk
 JAVA_HOME    := $(shell asdf where java)
 GRADLE       := ANDROID_HOME=$(ANDROID_HOME) JAVA_HOME=$(JAVA_HOME) ./android/gradlew
-APK          := android/app/build/outputs/apk/debug/app-debug.apk
+APK          := android/app/build/outputs/apk/release/app-release.apk
 
 export ANDROID_HOME
 export JAVA_HOME
@@ -15,9 +15,10 @@ all: build install
 prebuild:
 	npx expo prebuild --platform android
 
-# Compile APK
+# Compile APK (release — same signing as production; debug variant is omitted
+# intentionally per wristturn-app/CLAUDE.md)
 build:
-	$(GRADLE) -p android app:assembleDebug
+	$(GRADLE) -p android app:assembleRelease
 
 # Install APK on connected device
 install:
@@ -61,6 +62,10 @@ test:
 	bun src/gestures/__tests__/MotionClassifier.test.ts
 	bun src/ble/__tests__/StatePacket.test.ts
 	bun src/gestures/__tests__/InteractionEngine.test.ts
+	bun src/gestures/__tests__/ComboValidator.test.ts
+	bun src/gestures/__tests__/SettleGate.test.ts
+	bun src/gestures/__tests__/HoldDetector.test.ts
+	bun src/mapping/__tests__/MappingMigration.test.ts
 
 # Full wipe — node_modules + native cache + rebuild from scratch
 nuke:

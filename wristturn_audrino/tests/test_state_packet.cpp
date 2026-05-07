@@ -25,11 +25,12 @@ static void check(const char* name, bool cond) {
 
 int main() {
     // ── Struct sizes ────────────────────────────────────────────────────────
-    check("sizeof TagOnlyPacket == 1",   sizeof(TagOnlyPacket) == 1);
-    check("sizeof StabPacket == 2",      sizeof(StabPacket)    == 2);
-    check("sizeof AnglesPacket == 7",    sizeof(AnglesPacket)  == 7);
-    check("sizeof ArmEvtPacket == 5",    sizeof(ArmEvtPacket)  == 5);
-    check("STATE_PACKET_MAX_LEN == 7",   STATE_PACKET_MAX_LEN  == 7);
+    check("sizeof TagOnlyPacket == 1",      sizeof(TagOnlyPacket)    == 1);
+    check("sizeof StabPacket == 2",         sizeof(StabPacket)       == 2);
+    check("sizeof AnglesPacket == 7",       sizeof(AnglesPacket)     == 7);
+    check("sizeof ArmEvtPacket == 5",       sizeof(ArmEvtPacket)     == 5);
+    check("sizeof AnglesExtPacket == 9",    sizeof(AnglesExtPacket)  == 9);
+    check("STATE_PACKET_MAX_LEN == 9",      STATE_PACKET_MAX_LEN     == 9);
 
     // ── pkt_stab ────────────────────────────────────────────────────────────
     {
@@ -70,6 +71,40 @@ int main() {
         check("pkt_arm_evt state",        buf[2] == ARM_STATE_ARMED);
         int16_t d = (int16_t)((buf[4] << 8) | buf[3]);
         check("pkt_arm_evt delta_dd=15",  d == 15);
+    }
+
+    // ── dps_to_u16 saturation / clamp ───────────────────────────────────────
+    check("dps_to_u16 zero",              dps_to_u16(0.0f)        ==     0);
+    check("dps_to_u16 mid (25.0 dps)",    dps_to_u16(25.0f)       ==   250);
+    check("dps_to_u16 fast flick (600)",  dps_to_u16(600.0f)      ==  6000);
+    check("dps_to_u16 saturates at u16",  dps_to_u16(10000.0f)    == 65535);
+    check("dps_to_u16 clamps negatives",  dps_to_u16(-5.0f)       ==     0);
+
+    // ── pkt_pose_ext roundtrip (12.0°, -3.5°, 0°, 25.0 dps) ─────────────────
+    {
+        uint8_t buf[STATE_PACKET_MAX_LEN] = {0};
+        uint8_t n = pkt_pose_ext(buf, 12.0f, -3.5f, 0.0f, 25.0f);
+        check("pkt_pose_ext returns 9",       n == 9);
+        check("pkt_pose_ext tag",             buf[0] == PKT_POSE_EXT);
+        auto read_i16 = [&](int off) -> int16_t {
+            return (int16_t)((buf[off+1] << 8) | buf[off]);
+        };
+        auto read_u16 = [&](int off) -> uint16_t {
+            return (uint16_t)((buf[off+1] << 8) | buf[off]);
+        };
+        check("pkt_pose_ext roll_dd == 120",  read_i16(1) == 120);
+        check("pkt_pose_ext pitch_dd == -35", read_i16(3) == -35);
+        check("pkt_pose_ext yaw_dd == 0",     read_i16(5) ==   0);
+        check("pkt_pose_ext gyro_ddps == 250", read_u16(7) == 250);
+    }
+
+    // ── pkt_pose_ext with high gyro near saturation ─────────────────────────
+    {
+        uint8_t buf[STATE_PACKET_MAX_LEN] = {0};
+        uint8_t n = pkt_pose_ext(buf, 0.0f, 0.0f, 0.0f, 9999.0f);
+        check("pkt_pose_ext returns 9 (sat)", n == 9);
+        uint16_t g = (uint16_t)((buf[8] << 8) | buf[7]);
+        check("pkt_pose_ext gyro saturates",  g == 65535);
     }
 
     printf("\n%s: %d failure(s)\n", failed ? "FAIL" : "PASS", failed);

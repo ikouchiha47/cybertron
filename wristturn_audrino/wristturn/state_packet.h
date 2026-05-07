@@ -43,6 +43,7 @@ enum StatePacketType : uint8_t {
     PKT_WAKE         = 0x05,  // waking from sleep             (sizeof TagOnlyPacket)
     PKT_ARM_EVT      = 0x06,  // per-axis arm/disarm           (sizeof ArmEvtPacket)
     PKT_GRAV         = 0x07,  // arm pose from gravity vector  (sizeof GravPacket)
+    PKT_POSE_EXT     = 0x08,  // pose + gyro magnitude         (sizeof AnglesExtPacket)
 };
 
 // Axis identifiers used in PKT_ARM_EVT.
@@ -112,6 +113,19 @@ struct __attribute__((packed)) GravPacket {
 };
 static_assert(sizeof(GravPacket) == 2, "GravPacket must be 2 bytes");
 
+// PKT_POSE_EXT extends AnglesPacket with per-sample gyro magnitude.
+// Required by the app-side HoldDetector (UNIFIED_GESTURE_DESIGN.md). Magnitude
+// is unsigned deci-dps (divide by 10 → dps, range 0–6553 dps), enough for any
+// realistic flick. App parser at wristturn-app/src/ble/StatePacket.ts mirrors.
+struct __attribute__((packed)) AnglesExtPacket {
+    uint8_t  tag;
+    int16_t  roll_dd;
+    int16_t  pitch_dd;
+    int16_t  yaw_dd;
+    uint16_t gyro_mag_ddps;
+};
+static_assert(sizeof(AnglesExtPacket) == 9, "AnglesExtPacket must be 9 bytes");
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 // Convert a float in degrees to int16 deci-degrees, saturating at ±3276.7°.
@@ -120,6 +134,14 @@ static inline int16_t angle_to_i16(float degrees) {
     if (x >  32767.0f) return  32767;
     if (x < -32768.0f) return -32768;
     return (int16_t)x;
+}
+
+// Convert a non-negative dps magnitude to uint16 deci-dps, saturating at 6553.5.
+static inline uint16_t dps_to_u16(float dps) {
+    if (dps < 0.0f) return 0;
+    float x = dps * 10.0f;
+    if (x > 65535.0f) return 65535;
+    return (uint16_t)x;
 }
 
 // ── Packet builders ─────────────────────────────────────────────────────────
@@ -154,6 +176,20 @@ static inline uint8_t pkt_pose(uint8_t* out, float r, float p, float y) {
     return pkt_angles(out, PKT_POSE, r, p, y);
 }
 
+// Build a PKT_POSE_EXT packet (pose + per-sample gyro magnitude in dps).
+// gyroMagDps must be non-negative; saturates at 6553.5 dps.
+static inline uint8_t pkt_pose_ext(uint8_t* out, float r, float p, float y, float gyroMagDps) {
+    AnglesExtPacket pkt {
+        PKT_POSE_EXT,
+        angle_to_i16(r),
+        angle_to_i16(p),
+        angle_to_i16(y),
+        dps_to_u16(gyroMagDps),
+    };
+    memcpy(out, &pkt, sizeof(pkt));
+    return sizeof(pkt);
+}
+
 static inline uint8_t pkt_sleep(uint8_t* out) {
     TagOnlyPacket p { PKT_SLEEP };
     memcpy(out, &p, sizeof(p));
@@ -185,4 +221,4 @@ static inline uint8_t pkt_grav(uint8_t* out, uint8_t pose) {
 
 // Max packet size across all types — used to size transmission buffers.
 // Must be kept in sync with the largest packed struct above.
-static constexpr uint8_t STATE_PACKET_MAX_LEN = sizeof(AnglesPacket);  // 7
+static constexpr uint8_t STATE_PACKET_MAX_LEN = sizeof(AnglesExtPacket);  // 9

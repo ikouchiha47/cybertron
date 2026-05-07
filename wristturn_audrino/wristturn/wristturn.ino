@@ -18,6 +18,7 @@
 #include "PowerManager.h"
 #include "StillnessDetector.h"
 #include "gesture/GestureDetector.h"
+#include "fast_math.h"
 #include "log.h"
 #include "mounting_adapter.h"
 #include "shake_detector.h"
@@ -121,6 +122,7 @@ void emitState(const char *evt, const char *axis, const char *state, float d) {
 }
 
 void publishBaseline(float r, float p, float y) {
+  LOG_I("[PKT_BASELINE] sent r=%.1f p=%.1f y=%.1f", r, p, y);
   float vals[3] = {r, p, y};
   baselineChar.write(vals, 12);
   baselineChar.notify(vals, 12);
@@ -241,6 +243,12 @@ static constexpr unsigned long IDLE_RATE_DROP_MS = 5000; // 5s still → drop ra
 static bool     rvAtIdleRate    = false;
 static unsigned long rvIdleSinceMs = 0; // when device first went still
 
+// Gravity sensor (SH2_GRAVITY = 0x06) drives arm-pose classification independently
+// of rotation vector. Unlike RV (which the SH-2 hub suspends when stationary),
+// gravity continues at the requested rate so we can detect arm hanging even when
+// the wrist is held still. 100ms (10Hz) × 5-sample debounce = 500ms confirm.
+static constexpr uint32_t GRAVITY_INTERVAL_MS = 100;
+
 // ── Sleep / wake
 // ────────────────────────────────────────────────────────────── Define
 // DEBUG_SLEEP to use 30s timeout for bench testing sleep/wake via serial.
@@ -255,6 +263,16 @@ bool sleeping = false;
 unsigned long lastMotionMs = 0;
 unsigned long sleepStartMs = 0; // when enterSleep() was called
 static const unsigned long MIN_SLEEP_MS = 10000;
+
+// Most recent gyro magnitude in dps. Updated from handleGyroCalibrated (~50 Hz)
+// and read by handleRotationVector when emitting PKT_POSE_EXT (~10 Hz). Both
+// callbacks run on loop() — same thread — so no synchronisation needed, but
+// the value is "most recent at emit time" rather than synchronised with the
+// pose sample. Adequate for the app-side SettleGate which integrates over
+// 150ms windows. Stays 0 until the gyro callback fires once.
+static float latestGyroMagDps = 0.0f;
+// Conversion factor: rad/s → dps. Cached as a constant to avoid recomputing.
+static constexpr float RAD_PER_S_TO_DPS = 57.29577951308232f; // 180 / pi
 
 // ── PowerManager wiring ──────────────────────────────────────────────────────
 // Concrete IHardware that delegates to the BNO085 driver.
@@ -365,6 +383,14 @@ void enableReports() {
             RV_INTERVAL_ACTIVE_MS, 1000 / RV_INTERVAL_ACTIVE_MS);
     else
       LOG_E("BNO085: could not enable Rotation Vector");
+
+    // Gravity sensor — independent of RV so arm-pose detection survives RV
+    // throttling and SH-2 fusion suspension on stationary wrist.
+    if (imu.enableReport(SENSOR_REPORTID_GRAVITY, GRAVITY_INTERVAL_MS))
+      LOG_I("[Reports] gravity enabled at %ums (%uHz)",
+            GRAVITY_INTERVAL_MS, 1000 / GRAVITY_INTERVAL_MS);
+    else
+      LOG_E("BNO085: could not enable Gravity");
   }
 #ifdef ENABLE_SHAKE
   if (imu.enableLinearAccelerometer())
@@ -471,8 +497,14 @@ void onArmWrite(uint16_t conn_hdl, BLECharacteristic *chr, uint8_t *data,
   if (len != 1)
     return;
   bool newArmed = (data[0] != 0);
-  if (newArmed == armed)
+  // Diagnostic — uncomment to trace recalibration / arm-write flow.
+  // LOG_I("[Arm] write req=%d cur=%d calComplete=%d baseCaptured=%d calInProg=%d sleeping=%d",
+  //       (int)newArmed, (int)armed, (int)calibrationComplete,
+  //       (int)baselineCaptured, (int)calInProgress, (int)sleeping);
+  if (newArmed == armed) {
+    // LOG_I("[Arm] no-op (already %d)", (int)armed);
     return;
+  }
   armed = newArmed;
   if (armed) {
     pendingEnableReports = true;
@@ -490,6 +522,7 @@ void onArmWrite(uint16_t conn_hdl, BLECharacteristic *chr, uint8_t *data,
     if (!calibrationComplete) {
       if (!rawMode) {
         imu.enableReport(SENSOR_REPORTID_ROTATION_VECTOR, 0);
+        imu.enableReport(SENSOR_REPORTID_GRAVITY, 0);
       }
       baselineRoll = 0.0f;
       basePitch_arm = 0.0f;
@@ -504,9 +537,10 @@ void onArmWrite(uint16_t conn_hdl, BLECharacteristic *chr, uint8_t *data,
       inStableWindow = false;
     } else {
       // Calibration already done: keep baseline, just disable rotation vector
-      // if not rawMode
+      // and gravity if not rawMode
       if (!rawMode) {
         imu.enableReport(SENSOR_REPORTID_ROTATION_VECTOR, 0);
+        imu.enableReport(SENSOR_REPORTID_GRAVITY, 0);
       }
       LOG_I("[Arm] disarmed — baseline retained (calibration complete)");
     }
@@ -534,6 +568,8 @@ void onBaselineWrite(uint16_t conn_hdl, BLECharacteristic *chr, uint8_t *data,
     calBuffer.reset();
     stableCalBuffer.reset();
     LOG_I("[Cal] calibration cleared by app — awaiting new flat pose");
+    // Diagnostic — uncomment to log armed/sleeping at clear time.
+    // LOG_I("[Cal] cleared state: armed=%d sleeping=%d", (int)armed, (int)sleeping);
     return;
   }
 
@@ -592,6 +628,7 @@ void enterSleep() {
   // the correct approach. NOTE: do NOT call enableReport on TAP_DETECTOR with 0
   // — for event sensors, 0 ARMS them.
   imu.enableReport(SENSOR_REPORTID_ROTATION_VECTOR, 0);
+  imu.enableReport(SENSOR_REPORTID_GRAVITY, 0);
   imu.enableReport(SENSOR_REPORTID_LINEAR_ACCELERATION, 0);
   imu.enableReport(SENSOR_REPORTID_STABILITY_CLASSIFIER, 0);
   imu.enableReport(SENSOR_REPORTID_GYROSCOPE_CALIBRATED, 0);
@@ -1022,6 +1059,15 @@ static void handleGyroCalibrated() {
   float gz = imu.getGyroZ();
   mountAdapter.transform(gx, gy, gz);
 
+  // Cache magnitude in dps for PKT_POSE_EXT consumers (HoldDetector SettleGate).
+  // Magnitude is rotation-frame-invariant so the mount transform doesn't matter
+  // for it, but we use the post-transform components for consistency.
+  {
+    float mag2 = gx * gx + gy * gy + gz * gz;
+    float magRads = (mag2 > 0.0f) ? sqrtf(mag2) : 0.0f;
+    latestGyroMagDps = magRads * RAD_PER_S_TO_DPS;
+  }
+
   if (rawMode && Bluefruit.Periph.connected()) {
     char buf[40] = {};
     snprintf(buf, sizeof(buf), "gyr|%.3f|%.3f|%.3f", gx, gy, gz);
@@ -1089,6 +1135,79 @@ static void handleSleepShake() {
   pendingExitSleep = true;
 }
 
+// Arm-pose classifier: dominant axis of forearm-frame gravity → FLAT/HANGING/RAISED.
+// Reads gravity vector directly from SH2_GRAVITY so it keeps updating even when
+// RV is throttled or the SH-2 hub suspends fusion on a stationary wrist.
+// Mount transform {1,2,-3} matches the historical RV-derived classifier (Z negated).
+// Threshold/debounce kept identical to the old implementation, so behaviour at
+// emit-time is unchanged — only the input source changed.
+static void handleGravity() {
+  if (sleeping)
+    return;
+
+  float gfx = imu.getGravityX();
+  float gfy = imu.getGravityY();
+  float gfz = imu.getGravityZ();
+
+  // Same mount transform used for r/p/y (handleRotationVector) and gyro vector
+  // (handleGyroCalibrated). The selector logic in MountingAdapter is generic over
+  // its three input slots — works for angles or vector components alike.
+  mountAdapter.transform(gfx, gfy, gfz);
+
+  // Sanity guard before normalising — degenerate magnitude shouldn't happen on
+  // a real IMU but can during init or driver hiccups.
+  float mag2 = gfx * gfx + gfy * gfy + gfz * gfz;
+  if (mag2 < 0.01f) return;
+
+  // Normalise via fast_math.h dispatcher. Default = naive (1 sqrt + 3 div).
+  // Build with -DRUNE_NORMALISE_FAST to swap in the bit-hack approximation.
+  float gfx_n, gfy_n, gfz_n;
+  normalise3(gfx, gfy, gfz, &gfx_n, &gfy_n, &gfz_n);
+
+  static constexpr float GRAV_THRESHOLD = 0.75f;   // ≈41° cone (validated logs.13-17)
+  static constexpr uint8_t STABLE_SAMPLES = 5;     // 5 × 100ms = 500ms confirm
+
+  StatePacketGravPose newPose;
+  if (fabsf(gfz_n) > GRAV_THRESHOLD)
+    newPose = GRAV_POSE_FLAT;
+  else if (fabsf(gfx_n) > GRAV_THRESHOLD)
+    newPose = GRAV_POSE_HANGING;
+  else
+    newPose = GRAV_POSE_RAISED;
+
+  static StatePacketGravPose candidatePose = GRAV_POSE_RAISED;
+  static uint8_t stableCount = 0;
+  if (newPose == candidatePose) {
+    if (stableCount < STABLE_SAMPLES) stableCount++;
+  } else {
+    candidatePose = newPose;
+    stableCount = 1;
+  }
+
+  if (stableCount >= STABLE_SAMPLES &&
+      (uint8_t)candidatePose != lastStableGravPose) {
+    lastStableGravPose = (uint8_t)candidatePose;
+    if (Bluefruit.Periph.connected()) {
+      uint8_t gbuf[STATE_PACKET_MAX_LEN];
+      uint8_t gn = pkt_grav(gbuf, lastStableGravPose);
+      stateChar.notify(gbuf, gn);
+      const char *pnames[] = {"flat", "hanging", "raised"};
+      LOG_I("[GravPose] → %s  gfx_n=%.3f gfy_n=%.3f gfz_n=%.3f",
+            pnames[lastStableGravPose], gfx_n, gfy_n, gfz_n);
+    }
+  }
+
+  // DIAG: log forearm gravity every ~5s at 10Hz
+  static unsigned long gravDiagCount = 0;
+  if (++gravDiagCount % 50 == 0 && Bluefruit.Periph.connected()) {
+    const char *pnames[] = {"flat", "hanging", "raised"};
+    LOG_I("[GravDiag] gfx_n=%.3f gfy_n=%.3f gfz_n=%.3f → %s (stable=%u)",
+          gfx_n, gfy_n, gfz_n,
+          (uint8_t)candidatePose <= 2 ? pnames[(uint8_t)candidatePose] : "?",
+          stableCount);
+  }
+}
+
 static void handleRotationVector() {
   if (sleeping)
     return;
@@ -1118,86 +1237,8 @@ static void handleRotationVector() {
   mountAdapter.transform(roll, pitch, yaw);
   lastRoll = roll; lastPitch = pitch; lastYaw = yaw;
 
-  // ── Gravity-based arm pose classification ────────────────────────────────
-  // Rotate Earth gravity [0,0,-9.81] into sensor frame via conjugate
-  // quaternion, then apply mount transform {1,2,-3} to get forearm-frame
-  // gravity. Dominant axis of the normalised forearm gravity = arm pose.
-  // Validated against logs.13-17: flat Z′≈0.99, hanging X′≈-0.97, raised
-  // mixed≈0.73. Threshold 0.75 (≈41° cone) — more forgiving than original 0.85
-  // (≈32° cone).
-  {
-    static constexpr float GRAV_THRESHOLD = 0.75f;
-    static constexpr uint8_t STABLE_SAMPLES = 5;
-
-    // Conjugate quaternion (inverse for unit quaternion): negate vector part
-    float cq0 = w, cq1 = -x, cq2 = -y, cq3 = -z;
-    float g2 = -9.81f;
-    // cross(cq_vec, [0,0,g2])
-    float crx = cq2 * g2;
-    float cry = -cq1 * g2;
-    float crz = 0.0f;
-    // cross(cq_vec, cr)
-    float c2x = cq2 * crz - cq3 * cry;
-    float c2y = cq3 * crx - cq1 * crz;
-    float c2z = cq1 * cry - cq2 * crx;
-    // Rotated gravity in sensor frame
-    float gsx = 2.0f * (cq0 * crx + c2x);
-    float gsy = 2.0f * (cq0 * cry + c2y);
-    float gsz = g2 + 2.0f * (cq0 * crz + c2z);
-    // Apply mount transform {1,2,-3}: Z is negated
-    float gfx = gsx;
-    float gfy = gsy;
-    float gfz = -gsz;
-    float gf_mag = sqrtf(gfx * gfx + gfy * gfy + gfz * gfz);
-    float gfx_n = gfx / gf_mag;
-    float gfy_n = gfy / gf_mag;
-    float gfz_n = gfz / gf_mag;
-
-    // Classify pose
-    StatePacketGravPose newPose;
-    if (fabsf(gfz_n) > GRAV_THRESHOLD)
-      newPose = GRAV_POSE_FLAT;
-    else if (fabsf(gfx_n) > GRAV_THRESHOLD)
-      newPose = GRAV_POSE_HANGING;
-    else
-      newPose = GRAV_POSE_RAISED;
-
-    // Debounce: require STABLE_SAMPLES consecutive matching readings
-    static StatePacketGravPose candidatePose = GRAV_POSE_RAISED;
-    static uint8_t stableCount = 0;
-    if (newPose == candidatePose) {
-      if (stableCount < STABLE_SAMPLES)
-        stableCount++;
-    } else {
-      candidatePose = newPose;
-      stableCount = 1;
-    }
-
-    // Emit on stable pose change (including first emit after connect, via
-    // sentinel reset)
-    if (stableCount >= STABLE_SAMPLES &&
-        (uint8_t)candidatePose != lastStableGravPose) {
-      lastStableGravPose = (uint8_t)candidatePose;
-      if (Bluefruit.Periph.connected()) {
-        uint8_t gbuf[STATE_PACKET_MAX_LEN];
-        uint8_t gn = pkt_grav(gbuf, lastStableGravPose);
-        stateChar.notify(gbuf, gn);
-        const char *pnames[] = {"flat", "hanging", "raised"};
-        LOG_I("[GravPose] → %s  gfx_n=%.3f gfy_n=%.3f gfz_n=%.3f",
-              pnames[lastStableGravPose], gfx_n, gfy_n, gfz_n);
-      }
-    }
-
-    // DIAG: log forearm gravity every ~5s at 10Hz rotation vector rate
-    static unsigned long gravDiagCount = 0;
-    if (++gravDiagCount % 50 == 0 && Bluefruit.Periph.connected()) {
-      const char *pnames[] = {"flat", "hanging", "raised"};
-      LOG_I("[GravDiag] gfx_n=%.3f gfy_n=%.3f gfz_n=%.3f → %s (stable=%u)",
-            gfx_n, gfy_n, gfz_n,
-            (uint8_t)candidatePose <= 2 ? pnames[(uint8_t)candidatePose] : "?",
-            stableCount);
-    }
-  }
+  // (Arm-pose classification moved to handleGravity() — driven by SH2_GRAVITY
+  // so it survives RV throttling and SH-2 fusion suspension when stationary.)
 
   stillDetector->onRotationVector(roll, pitch, yaw, millis());
   // Stability-triggered rebasing removed entirely. Baseline only changes via:
@@ -1222,6 +1263,9 @@ static void handleRotationVector() {
           calBuffer.reset();
           stableCalBuffer.reset();
           inStableWindow = false;
+
+          LOG_I("[CalStart] armed=%d calComplete=%d baseCaptured=%d", armed, calibrationComplete, baselineCaptured);
+
           calStartMs    = millis();
           calDeadlineMs = calStartMs + CAL_DEADLINE_MS;
           calInProgress = true;
@@ -1234,6 +1278,10 @@ static void handleRotationVector() {
             stableCalBuffer.push(roll, pitch, yaw);
             LOG_I("[StabCal] count=%u r=%.1f p=%.1f y=%.1f",
                   stableCalBuffer.count, roll, pitch, yaw);
+          }
+
+          if (millis() - calStartMs >= CAL_WINDOW_MS && calInProgress && !baselineCaptured) {
+            LOG_I("[CalFail] timeout: %lums no stable pose", millis() - calStartMs);
           }
         }
       }
@@ -1265,13 +1313,16 @@ static void handleRotationVector() {
         float deltas[3] = {dr, dp, dy};
         deltaChar.notify(deltas, 12);
       }
-      // Emit pose for HUD (current vs baseline) at throttled rate — all modes
+      // Emit pose for HUD (current vs baseline) at throttled rate — all modes.
+      // Uses PKT_POSE_EXT to also carry per-sample gyro magnitude for the
+      // app-side HoldDetector. App falls back gracefully if it sees only the
+      // legacy PKT_POSE shape (older firmware), so the upgrade is one-way safe.
       {
         static unsigned long lastPoseMs = 0;
         if (now - lastPoseMs >= 100) {
           lastPoseMs = now;
           uint8_t pbuf[STATE_PACKET_MAX_LEN];
-          uint8_t pn = pkt_pose(pbuf, roll, pitch, yaw);
+          uint8_t pn = pkt_pose_ext(pbuf, roll, pitch, yaw, latestGyroMagDps);
           stateChar.notify(pbuf, pn);
         }
       }
@@ -1378,6 +1429,7 @@ static const struct {
 #endif
     {(uint8_t)SH2_SHAKE_DETECTOR, handleSleepShake},
     {SENSOR_REPORTID_ROTATION_VECTOR, handleRotationVector},
+    {SENSOR_REPORTID_GRAVITY, handleGravity},
     {SENSOR_REPORTID_STABILITY_CLASSIFIER, handleStabilityClassifier},
 };
 
@@ -1431,6 +1483,20 @@ void finalizeCalibration() {
 // ──────────────────────────────────────────────────────────────────────
 void loop() {
   static bool firstLoop = true;
+
+  // 5s heartbeat — proves the loop is alive and shows calibration-relevant
+  // state at a glance. Uncomment to enable diagnostic.
+  // {
+  //   static unsigned long lastHbMs = 0;
+  //   unsigned long nowMs = millis();
+  //   if (nowMs - lastHbMs >= 5000) {
+  //     lastHbMs = nowMs;
+  //     LOG_I("[HB] armed=%d sleeping=%d calComplete=%d baseCaptured=%d calInProg=%d connected=%d",
+  //           (int)armed, (int)sleeping, (int)calibrationComplete,
+  //           (int)baselineCaptured, (int)calInProgress,
+  //           (int)Bluefruit.Periph.connected());
+  //   }
+  // }
 
   if (pendingEnableReports) {
     pendingEnableReports = false;
