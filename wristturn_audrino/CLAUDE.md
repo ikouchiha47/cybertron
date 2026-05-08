@@ -16,8 +16,17 @@
 
 ## Flashing
 
-Use the Arduino IDE or `arduino-cli`. Target board: **Seeed XIAO nRF52840 Sense**.
+Target board: **Seeed XIAO nRF52840 Sense** (FQBN `Seeeduino:nrf52:xiaonRF52840Sense`).
 The active sketch is `wristturn/wristturn.ino`.
+
+```bash
+cd wristturn_audrino
+make build      # compile + produce firmware.uf2 and wristturn/firmware.hex
+make flash      # build + drag-drop to /Volumes/XIAO-SENSE (double-tap reset first)
+```
+
+`firmware.uf2` at the repo root is the committed snapshot of the most recent build —
+refresh it with `make build` whenever the sketch is updated.
 
 ---
 
