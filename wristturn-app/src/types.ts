@@ -38,7 +38,8 @@ export type GestureName =
   | "turn_right" | "turn_left"
   | "pitch_up"   | "pitch_down"
   | "yaw_right"  | "yaw_left"
-  | "tap" | "shake" | "step" | "idle";
+  | "tap" | "shake" | "step" | "idle"
+  | "arm_up"  | "arm_down";
 
 export interface GestureEvent {
   name: GestureName;
@@ -59,6 +60,7 @@ export interface RawSample {
 const GESTURE_NAMES = new Set<string>([
   "turn_right","turn_left","pitch_up","pitch_down",
   "yaw_right","yaw_left","tap","shake","step","idle",
+  "arm_up","arm_down",
 ]);
 
 /** Parse a raw BLE payload string into a GestureEvent, or null if invalid. */
@@ -146,6 +148,10 @@ export const Gesture = {
   SHAKE:           "shake",
   STEP:            "step",
   IDLE:            "idle",
+  // Pose-transition gestures, emitted by firmware on HANGING-involving
+  // GravPose changes. Carry no axis values (firmware sends zeros).
+  ARM_UP:          "arm_up",
+  ARM_DOWN:        "arm_down",
 } as const;
 
 /** Calibrated home position baseline — stored per wrist device */

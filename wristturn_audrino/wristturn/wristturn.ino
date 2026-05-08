@@ -85,6 +85,45 @@ bool isCharging() { return digitalRead(PIN_CHARGE_STATUS) == LOW; }
 #define STATE_CHAR_LEN                                                         \
   80 // largest JSON event fits in 80 bytes; within 247-byte ATT MTU
 
+// ── BLE radio tunables (EXPERIMENTAL — verify with logs in target rooms) ────
+//
+// These shape the radio link budget vs. battery / latency trade-off.
+// Bumped from prior values to address poor through-wall range observed during
+// room-mapping tests (device in one room, phone in next room → disconnects).
+//
+// Future: when room-mapping moves on-device, these can be adjusted dynamically
+// — e.g. drop TX power and switch to 1M PHY when the wrist is near its paired
+// gateway, raise them when roaming. See BLE_TX_POWER_NEAR / BLE_TX_POWER_FAR
+// stubs (TODO) for the dynamic path.
+//
+// nRF52840 TX power ladder: -40,-20,-16,-12,-8,-4,0,4,8 dBm.
+// +8 is the chip max. Each +6 dB ≈ 2× range in free space; expect less indoors.
+// Higher TX power costs only during actual transmit bursts — duty cycle for
+// our notify rate (~50 Hz, tiny payloads) keeps the average current bump small.
+static constexpr int8_t BLE_TX_POWER_DBM = 8;
+
+// Connection interval (units of 1.25 ms). Wider window = more time for the
+// radio to retry on weak links + lower average current, at the cost of latency
+// between gesture detection and notify delivery. Prior: 6–12 (7.5–15 ms);
+// new: 12–24 (15–30 ms). One-step bump — revisit if gestures feel laggy.
+static constexpr uint16_t BLE_CONN_INTERVAL_MIN_UNITS = 12; // 15 ms
+static constexpr uint16_t BLE_CONN_INTERVAL_MAX_UNITS = 24; // 30 ms
+
+// Supervision timeout (units of 10 ms). How long the link survives missed
+// packets before declaring disconnect. Prior: 200 (2 s); new: 400 (4 s).
+// Longer = fewer spurious disconnects on marginal signal; downside is slower
+// detection of a genuinely dead peer. Must satisfy:
+//   timeout > (1 + slave_latency) * conn_interval_max * 2
+// With slave_latency=0 and conn_interval_max=30 ms, min is 60 ms — 4 s is fine.
+static constexpr uint16_t BLE_CONN_SUPERVISION_TIMEOUT_UNITS = 400; // 4 s
+
+// PHY negotiation. Advertise on 1M (universal — every BLE phone can scan it),
+// then ask the peer to upgrade the data link to Coded PHY (S=8, "Long Range")
+// after connect. Coded PHY adds ~12 dB link budget at the cost of throughput
+// (125 kbps vs 1 Mbps) — fine for our small notify payloads. If the peer does
+// not support Coded PHY, the request fails gracefully and the link stays on 1M.
+static constexpr uint8_t BLE_DATA_PHY = BLE_GAP_PHY_CODED;
+
 BLEService wristService("19B10000-E8F2-537E-4F6C-D104768A1214");
 BLECharacteristic gestureChar("19B10001-E8F2-537E-4F6C-D104768A1214",
                               BLERead | BLENotify, GESTURE_CHAR_LEN);
@@ -193,10 +232,21 @@ CalibrationBuffer calBuffer;
 CalibrationBuffer stableCalBuffer;   // samples collected only during stab=3
 bool calInProgress = false;
 bool inStableWindow = false;
-unsigned long calStartMs = 0;     // resets on every stab=3 — 3s from last stable moment
+unsigned long calStartMs = 0;     // when cal began — set once at entry, never overwritten
+unsigned long stableStartMs = 0;  // when current stab=3 window began — diagnostic only
 unsigned long calDeadlineMs = 0;  // hard deadline: set once on calInProgress, never resets
-static constexpr unsigned long CAL_WINDOW_MS    = 3000;   // stable window length
-static constexpr unsigned long CAL_DEADLINE_MS  = 12000;  // max total cal time
+
+// Captured in setup() before anything can clear it; logged later once USB CDC
+// is enumerated. Decoded in loop() prologue on first iteration.
+uint32_t bootResetReas = 0;
+
+// Set to true to deliberately wedge after a few loop iterations so we can
+// confirm WDT actually resets the MCU. Note: the Seeeduino/Adafruit bootloader
+// clears RESETREAS before setup() runs, so "DOG" won't appear on the next
+// boot — verify instead by observing the ~8s silence + setup() re-running.
+static constexpr bool WDT_SELFTEST = false;
+static constexpr unsigned long CAL_COLLECT_MS  = 3000;  // sample collection window
+static constexpr unsigned long CAL_DEADLINE_MS = 6000;  // hard backstop (3s past collect)
 // #define CAL_LAST_WINDOW_ONLY  // uncomment to keep only the most recent stable window
 
 // Deferred flags — set in callbacks/event handlers, consumed in loop() where
@@ -206,6 +256,16 @@ static constexpr unsigned long CAL_DEADLINE_MS  = 12000;  // max total cal time
 // on the next iteration (same pattern as Go's select-on-channel).
 static volatile bool pendingEnableReports = false;
 static volatile bool pendingExitSleep = false;
+
+// PHY upgrade scheduling — set in onConnect, consumed in loop() once the link
+// has settled (MTU/DLE/initial discovery done) and sensor samples are flowing.
+// Done in loop() (main task) rather than onConnect (SoftDevice task) so we can
+// call sd_ble_gap_phy_update directly and capture the raw NRF err_code instead
+// of letting Bluefruit's requestPHY swallow it via VERIFY_STATUS.
+static volatile uint32_t bleConnectAtMs = 0; // 0 == no connection
+static volatile bool phyUpgradeAttempted = false;
+static constexpr uint32_t PHY_UPGRADE_DELAY_MS =
+    1500; // wait this long after connect before requesting PHY change
 
 // Last logged stability value — used to suppress duplicate logs and drive
 // heartbeat. Initialised to 1 (on_table) so the very first post-connect
@@ -722,10 +782,84 @@ void onConnect(uint16_t conn_hdl) {
   LOG_I("BLE connected. conn_hdl=%u peers=%u", conn_hdl,
         Bluefruit.Periph.connected());
   LOG_I("[Settings] current: debounce=%lu ms", debounceMs);
+
+  // Schedule deferred PHY upgrade (handled by servicePhyUpgrade() in loop()).
+  bleConnectAtMs = millis();
+  phyUpgradeAttempted = false;
+}
+
+// Drives the deferred PHY upgrade state machine. Called once per loop tick.
+//
+// Why this isn't done in onConnect: that callback runs in the SoftDevice task,
+// during which a fresh link is still doing MTU/DLE/discovery exchanges. PHY
+// updates issued in that window have been observed to fail with INVALID_STATE.
+// We also want the raw NRF err_code, which Bluefruit::requestPHY hides behind
+// VERIFY_STATUS — so we call sd_ble_gap_phy_update directly here.
+//
+// Two phases, gated on bleConnectAtMs (set in onConnect, cleared in onDisconnect):
+//   1. At connect+PHY_UPGRADE_DELAY_MS: issue the request, log raw err_code.
+//   2. At connect+PHY_UPGRADE_DELAY_MS+500: log getPHY() so we can see whether
+//      the negotiation actually succeeded (peer accepted) or quietly stayed on 1M.
+//
+// err_code interpretation (from ble_gap.h / nrf_error.h):
+//   0x00   NRF_SUCCESS                request accepted, outcome via BLE_GAP_EVT_PHY_UPDATE
+//   0x07   NRF_ERROR_INVALID_PARAM    SoftDevice config doesn't enable requested PHY
+//   0x08   NRF_ERROR_INVALID_STATE    link still negotiating something else
+//   0x11   NRF_ERROR_BUSY             a previous PHY update is in flight
+//   0x3002 BLE_ERROR_INVALID_CONN_HANDLE
+static void servicePhyUpgrade() {
+  static bool resultLogged = false;
+
+  // Reset post-disconnect so the next connection re-logs.
+  if (bleConnectAtMs == 0) {
+    if (resultLogged)
+      resultLogged = false;
+    return;
+  }
+  if (!Bluefruit.Periph.connected())
+    return;
+
+  uint32_t elapsed = millis() - bleConnectAtMs;
+
+  // Phase 1: issue the request once.
+  if (!phyUpgradeAttempted && elapsed >= PHY_UPGRADE_DELAY_MS) {
+    phyUpgradeAttempted = true;
+    BLEConnection *conn = Bluefruit.Connection(0);
+    if (!conn) {
+      LOG_E("[BLE] PHY upgrade: no connection object");
+      return;
+    }
+    uint8_t before = conn->getPHY();
+    ble_gap_phys_t gap_phy = {.tx_phys = BLE_DATA_PHY,
+                              .rx_phys = BLE_DATA_PHY};
+    uint32_t err = sd_ble_gap_phy_update(conn->handle(), &gap_phy);
+    LOG_I("[BLE] PHY upgrade req: target=0x%02X before=0x%02X "
+          "sd_err=0x%04lX (0=ok, 7=invalid_param, 8=invalid_state, 11=busy)",
+          BLE_DATA_PHY, before, (unsigned long)err);
+    return;
+  }
+
+  // Phase 2: log the active PHY ~500 ms later.
+  if (phyUpgradeAttempted && !resultLogged &&
+      elapsed >= (PHY_UPGRADE_DELAY_MS + 500)) {
+    resultLogged = true;
+    BLEConnection *conn = Bluefruit.Connection(0);
+    if (!conn)
+      return;
+    uint8_t phy = conn->getPHY();
+    const char *name = (phy == BLE_GAP_PHY_CODED)   ? "CODED"
+                       : (phy == BLE_GAP_PHY_2MBPS) ? "2M"
+                       : (phy == BLE_GAP_PHY_1MBPS) ? "1M"
+                                                    : "?";
+    LOG_I("[BLE] active PHY: %s (0x%02X)", name, phy);
+  }
 }
 
 void onDisconnect(uint16_t conn_hdl, uint8_t reason) {
   LOG_I("BLE disconnected. conn_hdl=%u reason=0x%02X", conn_hdl, reason);
+  // Clear PHY upgrade state for next connection.
+  bleConnectAtMs = 0;
+  phyUpgradeAttempted = false;
   // Reset calibration state for fresh start on next connect
   calibrationComplete = false;
   baselineCaptured = false;
@@ -762,6 +896,28 @@ void setup() {
   blinkLED(LED_BLUE, 5); // 5 blinks = new firmware confirmed
 
   Serial.begin(115200);
+
+  // ── Reset reason ──────────────────────────────────────────────────────────
+  // RESETREAS bits: 0=PIN, 1=DOG (watchdog), 2=SREQ (soft), 3=LOCKUP,
+  //                 16=OFF, 17=LPCOMP, 18=DIF, 19=NFC, 20=VBUS.
+  // Don't read NRF_POWER->RESETREAS directly — the Seeeduino Arduino core's
+  // init() (cores/nRF5/wiring.c:37) runs before setup() and already clears it
+  // (write-1-to-clear). It stashes the original value in _reset_reason and
+  // exposes it via readResetReason(). LOG_I is deferred until after IMU init
+  // because USB CDC isn't enumerated this early.
+  bootResetReas = readResetReason();
+
+  // ── Hardware watchdog (WDT) ───────────────────────────────────────────────
+  // 8s timeout. Pat at the top of loop(). If loop() doesn't iterate within
+  // 8s, MCU resets — RESETREAS bit 1 (DOG) will tell us next boot.
+  // HALT_Pause: WDT counter pauses while CPU is halted by debugger.
+  // SLEEP_Run:  WDT counter keeps running while CPU is asleep (WFE/WFI).
+  //             Required — otherwise wedge-in-WFE never trips the dog.
+  NRF_WDT->CONFIG = (WDT_CONFIG_HALT_Pause << WDT_CONFIG_HALT_Pos) |
+                    (WDT_CONFIG_SLEEP_Run  << WDT_CONFIG_SLEEP_Pos);
+  NRF_WDT->CRV    = 8UL * 32768UL;   // 8s in 32.768 kHz LFCLK ticks
+  NRF_WDT->RREN   = 0x1;             // enable reload register RR[0] only
+  NRF_WDT->TASKS_START = 1;
 
   // ── Power optimizations ───────────────────────────────────────────────────
   // Disable onboard PDM microphone (XIAO nRF52840 Sense: mic power on P1.10)
@@ -860,6 +1016,19 @@ void setup() {
   LOG_I("[IMU] INT pin %d level after begin=%d", BNO085_INT_PIN,
         digitalRead(BNO085_INT_PIN));
 
+  // ── Deferred boot diagnostics ─────────────────────────────────────────────
+  // bootResetReas was captured in the very first lines of setup(); WDT was
+  // started immediately too. We log them here because USB CDC is now ready
+  // (BNO085 init delay is enough for macOS to enumerate the tty).
+  LOG_I("[BOOT] resetreas=0x%08lx %s%s%s%s%s",
+        (unsigned long)bootResetReas,
+        (bootResetReas & 0x01) ? "PIN " : "",
+        (bootResetReas & 0x02) ? "DOG " : "",
+        (bootResetReas & 0x04) ? "SREQ " : "",
+        (bootResetReas & 0x08) ? "LOCKUP " : "",
+        (bootResetReas == 0)   ? "POWER_ON" : "");
+  LOG_I("[WDT] started, timeout=8000ms (selftest=%d)", (int)WDT_SELFTEST);
+
   // Attach interrupt on BNO085 INT pin so waitForEvent() wakes when IMU data
   // is ready. We do NOT pass INT to imu.begin() (see CLAUDE.md for why), but
   // we still need this for CPU wake from low-power sleep.
@@ -872,12 +1041,15 @@ void setup() {
   // ── BLE init ──
   LOG_I("BLE init...");
   Bluefruit.begin();
-  Bluefruit.setTxPower(
-      -20); // dBm: -40,-20,-16,-12,-8,-4,0,4. -20 sufficient for <2m
+  Bluefruit.setTxPower(BLE_TX_POWER_DBM);
   Bluefruit.setName("RUNE-I");
-  Bluefruit.Periph.setConnInterval(6, 12);
-  Bluefruit.Periph.setConnSupervisionTimeout(200);
-  LOG_I("BLE supervision timeout set to 2s.");
+  Bluefruit.Periph.setConnInterval(BLE_CONN_INTERVAL_MIN_UNITS,
+                                   BLE_CONN_INTERVAL_MAX_UNITS);
+  Bluefruit.Periph.setConnSupervisionTimeout(
+      BLE_CONN_SUPERVISION_TIMEOUT_UNITS);
+  LOG_I("[BLE] tx=%ddBm conn=%u-%u(*1.25ms) supv=%u(*10ms)",
+        (int)BLE_TX_POWER_DBM, BLE_CONN_INTERVAL_MIN_UNITS,
+        BLE_CONN_INTERVAL_MAX_UNITS, BLE_CONN_SUPERVISION_TIMEOUT_UNITS);
 
   // Battery service (must begin before advertising)
   bleBattery.begin();
@@ -1034,9 +1206,10 @@ static void handleLinearAcceleration() {
 
 #ifdef ENABLE_TAP
 static void handleTapDetector() {
+  uint8_t bits = imu.getTapDetector();
   char buf[40] = {};
   snprintf(buf, sizeof(buf), "tap");
-  LOG_I("%s", buf);
+  LOG_I("%s bits=0x%02x", buf, bits);
   gestureChar.notify(buf, 40);
   lastMotionMs = millis();
 }
@@ -1186,6 +1359,7 @@ static void handleGravity() {
 
   if (stableCount >= STABLE_SAMPLES &&
       (uint8_t)candidatePose != lastStableGravPose) {
+    const uint8_t prev = lastStableGravPose;
     lastStableGravPose = (uint8_t)candidatePose;
     if (Bluefruit.Periph.connected()) {
       uint8_t gbuf[STATE_PACKET_MAX_LEN];
@@ -1194,6 +1368,35 @@ static void handleGravity() {
       const char *pnames[] = {"flat", "hanging", "raised"};
       LOG_I("[GravPose] → %s  gfx_n=%.3f gfy_n=%.3f gfz_n=%.3f",
             pnames[lastStableGravPose], gfx_n, gfy_n, gfz_n);
+
+      // ── Emit arm_up / arm_down gesture on HANGING-involving transitions ──
+      //
+      // Skip the first-ever transition (prev == UINT8_MAX) since boot pose
+      // is not a user-initiated event.
+      //
+      // Wrist-roll transitions (FLAT ↔ RAISED) emit no gesture because they
+      // are not arm-pose changes — only HANGING crossings count as
+      // activate/deactivate intent.
+      const bool prevValid    = (prev <= GRAV_POSE_RAISED);
+      const bool leavingHang  = (prev == GRAV_POSE_HANGING)
+                                && (lastStableGravPose != GRAV_POSE_HANGING);
+      const bool enteringHang = (prev != GRAV_POSE_HANGING)
+                                && (lastStableGravPose == GRAV_POSE_HANGING);
+
+      const char *armToken = nullptr;
+      if (prevValid && leavingHang) {
+        armToken = "arm_up";
+      } else if (prevValid && enteringHang) {
+        armToken = "arm_down";
+      }
+
+      if (armToken) {
+        char abuf[GESTURE_CHAR_LEN] = {};
+        snprintf(abuf, sizeof(abuf),
+                 "%s|0.00|0.00|0.00|0.00|0.00", armToken);
+        gestureChar.notify(abuf, GESTURE_CHAR_LEN);
+        LOG_I("[Gesture] %s (pose transition)", armToken);
+      }
     }
   }
 
@@ -1267,10 +1470,11 @@ static void handleRotationVector() {
           LOG_I("[CalStart] armed=%d calComplete=%d baseCaptured=%d", armed, calibrationComplete, baselineCaptured);
 
           calStartMs    = millis();
+          stableStartMs = 0;
           calDeadlineMs = calStartMs + CAL_DEADLINE_MS;
           calInProgress = true;
         }
-        if (millis() - calStartMs < CAL_WINDOW_MS) {
+        if (millis() - calStartMs < CAL_COLLECT_MS) {
           calBuffer.push(roll, pitch, yaw);
           LOG_I("[CalBuf] count=%u/%u r=%.1f p=%.1f y=%.1f",
                 calBuffer.count, MAX_CAL_SAMPLES, roll, pitch, yaw);
@@ -1278,10 +1482,6 @@ static void handleRotationVector() {
             stableCalBuffer.push(roll, pitch, yaw);
             LOG_I("[StabCal] count=%u r=%.1f p=%.1f y=%.1f",
                   stableCalBuffer.count, roll, pitch, yaw);
-          }
-
-          if (millis() - calStartMs >= CAL_WINDOW_MS && calInProgress && !baselineCaptured) {
-            LOG_I("[CalFail] timeout: %lums no stable pose", millis() - calStartMs);
           }
         }
       }
@@ -1351,15 +1551,21 @@ static void handleStabilityClassifier() {
     lastMotionMs = now;
   }
 
-  // Calibration stable-window gating
+  // Calibration stable-window tracking — diagnostic only.
+  // Stab=3 transitions DO NOT touch calStartMs (that's the master collect timer).
+  // stableStartMs tracks when the current stab=3 window opened, for logging.
   if (calInProgress && !baselineCaptured) {
     if (stab == STABILITY_STABLE) {
-      inStableWindow = true;
-      // Restart the 3s collection window from this stable moment — arm just settled
-      calStartMs = now;
-      LOG_I("[Cal] stab=3: stable window started, calStartMs reset");
+      if (!inStableWindow) {
+        inStableWindow = true;
+        stableStartMs = now;
+        LOG_I("[Cal] stab=3: stable window opened");
+      }
     } else if (stab >= 4) {
-      inStableWindow = false;
+      if (inStableWindow) {
+        inStableWindow = false;
+        LOG_I("[Cal] stab=4: stable window closed after %lums", now - stableStartMs);
+      }
 #ifdef CAL_LAST_WINDOW_ONLY
       stableCalBuffer.reset();
 #endif
@@ -1484,8 +1690,69 @@ void finalizeCalibration() {
 void loop() {
   static bool firstLoop = true;
 
-  // 5s heartbeat — proves the loop is alive and shows calibration-relevant
-  // state at a glance. Uncomment to enable diagnostic.
+  // Pat the watchdog. Must be the first thing in loop() so any subsequent
+  // wedge gets caught within the 8s WDT window. Magic value 0x6E524635 is
+  // required by the nRF52840 WDT (per datasheet).
+  NRF_WDT->RR[0] = 0x6E524635UL;
+
+  // Self-test: when WDT_SELFTEST is true, spin forever after a few loop
+  // iterations so we can confirm WDT resets the MCU and RESETREAS reports DOG
+  // on next boot.
+  //
+  // Boot-loop safety: skip the hang if we just woke from a WDT reset. So the
+  // sequence is exactly one cycle:
+  //   power-on        → selftest runs → WDT trips → reboot
+  //   reboot from WDT → selftest skipped → device operates normally
+  // After observing the [BOOT] ... DOG line once, flip WDT_SELFTEST back to
+  // false. If you forget, the device still works on the second boot onward.
+  if (WDT_SELFTEST && !(bootResetReas & 0x02)) {
+    static uint32_t selftestCount = 0;
+    if (++selftestCount == 5) {
+      LOG_E("[WDT_SELFTEST] deliberate hang — WDT should reset in 8s");
+      while (true) { /* wait for the dog */ }
+    }
+  }
+
+  // ── Heartbeat / state transition log ───────────────────────────────────
+  // Logs only on state changes (arm/disarm, sleep enter/exit), with a 60s
+  // backstop while actively armed. Quiet when idle or asleep — no per-second
+  // noise. iter counter shows loop liveness; if WDT trips, the last [HB]
+  // line in the log shows what state the device was in before the wedge.
+  {
+    static uint8_t  lastLoggedState = 0xFF;          // 0xFF = no log yet
+    static unsigned long lastHbMs   = 0;
+    static uint32_t loopIter        = 0;
+    // Pre-emptive reset before uint32_t wraps. Natural wrap is well-defined
+    // (just resets to 0), but emitting an explicit log makes it possible to
+    // distinguish "fresh boot iter=0" from "wrapped iter=0" in traces. At
+    // ~100 iter/s this fires once every ~1.4 years of uptime.
+    if (loopIter >= 0xFFFFFFFEUL) {
+      LOG_I("[HB] iter counter wrap — reset to 0");
+      loopIter = 0;
+    }
+    loopIter++;
+
+    uint8_t state = (armed ? 1 : 0) | (sleeping ? 2 : 0);
+    unsigned long now = millis();
+    if (state != lastLoggedState) {
+      const char* label =
+        state == 0 ? "DISARMED" :
+        state == 1 ? "ARMED" :
+        state == 2 ? "DISARMED+SLEEPING" :
+                     "ARMED+SLEEPING";
+      LOG_I("[HB] state=%s prev=0x%02x iter=%lu connected=%d",
+            label, (unsigned)lastLoggedState, (unsigned long)loopIter,
+            (int)Bluefruit.Periph.connected());
+      lastLoggedState = state;
+      lastHbMs = now;
+    } else if (armed && !sleeping && (now - lastHbMs) >= 60000UL) {
+      LOG_I("[HB] alive armed=1 iter=%lu connected=%d",
+            (unsigned long)loopIter, (int)Bluefruit.Periph.connected());
+      lastHbMs = now;
+    }
+  }
+
+  // (Original verbose 5s heartbeat retained as commented reference)
   // {
   //   static unsigned long lastHbMs = 0;
   //   unsigned long nowMs = millis();
@@ -1502,6 +1769,8 @@ void loop() {
     pendingEnableReports = false;
     enableReports();
   }
+
+  servicePhyUpgrade();
 
   // ── PowerManager tick while sleeping ──────────────────────────────────
   // ShakeSleepPolicy: wakes every 30s, calls modeOn() + drainFifo(), looks
@@ -1620,14 +1889,17 @@ void loop() {
     LOG_E("[DEADLOCK WARNING] CPU about to sleep (waitForEvent) but BNO085 INT is LOW! Wake interrupt will never fire!");
   }
 
-  // Calibration timeout — fires regardless of IMU/BLE events
+  // Calibration finalization — fires regardless of IMU/BLE events.
+  // Normal path: collectDone fires 3s after cal entry → use stableCalBuffer if
+  // any stab=3 windows occurred, else fall back to calBuffer.
+  // Backstop: deadlineHit fires 6s after cal entry — finalize whatever we have.
   if (calInProgress && !baselineCaptured) {
     unsigned long now = millis();
-    bool stableWindowDone = (now - calStartMs >= CAL_WINDOW_MS);
-    bool hardDeadline     = (now >= calDeadlineMs);
-    if (stableWindowDone || hardDeadline) {
-      if (hardDeadline && !stableWindowDone)
-        LOG_E("[Cal] hard deadline hit (%lums) — finalizing with partial data", CAL_DEADLINE_MS);
+    bool collectDone = (now - calStartMs >= CAL_COLLECT_MS);
+    bool deadlineHit = (now >= calDeadlineMs);
+    if (collectDone || deadlineHit) {
+      if (deadlineHit && !collectDone)
+        LOG_E("[Cal] deadline hit (%lums) — finalizing partial", CAL_DEADLINE_MS);
       finalizeCalibration();
     }
   }

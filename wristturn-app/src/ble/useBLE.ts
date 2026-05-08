@@ -37,6 +37,10 @@ type SharedState = {
   pose: { roll: number; pitch: number; yaw: number; baseRoll: number; basePitch: number; baseYaw: number } | null;
   // Gravity-based arm pose — null until first PKT_GRAV arrives after connect
   armPose: "flat" | "hanging" | "raised" | null;
+  // True when BNO Stab classifier reports stab=1 (on a flat surface). Note:
+  // also fires for arm-resting-on-flat (desk, armrest, lap), not only "unworn
+  // on table" — see wristturn-app/CLAUDE.md "Stab classifier semantics".
+  onTable: boolean;
 };
 
 const state: SharedState = {
@@ -55,6 +59,7 @@ const state: SharedState = {
    baselineCandidate: null,
    pose:            null,
    armPose:         null,
+   onTable:         false,
 };
 
 const listeners = new Set<(s: SharedState) => void>();
@@ -93,6 +98,26 @@ function comboMapToRules(map: ComboMap): InteractionRule[] {
   if (map["shake"]) {
     rules.push({ type: "terminal", token: "shake", action: map["shake"], refractoryMs: 0, gobbleMs: 500 });
   }
+
+  // Pose-transition gestures (firmware-emitted on HANGING-involving GravPose
+  // changes). Always present, regardless of whether the user mapped an action,
+  // because the gobbleMs is what absorbs arc-bleed from the underlying motion.
+  // refractoryMs is set high so a flutter near the HANGING boundary can't
+  // re-fire the same transition twice.
+  rules.push({
+    type: "terminal",
+    token: "arm_up",
+    action: map["arm_up"] ?? "noop",
+    refractoryMs: 1500,
+    gobbleMs: 800,
+  });
+  rules.push({
+    type: "terminal",
+    token: "arm_down",
+    action: map["arm_down"] ?? "noop",
+    refractoryMs: 1500,
+    gobbleMs: 800,
+  });
 
   const multi: Array<[string[], string]> = [];
   const single: Array<[string, string]>  = [];
@@ -155,6 +180,10 @@ let gestureRules: InteractionRule[] = [];
 let activeMap: ComboMap = {};
 
 const engine = new InteractionEngine((action) => {
+  // Pose-transition rules (arm_up/arm_down) fire with action="noop" when the
+  // user hasn't mapped them to anything. The rule still ran — its gobbleMs
+  // already armed the cross-axis suppression window — so we just skip dispatch.
+  if (action === "noop") return;
   // Internal mode-commit actions are routed directly, not dispatched to device
   if (action === "symbol_finalize") { symbolCapture?.finalize(); return; }
   _tFire = _logTiming("fire", action, _tPush);
@@ -231,9 +260,11 @@ let symbolCapture:     SymbolCapture     | null = null;
 let motionClassifier:  MotionClassifier  | null = null;
 let holdDetector:      HoldDetector      | null = null;
 /**
- * Last per-sample gyro magnitude (dps). Sourced from PKT.POSE_EXT once
- * firmware Loop C.0 lands. Until then, stays 0 → HoldDetector's transit gate
- * never trips → detector silently no-ops, even with the experimental flag on.
+ * Last per-sample gyro magnitude (dps). Updated from PKT.POSE_EXT in the
+ * onState handler (~10 Hz). Reads 0 only if the firmware on this device
+ * predates Loop C.0 and emits legacy PKT.POSE without the gyro field — in
+ * which case HoldDetector's transit gate never trips and the detector
+ * silently no-ops. Current firmware emits PKT.POSE_EXT.
  */
 let lastGyroMagDps:    number = 0;
 
@@ -303,8 +334,9 @@ function startRuntime() {
 
   // Position-domain hold detector. Gated by PrefsStore.experimentalHoldDetector
   // — when off, samples are still fed but the detector is bypassed at dispatch.
-  // Requires firmware that emits PKT_POSE_EXT (Loop C.0); on older firmware,
-  // lastGyroMagDps stays 0 so the transit gate never trips even with the flag on.
+  // Consumes PKT.POSE_EXT (pose + gyro magnitude) emitted by current firmware.
+  // On legacy pre-Loop-C.0 firmware that only emits PKT.POSE, lastGyroMagDps
+  // stays 0 and the transit gate never trips — graceful no-op, not a crash.
   holdDetector = new HoldDetector({
     onFire(token) {
       DebugLog.push("HOLD", token);
@@ -417,12 +449,18 @@ function startRuntime() {
     if (!event || event.name === Gesture.IDLE) return;
 
     // ── Engagement gate ──────────────────────────────────────────────────────
-    // Drop every gesture except shake when the arm is hanging at the user's
-    // side. Shake is reserved as the always-on system abort signal so the user
-    // can still escape from any screen even while disengaged. Knob ticks are
-    // synthesised from delta samples elsewhere and do not flow through here —
-    // gating them is a separate change inside MotionClassifier.
-    if (state.armPose === ArmPose.HANGING && event.name !== Gesture.SHAKE) {
+    // Drop every gesture except shake / arm_up when the arm is hanging at the
+    // user's side. Shake is reserved as the always-on system abort signal so
+    // the user can still escape from any screen even while disengaged.
+    // arm_up is the activate-transition itself — gating it on the pre-state
+    // would suppress the very event that lifts the gate.
+    // Knob ticks are synthesised from delta samples elsewhere and do not flow
+    // through here — gating them is a separate change inside MotionClassifier.
+    if (
+      state.armPose === ArmPose.HANGING &&
+      event.name !== Gesture.SHAKE &&
+      event.name !== Gesture.ARM_UP
+    ) {
       DebugLog.push("GESTURE_DROP", `${event.name} dropped (armPose=hanging)`);
       return;
     }
@@ -485,8 +523,9 @@ function startRuntime() {
   BLEServiceNative.onDelta?.((p) => {
     motionClassifier?.onDelta(p);
     // Feed HoldDetector with the same delta + the most recent gyro magnitude.
-    // gyroMagDps comes from PKT_POSE_EXT (firmware Loop C.0); on older firmware
-    // it stays 0 and the detector silently no-ops via the transit gate.
+    // gyroMagDps is updated from PKT.POSE_EXT in onState (~10 Hz cadence); the
+    // last cached value is reused here at delta cadence. On legacy firmware
+    // emitting PKT.POSE only, lastGyroMagDps stays 0 and the detector no-ops.
     if (PrefsStore.experimentalHoldDetectorSync()) {
       const sample: PoseSample = {
         delta: p,
@@ -518,6 +557,16 @@ function startRuntime() {
     switch (pkt.type) {
       case "stab": {
         motionClassifier?.onStabilityClass(pkt.stab, Date.now());
+        // BNO stab=1 = flat stationary surface. Used by DiscoveryScreen E5
+        // to trigger BROWSING exit when watch is set on a table (parallel to
+        // the armPose=HANGING exit). Note: also fires for arm-resting-on-flat
+        // — consumers should layer in dwell + screen state to disambiguate.
+        const wasOnTable = state.onTable;
+        state.onTable = (pkt.stab === 1);
+        if (state.onTable !== wasOnTable) {
+          DebugLog.push("STAB", `onTable=${state.onTable} (stab=${pkt.stab})`);
+          notify();
+        }
         break;
       }
   case "baseline": {
@@ -586,6 +635,7 @@ function startRuntime() {
           const prev = state.armPose;
           state.armPose = label;
           console.log(`[GravPose] armPose → ${label}`);
+          DebugLog.push("GRAVPOSE", `${prev ?? "unknown"} → ${label}`);
           // HoldDetector universal exits on pose change
           holdDetector?.onArmPoseChange(prev ?? "unknown", label);
           holdDetector?.onGravPoseChange();
@@ -643,6 +693,7 @@ export function useBLE({ onGesture, onCombo }: UseBLEOptions = {}) {
   const [baselineReady,    setBaselineReady]    = useState(state.baselineReady);
   const [baselineCandidate,setBaselineCandidate]= useState(state.baselineCandidate);
   const [armPose,          setArmPose]          = useState(state.armPose);
+  const [onTable,          setOnTable]          = useState(state.onTable);
 
   const lastGestureRef  = useRef(state.lastGesture);
   const lastComboSeqRef = useRef(state.comboSeq);
@@ -663,6 +714,7 @@ export function useBLE({ onGesture, onCombo }: UseBLEOptions = {}) {
       setBaselineReady(s.baselineReady);
       setBaselineCandidate(s.baselineCandidate);
       setArmPose(s.armPose);
+      setOnTable(s.onTable);
 
       if (s.lastGesture && s.lastGesture !== lastGestureRef.current) {
         lastGestureRef.current = s.lastGesture;
@@ -684,7 +736,7 @@ export function useBLE({ onGesture, onCombo }: UseBLEOptions = {}) {
    return {
      connected, wristName, wristAddress, lastGesture, lastCombo, batteryPct,
      symbolModeEnabled, symbolCapturing, motionState, pose,
-     sleeping, baselineReady, baselineCandidate, armPose,
+     sleeping, baselineReady, baselineCandidate, armPose, onTable,
    };
  }
 

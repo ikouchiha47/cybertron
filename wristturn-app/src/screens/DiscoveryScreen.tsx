@@ -9,7 +9,8 @@ import type { StackScreenProps } from "@react-navigation/stack";
 import type { BottomTabScreenProps } from "@react-navigation/bottom-tabs";
 import type { TabParams, RootStackParams } from "../navigation/AppNavigator";
 import { useBLE } from "../ble/useBLE";
-import { startCalibration, armDevice, disarmDevice, confirmBaselineReady, sendBaselineToFirmware } from "../ble/useBLE";
+import { startCalibration, armDevice, disarmDevice, confirmBaselineReady, sendBaselineToFirmware, requestRecalibration, currentBaselineSeq } from "../ble/useBLE";
+import { DebugLog } from "../debug/DebugLog";
 import { BaselineStore } from "../storage/BaselineStore";
 import { CalibrationOverlay } from "./CalibrationOverlay";
 import { WRISTTURN_NAME } from "../ble/constants";
@@ -43,6 +44,7 @@ function PulseRings({ active }: { active: boolean }) {
   const loops = useRef<Animated.CompositeAnimation[]>([]);
 
   useEffect(() => {
+    console.log(`[PulseRings] effect run active=${active}`);
     loops.current.forEach(l => l.stop());
     anims.forEach(a => a.setValue(0));
     if (!active) return;
@@ -52,6 +54,7 @@ function PulseRings({ active }: { active: boolean }) {
     );
     const timeouts = loops.current.map((loop, i) => setTimeout(() => loop.start(), i * PULSE_STAGGER));
     return () => {
+      console.log(`[PulseRings] cleanup`);
       timeouts.forEach(clearTimeout);
       loops.current.forEach(l => l.stop());
     };
@@ -231,7 +234,9 @@ function CircleView({
   );
 }
 
-const RAISE_CONFIRM_MS = 1000;  // arm must stay not-hanging for 1s before entering browse
+const RAISE_CONFIRM_MS     = 1000;  // arm must stay not-hanging for 1s before entering browse
+const SETTLE_PITCH_DOWN_MS = 500;   // min quiet window before pitch_down can open a device
+const TABLE_EXIT_MS        = 2500;  // device-on-table held this long → exit browse (parallel to HANGING)
 const HANG_EXIT_MS     = 1500;  // hanging held for 1.5s exits browse
 
 export function DiscoveryScreen({ navigation }: Props) {
@@ -240,12 +245,23 @@ export function DiscoveryScreen({ navigation }: Props) {
   const [selectedIdx, setSelected] = useState(0);
   const [discState, setDiscState] = useState<DiscStateValue>(DiscState.IDLE);
   const [storedBaseline, setStoredBaseline] = useState<Baseline | null>(null);
-  const connectingRef  = useRef(false);
-  const devicesRef     = useRef<DeviceMetadata[]>([]);
-  const selectedRef    = useRef(0);
-  const discStateRef   = useRef(discState);
-  const dropTimerRef   = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const insets         = useSafeAreaInsets();
+  const connectingRef    = useRef(false);
+  const devicesRef       = useRef<DeviceMetadata[]>([]);
+  const selectedRef      = useRef(0);
+  const discStateRef     = useRef(discState);
+  const dropTimerRef     = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const calibTimeoutRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Fencing token: snapshot of baselineCandidate.seq taken when this screen
+  // initiates a calibration round. The completion effect ignores any candidate
+  // whose seq ≤ this snapshot — that filters out the candidate from a previous
+  // round (e.g. user cleared baseline in Settings then came back).
+  const calibSnapshotSeqRef = useRef<number | null>(null);
+  // Settle gate: pitch_down → openDevice rejected if any gesture fired in the
+  // last SETTLE_PITCH_DOWN_MS. Suppresses arc-bleed during arm-down/arm-up
+  // motions where pitch_down fires mid-arc and would accidentally select a
+  // device. Updated on every gesture this screen sees.
+  const lastGestureMsRef = useRef<number>(0);
+  const insets           = useSafeAreaInsets();
   const iconRot        = useRef(new Animated.Value(0)).current;
 
   // ── State logger ─────────────────────────────────────────────────────────
@@ -257,6 +273,10 @@ export function DiscoveryScreen({ navigation }: Props) {
   // Stable gesture handler — reads discState via ref, no dependency churn
   const handleGesture = React.useCallback((g: string) => {
     const ds = discStateRef.current;
+    const now = Date.now();
+    const sinceLast = now - lastGestureMsRef.current;
+    lastGestureMsRef.current = now;
+
     switch (ds) {
       case "calibrating":
         if (g === Gesture.SHAKE) {
@@ -266,6 +286,10 @@ export function DiscoveryScreen({ navigation }: Props) {
         break;
       case "wait_raised":
         if (g === Gesture.PITCH_DOWN && devicesRef.current.length > 0) {
+          if (sinceLast < SETTLE_PITCH_DOWN_MS) {
+            DebugLog.push("DISCOVERY", `pitch_down rejected: ${sinceLast}ms < ${SETTLE_PITCH_DOWN_MS}ms (wait_raised)`);
+            return;
+          }
           setDiscState(DiscState.BROWSING);
           openDevice(devicesRef.current[selectedRef.current]);
         }
@@ -275,6 +299,10 @@ export function DiscoveryScreen({ navigation }: Props) {
           const dir = g === Gesture.TURN_RIGHT ? 1 : -1;
           cycleDevice(dir);
         } else if (g === Gesture.PITCH_DOWN && devicesRef.current.length > 0) {
+          if (sinceLast < SETTLE_PITCH_DOWN_MS) {
+            DebugLog.push("DISCOVERY", `pitch_down rejected: ${sinceLast}ms < ${SETTLE_PITCH_DOWN_MS}ms (browsing)`);
+            return;
+          }
           openDevice(devicesRef.current[selectedRef.current]);
         } else if (g === Gesture.SHAKE) {
           setDiscState(DiscState.WAIT_RAISED);
@@ -291,7 +319,7 @@ export function DiscoveryScreen({ navigation }: Props) {
   }, []); // stable — reads state via ref
 
   const ble = useBLE({ onGesture: handleGesture });
-  const { connected, wristName, wristAddress, batteryPct, motionState, pose, sleeping, baselineCandidate, armPose } = ble;
+  const { connected, wristName, wristAddress, batteryPct, motionState, pose, sleeping, baselineCandidate, armPose, onTable } = ble;
 
   useEffect(() => {
     log(`discState → ${discState} | connected=${connected} | baseline=${!!storedBaseline} | motion=${motionState} | sleeping=${sleeping}`);
@@ -323,10 +351,13 @@ export function DiscoveryScreen({ navigation }: Props) {
   }, [navigation]);
 
   // E1: Connect/disconnect
+  // On disconnect we only reset to IDLE — we intentionally do NOT wipe storedBaseline
+  // from state, because clearing it caused E2 to re-trigger recalibration on every
+  // BLE reconnect (e.g. brief drop during navigation to ActiveControl). The baseline
+  // is always reloaded fresh from BaselineStore on each reconnect anyway.
   useEffect(() => {
     if (!connected) {
       log("E1: disconnected → idle");
-      setStoredBaseline(null);
       setDiscState(DiscState.IDLE);
       return;
     }
@@ -337,8 +368,15 @@ export function DiscoveryScreen({ navigation }: Props) {
       if (b) {
         // E8 only fires on focus transitions — by the time this async load completes
         // the screen is already focused and the event won't re-fire. Send here instead.
+        // MotionClassifier is NOT initialised here — that's a per-device-selection-session
+        // concern handled by ActiveControl. Discovery only restores the persistent
+        // home baseline; MC calibration is fresh per session and forgotten on exit.
         sendBaselineToFirmware(b).catch((e) => log(`E1: sendBaseline error: ${e}`));
         setDiscState(DiscState.WAIT_RAISED);
+      } else {
+        // No baseline exists yet — let E2 handle starting calibration.
+        // Reset to null so E2's guard triggers correctly.
+        setStoredBaseline(null);
       }
     }).catch((e) => {
       log(`E1: BaselineStore error: ${e}`);
@@ -347,18 +385,39 @@ export function DiscoveryScreen({ navigation }: Props) {
   }, [connected, wristAddress]);
 
   // E2: No baseline → calibrate
+  // Only fires when connected AND storedBaseline is definitively null (not just
+  // transiently unloaded), and we're not already calibrating.
   useEffect(() => {
-    if (connected && !storedBaseline && discState !== DiscState.CALIBRATING) {
+    if (connected && storedBaseline === null && discState !== DiscState.CALIBRATING) {
       log("E2: no baseline → calibrating");
+      // Snapshot seq before arming so the completion effect can fence stale candidates.
+      calibSnapshotSeqRef.current = currentBaselineSeq();
       setDiscState(DiscState.CALIBRATING);
       startCalibration();
     }
   }, [connected, storedBaseline, discState]);
 
   // E3: Calibration complete
+  // Safety: if the async chain (save/send/arm) fails or firmware never responds,
+  // a 5s timeout advances to WAIT_RAISED so the user is never stuck on the overlay.
   useEffect(() => {
-    if (discState !== DiscState.CALIBRATING || !baselineCandidate) return;
-    log("E3: baseline candidate received, saving");
+    if (discState !== DiscState.CALIBRATING) {
+      // Clear any pending safety timeout if we exit calibration for any reason
+      if (calibTimeoutRef.current) { clearTimeout(calibTimeoutRef.current); calibTimeoutRef.current = null; }
+      return;
+    }
+    if (!baselineCandidate) return;
+    // Fence: ignore candidates from prior rounds. If snap is null we have no
+    // outstanding request — also ignore (defensive; shouldn't happen because
+    // the only paths into CALIBRATING all set the snapshot first).
+    const snap = calibSnapshotSeqRef.current;
+    if (snap === null || baselineCandidate.seq <= snap) {
+      log(`E3: stale candidate seq=${baselineCandidate.seq} snap=${snap}, ignoring`);
+      return;
+    }
+    // Firmware sent a baseline — clear safety timeout and process it
+    if (calibTimeoutRef.current) { clearTimeout(calibTimeoutRef.current); calibTimeoutRef.current = null; }
+    log(`E3: fresh candidate seq=${baselineCandidate.seq} > snap=${snap}, saving`);
     const baseline: Baseline = {
       roll: baselineCandidate.roll,
       pitch: baselineCandidate.pitch,
@@ -375,23 +434,48 @@ export function DiscoveryScreen({ navigation }: Props) {
       return armDevice();
     }).then(() => {
       log("E3: done → wait_raised");
+      calibSnapshotSeqRef.current = null;
       setDiscState(DiscState.WAIT_RAISED);
-    }).catch((e) => log(`E3: ERROR: ${e}`));
+    }).catch((e) => {
+      log(`E3: ERROR: ${e} — advancing to wait_raised anyway`);
+      DebugLog.error(`Calibration failed: ${e}`);
+      calibSnapshotSeqRef.current = null;
+      setDiscState(DiscState.WAIT_RAISED);
+    });
   }, [discState, baselineCandidate, wristName, wristAddress]);
+
+  // E3b: Safety timeout — if CALIBRATING for > 8s with no baseline candidate,
+  // advance to WAIT_RAISED (firmware may have silently failed to respond).
+  useEffect(() => {
+    if (discState !== DiscState.CALIBRATING) return;
+    calibTimeoutRef.current = setTimeout(() => {
+      calibTimeoutRef.current = null;
+      if (discStateRef.current !== DiscState.CALIBRATING) return;
+      log("E3b: calibration safety timeout — advancing to wait_raised");
+      calibSnapshotSeqRef.current = null;
+      setDiscState(DiscState.WAIT_RAISED);
+    }, 8000);
+    return () => {
+      if (calibTimeoutRef.current) { clearTimeout(calibTimeoutRef.current); calibTimeoutRef.current = null; }
+    };
+  }, [discState]);
 
   // E4: wait_raised → browsing when arm is not hanging (flat or raised = device in use).
   // "raised" (steep angle) and "flat" (horizontal use) both count — only hanging means done.
   // Requires pose to hold for RAISE_CONFIRM_MS to avoid transient triggers.
+  // Also requires !onTable — without this, E5b would exit and E4 would
+  // immediately re-engage the next render, looping forever on a stable surface.
   useEffect(() => {
     if (discState !== DiscState.WAIT_RAISED || armPose === null) return;
     if (armPose === ArmPose.HANGING) return;
+    if (onTable) return;
     log(`E4: armPose=${armPose} → confirm ${RAISE_CONFIRM_MS}ms`);
     const t = setTimeout(() => {
       log("E4: confirmed → browsing");
       setDiscState(DiscState.BROWSING);
     }, RAISE_CONFIRM_MS);
     return () => clearTimeout(t);
-  }, [armPose, discState]);
+  }, [armPose, discState, onTable]);
 
   // E5: browsing → wait_raised when arm hangs by side (definitive done signal).
   // flat = device still in use (on desk, armrest, pointing at screen) — don't exit.
@@ -414,6 +498,39 @@ export function DiscoveryScreen({ navigation }: Props) {
       }, HANG_EXIT_MS);
     }
   }, [armPose, discState]);
+
+  // E5b: browsing → wait_raised when device is set on a flat surface.
+  //
+  // Parallel to E5 (HANGING exit) but driven by the BNO Stab classifier (stab=1).
+  // Independent timer so the table-vs-hanging dwells can diverge without coupling.
+  // Note: stab=1 also fires for arm-resting-on-flat (desk, armrest, lap) — the
+  // longer dwell (TABLE_EXIT_MS) gives the user a window to lift before exit.
+  const tableTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    if (discState !== DiscState.BROWSING) {
+      if (tableTimerRef.current) {
+        clearTimeout(tableTimerRef.current);
+        tableTimerRef.current = null;
+      }
+      return;
+    }
+    if (!onTable) {
+      if (tableTimerRef.current) {
+        clearTimeout(tableTimerRef.current);
+        tableTimerRef.current = null;
+      }
+      return;
+    }
+    if (!tableTimerRef.current) {
+      log(`E5b: onTable=true, exit timer ${TABLE_EXIT_MS}ms`);
+      tableTimerRef.current = setTimeout(() => {
+        log("E5b: timer fired → wait_raised");
+        tableTimerRef.current = null;
+        setDiscState(DiscState.WAIT_RAISED);
+      }, TABLE_EXIT_MS);
+    }
+  }, [onTable, discState]);
 
   // E6: Sleeping → idle
   useEffect(() => {
@@ -444,15 +561,21 @@ export function DiscoveryScreen({ navigation }: Props) {
             sendBaselineToFirmware(b).catch(() => {});
           } else if (discStateRef.current !== DiscState.CALIBRATING) {
             log("E8: baseline missing on focus → triggering recalibration");
+            // Snapshot before issuing the request so the next firmware-emitted
+            // candidate (seq > snapshot) is the only one E3 will accept.
+            calibSnapshotSeqRef.current = currentBaselineSeq();
             setDiscState(DiscState.CALIBRATING);
             startCalibration();
+            requestRecalibration().catch(() => {});
           } else {
             // discState is already CALIBRATING — discState won't change so E7 won't
             // re-fire. Call startCalibration() directly: it now arms the device, which
             // is what may have been missing (e.g. user cleared baseline mid-session,
             // or reconnect after sleep landed in an already-CALIBRATING discState).
-            log("E8: already calibrating on focus → re-arm device");
+            log("E8: already calibrating on focus → re-arm + re-request");
+            calibSnapshotSeqRef.current = currentBaselineSeq();
             startCalibration();
+            requestRecalibration().catch(() => {});
           }
         });
       }
@@ -465,6 +588,7 @@ export function DiscoveryScreen({ navigation }: Props) {
   useEffect(() => {
     return () => {
       if (dropTimerRef.current) { clearTimeout(dropTimerRef.current); dropTimerRef.current = null; }
+      if (calibTimeoutRef.current) { clearTimeout(calibTimeoutRef.current); calibTimeoutRef.current = null; }
     };
   }, []);
 
@@ -496,9 +620,10 @@ export function DiscoveryScreen({ navigation }: Props) {
       navigation.navigate("Pairing", { deviceId: meta.id });
     });
     subs.push(onReady, onError);
-    AndroidTV.connect(meta.host).catch(() => {
+    AndroidTV.connect(meta.host).catch((e: unknown) => {
       subs.forEach((s) => s.remove());
       connectingRef.current = false;
+      DebugLog.error(`AndroidTV connect failed: ${e}`);
       navigation.navigate("Pairing", { deviceId: meta.id });
     });
   }
@@ -519,7 +644,17 @@ export function DiscoveryScreen({ navigation }: Props) {
       {/* Calibration Overlay */}
       <CalibrationOverlay
         visible={discState === DiscState.CALIBRATING}
-        onSkip={() => { disarmDevice().catch(() => {}); setDiscState(DiscState.WAIT_RAISED); }}
+        onSkip={() => {
+          // Only advance to WAIT_RAISED if we already have a stored baseline;
+          // otherwise skip back to IDLE so E2 can re-trigger calibration cleanly.
+          disarmDevice().catch(() => {});
+          calibSnapshotSeqRef.current = null;
+          if (storedBaseline) {
+            setDiscState(DiscState.WAIT_RAISED);
+          } else {
+            setDiscState(DiscState.IDLE);
+          }
+        }}
       />
 
       {/* Header */}

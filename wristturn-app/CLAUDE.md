@@ -100,3 +100,24 @@ Rules:
   from `useBLE`. They do not drive those values.
 - New screens go in `RootStackParams` / `TabParams` in `AppNavigator.tsx` first.
 - `src/ui/` holds shared visual components — keep them stateless and prop-driven.
+
+---
+
+## Stab classifier semantics — important nuance
+
+The BNO Stab classifier (values 0-4) feeds `state.motionState`. The value
+`stab=1` is documented as "table" but in practice fires whenever the device
+is stationary on a flat surface — which includes:
+
+- Watch on a literal table
+- **Wrist resting on something flat** (chair armrest, desk, lap, knee)
+- Watch in a still pocket
+
+So `stab=1` does NOT mean "device is unworn." It means "device is at rest
+on a flat enough surface, no biological tremor present." A user resting
+their forearm on a desk while wearing the watch will produce `stab=1`.
+
+This matters for engagement-state logic that wants to distinguish "user is
+not engaged" from "user is engaged but resting." Treat `stab=1` as an
+ambiguity signal, not a definitive "not worn" signal. If you key engagement
+off `stab=1`, you'll falsely disengage users who rest their arm.
