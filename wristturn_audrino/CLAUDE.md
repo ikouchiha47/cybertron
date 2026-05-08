@@ -148,3 +148,65 @@ python3 tools/analyze_firmware_log.py tmp/logs.NN.txt --tags Cal Stab RVRate Cal
 [CalBuf] count=25/25 ...            ← full after 25 samples (~500ms)
 [Cal] baseline captured             ← done
 ```
+
+---
+
+## C++ coding conventions
+
+The firmware runs two execution contexts:
+
+1. **Main task** — `setup()` and `loop()`, the Arduino sketch.
+2. **Bluefruit / SoftDevice task** — every BLE callback (`connect_callback`, `disconnect_callback`, `onWrite`, `onCccd`, …) runs on a separate FreeRTOS task scheduled by the SoftDevice.
+
+Anything touched by both is **shared mutable state across tasks**. Treat it that way.
+
+### Rules
+
+1. **Tag every cross-task variable.** Any global written by a BLE callback and read by `loop()` (or vice versa) must be `volatile`. Examples in this codebase: `armed`, `sleeping`, `calInProgress`, `baselineCaptured`, `currentMode`, `lastActivityMs`. Without `volatile` the compiler is free to cache the value in a register and never re-read it (`while (!armed) {}` becomes an infinite loop in `-O2`).
+
+2. **Single-task locals stay plain.** `static` locals inside `loop()` (e.g. `loopIter`, `lastLoggedState`, `lastHbMs` in the heartbeat block) are only touched by the main task — no `volatile` needed. Document this with a one-line comment if the file also handles cross-task state, so the next reader doesn't have to derive it.
+
+3. **`volatile` is not atomicity.** It guarantees the load/store isn't elided or reordered by the compiler — it does **not** guarantee a multi-step read-modify-write is uninterruptible. For counters incremented from both tasks, or for multi-field invariants, use a critical section (`taskENTER_CRITICAL()` / `taskEXIT_CRITICAL()` under FreeRTOS, or `noInterrupts()/interrupts()` for ISR-shared state).
+
+4. **Aligned 32-bit reads/stores are atomic on Cortex-M4 — but only single-word.** `bool`, `uint8_t`, `uint32_t`, and pointers won't tear. Anything wider (`uint64_t`, structs, strings) can. If you log or copy a multi-field snapshot from the other task, expect transient inconsistency — fine for logs, not fine for control decisions.
+
+5. **Check return values.** Every `imu.enableReport(...)`, `Bluefruit.begin(...)`, `Wire.endTransmission()` returns success/failure. Discarding the result is a Power-of-10 Rule 7 violation. Either act on it or log it with a tag.
+
+6. **Bound every wait.** `Bluefruit.waitForEvent()` and similar must have an upper bound or sit behind the hardware watchdog. The 8s WDT is the backstop — don't rely on it as the primary mechanism.
+
+7. **Assert on invariants** (Power-of-10 Rule 5). Use a `LOG_E` + safe fallback rather than `assert()` (which would halt). Density target: at least one assertion per non-trivial function.
+
+8. **Bounded loops** (Power-of-10 Rule 2). Every `while`/`for` must have a statically provable upper bound or an explicit iteration cap with a logged break. Drain loops on the BNO08x FIFO are a common offender — cap at e.g. 32 events per pass.
+
+9. **No dynamic allocation on hot paths.** No `new`, no `malloc`, no STL containers that allocate (`std::vector`, `std::string`). Fixed-size buffers only. Allocation in `setup()` is fine; allocation in `loop()` or any callback is not.
+
+10. **Pedantic warnings on** (Power-of-10 Rule 10). Build with `-Wall -Wextra -Wpedantic -Wshadow -Wconversion`. Treat warnings as bugs. `if constexpr` requires `-std=c++17` — Arduino IDE default is gnu++11, so plain `if (CONSTEXPR_BOOL)` with a `static constexpr bool` is the portable form (the dead branch still folds).
+
+### Tools — what helps, what doesn't
+
+- **No `go -race` equivalent for nRF52.** ThreadSanitizer / Helgrind / DRD all need host runtime — won't fit in 256 KB RAM and aren't supported by the Cortex-M4 toolchain.
+- **Host-side TSan is reachable** for any pure-C++ logic factored out of Arduino headers. The `wristturn/Makefile.test` host harness already builds `StillnessDetector` with `g++` — adding `-fsanitize=thread` to a host build would catch races in classifier/state-machine code if we ever spawn host-side threads to exercise them. Today everything runs single-threaded in tests, so TSan would find nothing.
+- **Static checkers**: `clang-tidy` with `concurrency-*`, `bugprone-*`, `cert-*` checks runs on Arduino sources directly. `cppcheck --enable=all` is lighter and catches missing `volatile` on globals touched from ISRs in many cases. Either is worth wiring into CI.
+- **Compile-time concurrency annotations**: Clang's `-Wthread-safety` plus `__attribute__((guarded_by(...)))` lets you annotate which mutex protects each variable and have the compiler enforce it. Heavier than this codebase needs today, but the right answer if cross-task state grows.
+
+### Future work — atomics and a small concurrency primitive
+
+When the cross-task variable count grows past a handful, replace ad-hoc `volatile` with a thin wrapper:
+
+```cpp
+// Future: drop-in for cross-task scalars. Documents intent and centralizes
+// the memory-order story so we don't relitigate it per call site.
+template <typename T>
+class Atomic {
+  static_assert(sizeof(T) <= 4, "Cortex-M4 atomic single-word only");
+  volatile T v_;
+public:
+  T  load()  const { return v_; }            // atomic on aligned 32-bit
+  void store(T x)  { v_ = x; }
+  // No fetch_add / CAS yet — add via __atomic_* builtins when needed.
+};
+```
+
+Or, once a build switches to `-std=c++17` consistently, just `std::atomic<bool>` / `std::atomic<uint32_t>` from `<atomic>` — the GCC ARM port lowers these to `LDREX/STREX` on Cortex-M4, no library needed for word-sized types.
+
+Trigger to do this work: the next time we add a cross-task variable, OR the next time a race is suspected (symptom: stale read of `armed`, `sleeping`, or similar — heartbeat shows one value, behaviour reflects another).
