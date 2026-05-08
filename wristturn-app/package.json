@@ -20,6 +20,7 @@
     "androidtv-remote": "^1.0.10",
     "expo": "~54.0.33",
     "expo-file-system": "~19.0.21",
+    "expo-keep-awake": "~15.0.8",
     "expo-sharing": "~14.0.8",
     "expo-status-bar": "~3.0.9",
     "protobufjs": "^8.0.0",

@@ -3,9 +3,13 @@ import {
   View, Text, FlatList, TouchableOpacity, StyleSheet, Alert,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { useKeepAwake } from "expo-keep-awake";
 import { DebugLog } from "../debug/DebugLog";
 
 export function LogsScreen() {
+  // Hold the screen awake while watching live logs — user is gesturing at
+  // the wrist device, not touching the phone.
+  useKeepAwake();
   const [lines, setLines] = useState<string[]>([]);
   const listRef = useRef<FlatList>(null);
   const insets  = useSafeAreaInsets();

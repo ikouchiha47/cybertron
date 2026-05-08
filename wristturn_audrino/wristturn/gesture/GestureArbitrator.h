@@ -77,9 +77,18 @@ public:
     // all non-dominant candidates have zero integrals.
     static constexpr float DENOMINATOR_EPSILON = 0.001f;
     // Absolute minimum |integral| for any axis to be considered a real gesture.
-    // Lowered from 0.40 → 0.20 rad (~11.5°) to allow gentler wrist movements
-    // to register as gestures. Bleed events still blocked by ratio test.
-    static constexpr float MIN_INTEGRAL = 0.20f;
+    // Tuned against real-use logs:
+    //   - Bleeds during arm-up/arm-down arcs cluster at 0.15–0.30 rad
+    //   - Legitimate gentle pitches sit at 0.30–0.50 rad (with high peakRate)
+    //   - Strong flicks are 0.7+ rad
+    // 0.35 (~20°) is a noise floor that cuts the small bleed band but keeps
+    // gentle deliberate pitches intact. Higher integ-range bleeds are caught
+    // by the screen-level settle gate (Discovery's pitch_down → openDevice).
+    // Symbol mode unaffected — that path consumes raw IMU samples directly.
+    // History: originally 0.40; lowered to 0.20 for gentle gestures; tried
+    // 0.50 (cut too many real pitches); landed at 0.35.
+    // If pitch bleed remains, consider per-axis thresholds (pitch lower).
+    static constexpr float MIN_INTEGRAL = 0.30f;
 
     // arbitrate() may be called on every gyro sample or only when at least
     // one candidate is valid — the caller decides the cadence.

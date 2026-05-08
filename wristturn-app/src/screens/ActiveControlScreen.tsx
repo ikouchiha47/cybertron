@@ -4,6 +4,7 @@ import {
 } from "react-native";
 import MCI from "react-native-vector-icons/MaterialCommunityIcons";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { useKeepAwake } from "expo-keep-awake";
 import type { StackScreenProps } from "@react-navigation/stack";
 import type { RootStackParams } from "../navigation/AppNavigator";
 import { useBLE, setActiveComboMap, sendBaselineToFirmware, armDevice, requestRecalibration, lastFireMs, recalibrate, resetMotionClassifier } from "../ble/useBLE";
@@ -20,6 +21,10 @@ import { Gesture, ArmPose } from "../types";
 type Props = StackScreenProps<RootStackParams, "ActiveControl">;
 
 export function ActiveControlScreen({ route, navigation }: Props) {
+  // Hold the screen awake — gestures come from the wrist, not the touch
+  // surface, so Android's display timeout would otherwise dim the screen
+  // mid-session.
+  useKeepAwake();
   const { deviceId, homeBaseline }  = route.params;
   const meta          = registry.get(deviceId);
   const proxy         = registry.getProxy(deviceId);
@@ -75,6 +80,10 @@ export function ActiveControlScreen({ route, navigation }: Props) {
   }, [locked]);
 
   useEffect(() => {
+    // Start the idle countdown on screen mount so "open and walk away"
+    // auto-exits without requiring a first gesture to arm the timer.
+    // resetIdleTimer respects locked / backgrounded state internally.
+    resetIdleTimer();
     return () => { if (idleTimer.current) clearTimeout(idleTimer.current); };
   }, []);
 
@@ -89,8 +98,45 @@ export function ActiveControlScreen({ route, navigation }: Props) {
       mapRef.current = m;
       setActiveComboMap(m);
     });
-    proxy.connect().then(() => setDeviceConnected(true)).catch(console.error);
-    return () => { proxy.disconnect(); setDeviceConnected(false); };
+
+    // Connect to the device with a timeout fallback. If the device proxy
+    // doesn't respond (e.g. the TV is powered off / unreachable), bail back
+    // to Discovery instead of leaving the user stuck on a non-functional
+    // "Connecting..." screen forever. `cancelled` guards against firing
+    // navigation.goBack() if the screen has already been unmounted by the
+    // time the timeout / catch resolves.
+    const CONNECT_TIMEOUT_MS = 5000;
+    let cancelled = false;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutId = setTimeout(
+        () => reject(new Error("connect timeout")),
+        CONNECT_TIMEOUT_MS,
+      );
+    });
+
+    Promise.race([proxy.connect(), timeoutPromise])
+      .then(() => {
+        if (cancelled) return;
+        if (timeoutId) clearTimeout(timeoutId);
+        setDeviceConnected(true);
+      })
+      .catch((e) => {
+        if (timeoutId) clearTimeout(timeoutId);
+        if (cancelled) return;
+        const reason = e?.message ?? String(e);
+        console.error("[ActiveControl] connect failed:", reason);
+        DebugLog.push("AC", `connect failed: ${reason} — exiting`);
+        navigation.goBack();
+      });
+
+    return () => {
+      cancelled = true;
+      if (timeoutId) clearTimeout(timeoutId);
+      proxy.disconnect();
+      setDeviceConnected(false);
+    };
   }, [deviceId]);
 
   // ── Animation helper (must be before useBLE so onCombo closure can reference it without hoisting) ──

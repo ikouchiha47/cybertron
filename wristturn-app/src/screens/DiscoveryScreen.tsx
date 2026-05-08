@@ -4,6 +4,7 @@ import {
 } from "react-native";
 import MCI from "react-native-vector-icons/MaterialCommunityIcons";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { useKeepAwake } from "expo-keep-awake";
 import type { CompositeScreenProps } from "@react-navigation/native";
 import type { StackScreenProps } from "@react-navigation/stack";
 import type { BottomTabScreenProps } from "@react-navigation/bottom-tabs";
@@ -235,11 +236,15 @@ function CircleView({
 }
 
 const RAISE_CONFIRM_MS     = 1000;  // arm must stay not-hanging for 1s before entering browse
-const SETTLE_PITCH_DOWN_MS = 500;   // min quiet window before pitch_down can open a device
+const SETTLE_PITCH_DOWN_MS = 800;   // min quiet window before pitch_down can open a device (matches arm_up gobbleMs)
 const TABLE_EXIT_MS        = 2500;  // device-on-table held this long → exit browse (parallel to HANGING)
 const HANG_EXIT_MS     = 1500;  // hanging held for 1.5s exits browse
 
 export function DiscoveryScreen({ navigation }: Props) {
+  // Hold the screen awake while the user is gesturing at the wrist —
+  // Android's display timeout would otherwise kick in because the phone
+  // sees no touch input.
+  useKeepAwake();
   const [viewMode, setViewMode] = useState<"circle" | "list">("circle");
   const [devices, setDevices]   = useState<DeviceMetadata[]>([]);
   const [selectedIdx, setSelected] = useState(0);
