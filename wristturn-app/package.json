@@ -4,10 +4,13 @@
   "main": "index.ts",
   "scripts": {
     "start": "expo start",
-    "android": "expo run:android",
+    "android": "npm run sync-native && expo run:android",
     "ios": "expo run:ios",
     "web": "expo start --web",
-    "validate-combos": "tsx scripts/validate-combos.ts"
+    "validate-combos": "tsx scripts/validate-combos.ts",
+    "sync-native": "bash scripts/sync-native-overlay.sh",
+    "prebuild": "expo prebuild && npm run sync-native",
+    "postinstall": "[ -d android ] && npm run sync-native || true"
   },
   "dependencies": {
     "@react-native-async-storage/async-storage": "2.2.0",
