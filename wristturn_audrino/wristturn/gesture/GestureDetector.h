@@ -99,6 +99,12 @@ public:
     }
     float integralThreshold() const { return _integralThreshold; }
 
+    /** Per-axis arbitrator floor — runtime-tunable via BLE minIntegralsChar. */
+    void  setMinIntegralPitch(float v)   { _arb.setMinIntegralPitch(v); }
+    void  setMinIntegralRollYaw(float v) { _arb.setMinIntegralRollYaw(v); }
+    float minIntegralPitch()   const { return _arb.getMinIntegralPitch(); }
+    float minIntegralRollYaw() const { return _arb.getMinIntegralRollYaw(); }
+
     // Expose axis states for serial logging
     AxisDetector::AxisState rollState()  const { return _roll.state();  }
     AxisDetector::AxisState pitchState() const { return _pitch.state(); }

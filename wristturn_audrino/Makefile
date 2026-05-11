@@ -7,7 +7,13 @@ UF2FAM   := 0xADA52840
 .PHONY: build clean flash
 
 build:
-	arduino-cli compile --fqbn $(FQBN) --output-dir $(BUILDDIR) $(SKETCH)
+	@COMPILE_EPOCH=$$(date -u +%s); \
+	echo "==> compile epoch UTC: $$COMPILE_EPOCH ($$(date -u))"; \
+	arduino-cli compile \
+	  --fqbn $(FQBN) \
+	  --output-dir $(BUILDDIR) \
+	  --build-property "compiler.cpp.extra_flags=-DCOMPILE_EPOCH=$$COMPILE_EPOCH""UL" \
+	  $(SKETCH)
 	$(UF2CONV) -c -f $(UF2FAM) -o firmware.uf2 $(BUILDDIR)/$(SKETCH).ino.hex
 	cp $(BUILDDIR)/$(SKETCH).ino.hex $(SKETCH)/firmware.hex
 	@echo "==> firmware.uf2 ($(shell ls -lh firmware.uf2 2>/dev/null | awk '{print $$5}'))"

@@ -76,19 +76,26 @@ public:
     // Small epsilon added to the denominator to prevent divide-by-zero when
     // all non-dominant candidates have zero integrals.
     static constexpr float DENOMINATOR_EPSILON = 0.001f;
-    // Absolute minimum |integral| for any axis to be considered a real gesture.
-    // Tuned against real-use logs:
-    //   - Bleeds during arm-up/arm-down arcs cluster at 0.15–0.30 rad
-    //   - Legitimate gentle pitches sit at 0.30–0.50 rad (with high peakRate)
-    //   - Strong flicks are 0.7+ rad
-    // 0.35 (~20°) is a noise floor that cuts the small bleed band but keeps
-    // gentle deliberate pitches intact. Higher integ-range bleeds are caught
-    // by the screen-level settle gate (Discovery's pitch_down → openDevice).
-    // Symbol mode unaffected — that path consumes raw IMU samples directly.
-    // History: originally 0.40; lowered to 0.20 for gentle gestures; tried
-    // 0.50 (cut too many real pitches); landed at 0.35.
-    // If pitch bleed remains, consider per-axis thresholds (pitch lower).
-    static constexpr float MIN_INTEGRAL = 0.30f;
+
+    // Per-axis minimum |integral| floors. Below the floor, the dominant axis
+    // is treated as bleed/noise and the gesture is rejected. Pitch bleeds more
+    // during arm-up/arm-down arc motions than roll/yaw, so it's split out as
+    // its own knob — typically held lower so gentle deliberate pitches still
+    // fire while the noise floor stays in place for the other axes.
+    //
+    // Defaults track the historical single MIN_INTEGRAL value (0.30 rad ≈ 17°).
+    // Runtime-tunable via the BLE minIntegralsChar; one packed uint16 carries
+    // both bytes (high = pitch ×100, low = roll/yaw ×100).
+    //
+    // Symbol mode unaffected — that path consumes raw IMU samples directly,
+    // not arbitrator output.
+    float minIntegralPitch   = 0.30f;
+    float minIntegralRollYaw = 0.30f;
+
+    void setMinIntegralPitch(float v)   { minIntegralPitch   = v; }
+    void setMinIntegralRollYaw(float v) { minIntegralRollYaw = v; }
+    float getMinIntegralPitch()   const { return minIntegralPitch;   }
+    float getMinIntegralRollYaw() const { return minIntegralRollYaw; }
 
     // arbitrate() may be called on every gyro sample or only when at least
     // one candidate is valid — the caller decides the cadence.
@@ -166,8 +173,14 @@ public:
 
         // ----------------------------------------------------------------
         // 4. Absolute minimum check — reject noise and cross-axis bleed.
+        //    Per-axis floor: pitch uses its own threshold so it can be held
+        //    lower than roll/yaw (bleeds asymmetrically during arm motion).
         // ----------------------------------------------------------------
-        if (dominantAbs < MIN_INTEGRAL) {
+        const float minIntegThreshold =
+            (slots[dominantIdx].axis == GestureAxis::PITCH)
+            ? minIntegralPitch
+            : minIntegralRollYaw;
+        if (dominantAbs < minIntegThreshold) {
             localDbg.reject = ArbReject::MIN_INTEG;
             if (dbg) *dbg = localDbg;
             return NO_EVENT;

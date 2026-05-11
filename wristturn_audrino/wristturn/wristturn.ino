@@ -197,6 +197,17 @@ BLECharacteristic armChar("19B10019-E8F2-537E-4F6C-D104768A1214",
 // Delta from baseline: 3x LE float [deltaRoll, deltaPitch, deltaYaw] in degrees
 BLECharacteristic deltaChar("19B1001A-E8F2-537E-4F6C-D104768A1214",
                             BLERead | BLENotify, 12);
+// Per-axis MIN_INTEGRAL floors packed as a single uint16:
+//   high byte = pitch threshold ×100 (e.g. 30 → 0.30 rad)
+//   low byte  = roll/yaw threshold ×100
+// Range per byte: 10–100 → 0.10–1.00 rad. Default 0x1E1E (0.30 / 0.30).
+BLECharacteristic minIntegralsChar("19B1001B-E8F2-537E-4F6C-D104768A1214",
+                                   BLERead | BLEWrite, 2);
+// Diagnostic firehose toggle: 1=stream every IMU sample (dgr/dla/dgv/dyp),
+// 0=normal (default). Independent from rawMode — rawMode also gates
+// calibration; diagMode is a pure observation channel.
+BLECharacteristic diagModeChar("19B1001C-E8F2-537E-4F6C-D104768A1214",
+                               BLERead | BLEWrite, 1);
 
 // ── IMU ──────────────────────────────────────────────────────────────────────
 BNO08x imu;
@@ -208,6 +219,12 @@ unsigned long debounceMs = 200; // min ms between gestures (kept for shake/tap)
 
 // ── State ────────────────────────────────────────────────────────────────────
 bool rawMode = false; // stream raw IMU on every rotation vector event
+// Diagnostic firehose — when true, every gyro / linear-accel / gravity / RV
+// sample is mirrored over gestureChar with prefixes "dgr|" / "dla|" / "dgv|" /
+// "dyp|" so the app can capture ungated raw values for offline analysis.
+// Independent of rawMode so toggling diag does not affect production paths
+// (rawMode also gates calibration logic — diagMode does not).
+bool diagMode = false;
 GestureDetector gestureDetector;
 
 // Interaction modes (written by app via modeChar)
@@ -310,15 +327,27 @@ static unsigned long rvIdleSinceMs = 0; // when device first went still
 static constexpr uint32_t GRAVITY_INTERVAL_MS = 100;
 
 // ── Sleep / wake
-// ────────────────────────────────────────────────────────────── Define
-// DEBUG_SLEEP to use 30s timeout for bench testing sleep/wake via serial.
+// ── Sleep / wake timing constants ────────────────────────────────────────────
+// All sleep-related durations live here so battery-life tuning is one-stop.
+// Define DEBUG_SLEEP to use 30 s inactivity for bench testing sleep/wake.
+//
+// Battery target: ~24 h on a 300 mAh / 3.7 V cell → ~12.5 mA average. The
+// dominant variable is how often a wake event escalates into the full
+// active-mode restoration cycle, which is gated by INACTIVITY_TIMEOUT_MS.
+//
 // #define DEBUG_SLEEP
 #ifdef DEBUG_SLEEP
-const unsigned long SLEEP_TIMEOUT_MS = 30UL * 1000UL; // 30 seconds (test)
+const unsigned long SLEEP_TIMEOUT_MS    = 30UL * 1000UL;      // 30 s (test)
 #else
-const unsigned long SLEEP_TIMEOUT_MS =
-    5UL * 60UL * 1000UL; // 5 minutes (production)
+const unsigned long SLEEP_TIMEOUT_MS    = 2UL * 60UL * 1000UL; // 2 minutes idle → sleep
 #endif
+// Stage 0 (light sleep, shake-detector polling) duration before escalating to
+// stage 1 (sigmotion deep sleep). Was 10 min — reduced to 5 min so a
+// stationary device gets to deep sleep faster without sacrificing the chance
+// of a quick reconnect during the first few minutes after sleep entry.
+const unsigned long LIGHT_SLEEP_DURATION_MS = 5UL * 60UL * 1000UL;
+// Shake polling cycle within stage 0 — wake the BNO this often to check FIFO.
+const unsigned long SHAKE_CYCLE_MS          = 30UL * 1000UL;
 bool sleeping = false;
 unsigned long lastMotionMs = 0;
 unsigned long sleepStartMs = 0; // when enterSleep() was called
@@ -347,19 +376,36 @@ struct WristTurnHW : IHardware {
 
   void drainFifo(uint32_t msMax) override {
     _lastId = 0;
+    // Diagnostic: log each event ID drained so we can tell whether wake events
+    // are real shakes (0x19) or spurious reports (e.g. periodic shake-detector
+    // emissions when interval_us is non-zero — see PowerManager.h SHAKE_POLL).
+    // Counts kept on the stack so this is cheap when nothing fires.
+    uint8_t  evCount = 0;
+    uint8_t  firstEid = 0;
     unsigned long start = millis();
     while ((millis() - start) < msMax) {
       if (imu.getSensorEvent()) {
         uint8_t eid = imu.getSensorEventID();
         if (eid) {
+          if (firstEid == 0) firstEid = eid;
+          evCount++;
           _lastId = eid;
           if (eid == WAKE_SENSOR_SHAKE || eid == WAKE_SENSOR_SIGMOTION)
             break;
         }
       }
-      if (digitalRead(BNO085_INT_PIN) == HIGH && (millis() - start) > 150)
+      // Early exit when BNO INT goes HIGH (FIFO drained). 20 ms minimum
+      // ensures we don't bail before the first event lands. The previous
+      // 150 ms variant was paired with the broken 10 ms shake interval —
+      // both reverted together (commit-a1ce55a regression).
+      if (digitalRead(BNO085_INT_PIN) == HIGH && (millis() - start) > 20)
         break;
       delayMicroseconds(2000);
+    }
+    if (evCount > 0) {
+      LOG_I("[Drain] %u events in %lums, first=0x%02x last=0x%02x INT=%d",
+            evCount, millis() - start, firstEid, _lastId,
+            digitalRead(BNO085_INT_PIN));
     }
   }
 
@@ -377,7 +423,7 @@ struct WristTurnHW : IHardware {
 };
 
 WristTurnHW         hw;
-ShakeSleepPolicy    shakePol(30000);   // 30 s light-sleep cycles
+ShakeSleepPolicy    shakePol(SHAKE_CYCLE_MS);
 SigMotionSleepPolicy sigMotPol;
 StagedPolicy        staged;
 PowerManager        powerMgr;
@@ -495,6 +541,49 @@ void onDebounceWrite(uint16_t conn_hdl, BLECharacteristic *chr, uint8_t *data,
     } else {
       LOG_E("[Settings] debounce out of range: %lu (must be 50-2000)", val);
     }
+  }
+}
+
+// Decode packed per-axis MIN_INTEGRAL thresholds.
+//   data[0..1] = uint16 little-endian
+//   high byte (bits 15..8) = pitch threshold ×100
+//   low  byte (bits  7..0) = roll/yaw threshold ×100
+// Both values clamped to 10–100 (i.e. 0.10–1.00 rad). Out-of-range bytes
+// are rejected without partial application — atomic update or no update.
+void onMinIntegralsWrite(uint16_t conn_hdl, BLECharacteristic *chr,
+                         uint8_t *data, uint16_t len) {
+  if (len != 2) {
+    LOG_E("[Settings] minIntegrals: bad len %u (expect 2)", len);
+    return;
+  }
+  uint16_t packed;
+  memcpy(&packed, data, 2);
+  uint8_t pitchX100   = (packed >> 8) & 0xFF;
+  uint8_t rollYawX100 =  packed       & 0xFF;
+  if (pitchX100 < 10 || pitchX100 > 100 ||
+      rollYawX100 < 10 || rollYawX100 > 100) {
+    LOG_E("[Settings] minIntegrals out of range: pitch=%u rollyaw=%u (must be 10-100 each)",
+          pitchX100, rollYawX100);
+    return;
+  }
+  const float pitchRad   = pitchX100   / 100.0f;
+  const float rollYawRad = rollYawX100 / 100.0f;
+  gestureDetector.setMinIntegralPitch(pitchRad);
+  gestureDetector.setMinIntegralRollYaw(rollYawRad);
+  LOG_I("[Settings] minIntegrals updated: pitch=%.2f rollyaw=%.2f rad",
+        pitchRad, rollYawRad);
+}
+
+// Diag mode toggle — 0/1 byte. Enables ungated per-sample mirroring of every
+// IMU report over gestureChar with diag-prefixed payloads. Heavy BLE traffic;
+// default off.
+void onDiagModeWrite(uint16_t conn_hdl, BLECharacteristic *chr,
+                     uint8_t *data, uint16_t len) {
+  if (len != 1) return;
+  bool newMode = (data[0] != 0);
+  if (newMode != diagMode) {
+    diagMode = newMode;
+    LOG_I("[Settings] diagMode=%d", diagMode);
   }
 }
 
@@ -1148,6 +1237,33 @@ void setup() {
     deltaChar.write(zeros, 12);
   }
 
+  // Per-axis MIN_INTEGRAL floors (packed uint16 — see declaration comment).
+  // Default seeds the char with the current arbitrator values so a reader
+  // sees what's actually in effect, not a stale baked-in number.
+  minIntegralsChar.setProperties(CHR_PROPS_READ | CHR_PROPS_WRITE);
+  minIntegralsChar.setPermission(SECMODE_OPEN, SECMODE_OPEN);
+  minIntegralsChar.setFixedLen(2);
+  minIntegralsChar.setWriteCallback(onMinIntegralsWrite);
+  minIntegralsChar.begin();
+  {
+    const uint8_t pitchX100   = (uint8_t)(gestureDetector.minIntegralPitch()   * 100.0f + 0.5f);
+    const uint8_t rollYawX100 = (uint8_t)(gestureDetector.minIntegralRollYaw() * 100.0f + 0.5f);
+    uint16_t packed = ((uint16_t)pitchX100 << 8) | (uint16_t)rollYawX100;
+    minIntegralsChar.write(&packed, 2);
+  }
+
+  // Diag mode toggle — default off so a fresh boot doesn't dump firehose
+  // until the user explicitly enables it from the app.
+  diagModeChar.setProperties(CHR_PROPS_READ | CHR_PROPS_WRITE);
+  diagModeChar.setPermission(SECMODE_OPEN, SECMODE_OPEN);
+  diagModeChar.setFixedLen(1);
+  diagModeChar.setWriteCallback(onDiagModeWrite);
+  diagModeChar.begin();
+  {
+    uint8_t off = 0;
+    diagModeChar.write(&off, 1);
+  }
+
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
   Bluefruit.Advertising.addTxPower();
   Bluefruit.Advertising.addService(wristService);
@@ -1162,8 +1278,8 @@ void setup() {
   // ── PowerManager: assemble staged sleep policy ──────────────────────────
   // Stage 0: light sleep (shake-based, software timer, 30s cycles) for 4.5 min.
   // Stage 1: deep sleep (SH2_SIGNIFICANT_MOTION with wakeupEnabled) forever.
-  staged.addStage(&shakePol, 600UL * 1000UL);  // 10 min = 600 s
-  staged.addStage(&sigMotPol, 0);
+  staged.addStage(&shakePol, LIGHT_SLEEP_DURATION_MS);
+  staged.addStage(&sigMotPol, 0);  // 0 = run forever (last stage)
   powerMgr.policy = &staged;
 
   LOG_I("BLE advertising as 'RUNE-I'.");
@@ -1181,6 +1297,13 @@ static void handleLinearAcceleration() {
   float ay = imu.getLinAccelY();
   float az = imu.getLinAccelZ();
   float mag = sqrtf(ax * ax + ay * ay + az * az);
+
+  // Diag firehose: stream every linear-accel sample. Disabled by default.
+  if (diagMode && Bluefruit.Periph.connected()) {
+    char buf[40] = {};
+    snprintf(buf, sizeof(buf), "dla|%.3f|%.3f|%.3f", ax, ay, az);
+    gestureChar.notify(buf, 40);
+  }
 
   // ── DIAG: Log accel magnitude every 20 samples (~2 Hz) ───────────────
   // ShakeDetector threshold: ACCEL_THRESHOLD_MS2 = 2.5 m/s² (~0.25g).
@@ -1244,6 +1367,14 @@ static void handleGyroCalibrated() {
   if (rawMode && Bluefruit.Periph.connected()) {
     char buf[40] = {};
     snprintf(buf, sizeof(buf), "gyr|%.3f|%.3f|%.3f", gx, gy, gz);
+    gestureChar.notify(buf, 40);
+  }
+
+  // Diag firehose: stream every gyro sample with a distinct prefix so the
+  // app routes it separately from the legacy rawMode "gyr|" stream.
+  if (diagMode && Bluefruit.Periph.connected()) {
+    char buf[40] = {};
+    snprintf(buf, sizeof(buf), "dgr|%.3f|%.3f|%.3f", gx, gy, gz);
     gestureChar.notify(buf, 40);
   }
 
@@ -1326,6 +1457,14 @@ static void handleGravity() {
   // (handleGyroCalibrated). The selector logic in MountingAdapter is generic over
   // its three input slots — works for angles or vector components alike.
   mountAdapter.transform(gfx, gfy, gfz);
+
+  // Diag firehose: post-mount-transform gravity components (the same values
+  // the classifier sees, so the captured stream matches firmware behaviour).
+  if (diagMode && Bluefruit.Periph.connected()) {
+    char buf[40] = {};
+    snprintf(buf, sizeof(buf), "dgv|%.3f|%.3f|%.3f", gfx, gfy, gfz);
+    gestureChar.notify(buf, 40);
+  }
 
   // Sanity guard before normalising — degenerate magnitude shouldn't happen on
   // a real IMU but can during init or driver hiccups.
@@ -1454,6 +1593,14 @@ static void handleRotationVector() {
   if (rawMode) {
     char buf[40] = {};
     snprintf(buf, sizeof(buf), "raw|%.1f|%.1f|%.1f", roll, pitch, yaw);
+    gestureChar.notify(buf, 40);
+  }
+
+  // Diag firehose: per-sample YPR with a distinct prefix so the app routes
+  // it separately from the rawMode "raw|" stream.
+  if (diagMode) {
+    char buf[40] = {};
+    snprintf(buf, sizeof(buf), "dyp|%.2f|%.2f|%.2f", roll, pitch, yaw);
     gestureChar.notify(buf, 40);
   }
 
@@ -1792,6 +1939,25 @@ void loop() {
       exitSleep();
       lastStage = 0;
     }
+
+    // CHRG-pin watch: log on edge so the operator can correlate "battery
+    // dying during sleep" with USB plug/unplug events. ~1 Hz poll cadence —
+    // cheap because isCharging() is one digitalRead.
+    {
+      static int8_t lastChrg = -1;     // -1 = uninitialised
+      static uint32_t lastChrgPollMs = 0;
+      uint32_t nowMs = millis();
+      if (nowMs - lastChrgPollMs >= 1000) {
+        lastChrgPollMs = nowMs;
+        int8_t cur = isCharging() ? 1 : 0;
+        if (cur != lastChrg) {
+          LOG_I("[Sleep] CHRG edge: %s (was=%d now=%d)",
+                cur ? "plugged" : "UNPLUGGED", (int)lastChrg, (int)cur);
+          lastChrg = cur;
+        }
+      }
+    }
+
     delay(10);
     return;  // skip dispatch, keepalive, DEADLOCK check, waitForEvent
   }

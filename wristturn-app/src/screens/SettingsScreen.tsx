@@ -9,9 +9,9 @@ import type { BottomTabScreenProps } from "@react-navigation/bottom-tabs";
 import type { TabParams, RootStackParams } from "../navigation/AppNavigator";
 import { registry } from "../devices/registry/DeviceRegistry";
 import { useMDNSDiscovery } from "../discovery/useMDNSDiscovery";
-import { useBLE, sendBaselineToFirmware, setSymbolMode } from "../ble/useBLE";
+import { useBLE, sendBaselineToFirmware, setSymbolMode, setMinIntegrals, setDiagMode } from "../ble/useBLE";
 import { BaselineStore } from "../storage/BaselineStore";
-import { PrefsStore } from "../mapping/PrefsStore";
+import { PrefsStore, DEFAULT_MIN_INTEGRAL_PITCH, DEFAULT_MIN_INTEGRAL_ROLLYAW, MIN_INTEGRAL_RANGE } from "../mapping/PrefsStore";
 import { AndroidTV } from "../../modules/androidtv";
 import { ANDROIDTV_COMMANDS } from "../devices/adapters/AndroidTVAdapter";
 import { WIZ_COMMANDS } from "../devices/adapters/WizAdapter";
@@ -58,11 +58,19 @@ export function SettingsScreen({ navigation }: Props) {
   const { connected, wristName, wristAddress, motionState } = useBLE();
   const [symbolMode, setSymbolModeState] = useState<boolean>(false);
   const [holdDetectorEnabled, setHoldDetectorEnabled] = useState<boolean>(false);
+  const [diagModeOn, setDiagModeOn] = useState<boolean>(false);
+  // Per-axis MIN_INTEGRAL thresholds (radians). Edited as strings so the user
+  // can type/clear without the field jumping. Saved on Apply press only.
+  const [minIntegPitchStr,   setMinIntegPitchStr]   = useState<string>(DEFAULT_MIN_INTEGRAL_PITCH.toFixed(2));
+  const [minIntegRollYawStr, setMinIntegRollYawStr] = useState<string>(DEFAULT_MIN_INTEGRAL_ROLLYAW.toFixed(2));
+  const [minIntegStatus,     setMinIntegStatus]     = useState<string>("");
   const { devices: discovered, scanning, rescan } = useMDNSDiscovery();
 
   useEffect(() => {
     PrefsStore.getSymbolModeEnabled().then(setSymbolModeState).catch(() => {});
     PrefsStore.getExperimentalHoldDetector().then(setHoldDetectorEnabled).catch(() => {});
+    PrefsStore.getMinIntegralPitch().then((v) => setMinIntegPitchStr(v.toFixed(2))).catch(() => {});
+    PrefsStore.getMinIntegralRollYaw().then((v) => setMinIntegRollYawStr(v.toFixed(2))).catch(() => {});
   }, []);
 
   function toggleSymbolMode(next: boolean) {
@@ -73,6 +81,43 @@ export function SettingsScreen({ navigation }: Props) {
   function toggleHoldDetector(next: boolean) {
     setHoldDetectorEnabled(next);
     PrefsStore.setExperimentalHoldDetector(next).catch(() => {});
+  }
+
+  function toggleDiagMode(next: boolean) {
+    // Diag mode is not persisted — purely runtime, only active while the user
+    // explicitly has it on. Default off on every connect (firmware boot
+    // initialises to 0). State here just mirrors the current toggle.
+    setDiagModeOn(next);
+    setDiagMode(next).catch((e) => {
+      console.error("[Settings] setDiagMode failed:", e);
+      setDiagModeOn(!next);  // revert on failure
+    });
+  }
+
+  async function applyMinIntegrals() {
+    const pitch = parseFloat(minIntegPitchStr);
+    const rollYaw = parseFloat(minIntegRollYawStr);
+    if (Number.isNaN(pitch) || Number.isNaN(rollYaw)) {
+      setMinIntegStatus("Invalid number");
+      return;
+    }
+    const inRange = (x: number) => x >= MIN_INTEGRAL_RANGE.min && x <= MIN_INTEGRAL_RANGE.max;
+    if (!inRange(pitch) || !inRange(rollYaw)) {
+      setMinIntegStatus(`Out of range (${MIN_INTEGRAL_RANGE.min}–${MIN_INTEGRAL_RANGE.max})`);
+      return;
+    }
+    try {
+      await PrefsStore.setMinIntegralPitch(pitch);
+      await PrefsStore.setMinIntegralRollYaw(rollYaw);
+      if (connected) {
+        await setMinIntegrals(pitch, rollYaw);
+        setMinIntegStatus(`Applied (pitch=${pitch.toFixed(2)}, roll/yaw=${rollYaw.toFixed(2)})`);
+      } else {
+        setMinIntegStatus("Saved — will push on next connect");
+      }
+    } catch (e) {
+      setMinIntegStatus(`Failed: ${(e as Error)?.message ?? e}`);
+    }
   }
   const [saved, setSaved] = useState<DeviceMetadata[]>([]);
   const [showAddForm, setShowAddForm] = useState(false);
@@ -338,6 +383,75 @@ export function SettingsScreen({ navigation }: Props) {
               trackColor={{ false: "#2a2a2a", true: "#1e3a5f" }}
               thumbColor={holdDetectorEnabled ? "#4a9eff" : "#666"}
             />
+          </View>
+
+          {/* Diagnostic firehose. Streams every IMU sample (gyro, lacc, grav,
+              YPR) over BLE for offline analysis. Heavy traffic — start a
+              recording session in Logs, enable here, do motions, disable,
+              stop session. Default off; firmware also defaults off on boot. */}
+          <View style={s.toggleRow}>
+            <View style={{ flex: 1 }}>
+              <Text style={s.toggleTitle}>Diag firehose</Text>
+              <Text style={s.toggleSub}>
+                Stream every IMU sample (~210 lines/s). Start a Logs session
+                to capture. Heavy BLE + battery cost. Off on next reconnect.
+              </Text>
+            </View>
+            <Switch
+              value={diagModeOn}
+              onValueChange={toggleDiagMode}
+              trackColor={{ false: "#2a2a2a", true: "#5f1e1e" }}
+              thumbColor={diagModeOn ? "#ff6b6b" : "#666"}
+            />
+          </View>
+
+          {/* Per-axis MIN_INTEGRAL floors. Pitch is split out from roll/yaw
+              because pitch bleeds asymmetrically during arm-up/arm-down arcs.
+              Range 0.10–1.00 rad. Pushed to firmware on Apply and on every
+              reconnect. Persisted to AsyncStorage. */}
+          <View style={[s.toggleRow, { flexDirection: "column", alignItems: "stretch" }]}>
+            <Text style={s.toggleTitle}>Arbitrator floor (rad)</Text>
+            <Text style={s.toggleSub}>
+              Minimum integral for a gesture to fire. Lower = more sensitive,
+              higher = more bleed rejection. Range {MIN_INTEGRAL_RANGE.min}–{MIN_INTEGRAL_RANGE.max}.
+            </Text>
+            <View style={{ flexDirection: "row", gap: 12, marginTop: 10 }}>
+              <View style={{ flex: 1 }}>
+                <Text style={s.toggleSub}>Pitch</Text>
+                <TextInput
+                  style={[s.input, { marginTop: 4 }]}
+                  value={minIntegPitchStr}
+                  onChangeText={setMinIntegPitchStr}
+                  keyboardType="decimal-pad"
+                  placeholder="0.30"
+                  placeholderTextColor="#555"
+                />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={s.toggleSub}>Roll / Yaw</Text>
+                <TextInput
+                  style={[s.input, { marginTop: 4 }]}
+                  value={minIntegRollYawStr}
+                  onChangeText={setMinIntegRollYawStr}
+                  keyboardType="decimal-pad"
+                  placeholder="0.30"
+                  placeholderTextColor="#555"
+                />
+              </View>
+            </View>
+            <View style={{ flexDirection: "row", alignItems: "center", marginTop: 8 }}>
+              <TouchableOpacity
+                style={[s.scanBtn, { flexShrink: 0, paddingHorizontal: 16 }]}
+                onPress={applyMinIntegrals}
+              >
+                <Text style={{ color: "#4a9eff", fontWeight: "600" }}>Apply</Text>
+              </TouchableOpacity>
+              {minIntegStatus !== "" && (
+                <Text style={[s.toggleSub, { marginLeft: 12, flex: 1 }]} numberOfLines={2}>
+                  {minIntegStatus}
+                </Text>
+              )}
+            </View>
           </View>
         </View>
       </View>

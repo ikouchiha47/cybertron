@@ -412,6 +412,14 @@ function startRuntime() {
       state.symbolModeEnabled = PrefsStore.symbolModeEnabledSync();
       engine.setRules(state.symbolModeEnabled ? SYMBOL_RULES : gestureRules);
       notify();
+      // Push persisted MIN_INTEGRAL thresholds to firmware so a fresh boot
+      // picks up the user's tuned values instead of the firmware compile-time
+      // defaults. Failures are non-fatal (firmware still has its defaults).
+      const pitch   = PrefsStore.minIntegralPitchSync();
+      const rollYaw = PrefsStore.minIntegralRollYawSync();
+      setMinIntegrals(pitch, rollYaw).catch((e) => {
+        console.error("[BLE] setMinIntegrals on connect failed:", e);
+      });
     }).catch(() => {});
     notify();
   });
@@ -518,6 +526,18 @@ function startRuntime() {
   BLEServiceNative.onRaw?.((p) => {
     if (PrefsStore.symbolModeEnabledSync()) symbolCapture?.onRaw(p);
     SessionRecorder.recordRaw(p);
+    // Diag: also capture rawMode RV stream into the WAL log when recording,
+    // tagged so it sorts alongside the dedicated diagMode tags.
+    DebugLog.push("DIAG_RAW", `r=${p.roll?.toFixed(2)} p=${p.pitch?.toFixed(2)} y=${p.yaw?.toFixed(2)}`);
+  });
+
+  BLEServiceNative.onDiag?.((p) => {
+    // Diagnostic firehose — one line per IMU sample. Heavy at full rate
+    // (~210 lines/s) so only useful while a recording session is active.
+    DebugLog.push(
+      `DIAG_${p.type}`,
+      `${p.x?.toFixed(3)} ${p.y?.toFixed(3)} ${p.z?.toFixed(3)}`,
+    );
   });
 
   BLEServiceNative.onDelta?.((p) => {
@@ -776,6 +796,33 @@ export function disarmDevice(): Promise<void> {
 export function sendBaselineToFirmware(baseline: { roll: number; pitch: number; yaw: number }): Promise<void> {
   console.log(`[BLE] sendBaselineToFirmware → r=${baseline.roll.toFixed(1)} p=${baseline.pitch.toFixed(1)} y=${baseline.yaw.toFixed(1)}`);
   return BLEServiceNative.setBaseline(baseline);
+}
+
+/**
+ * Push per-axis MIN_INTEGRAL thresholds to firmware. Pitch is split out from
+ * roll/yaw because it bleeds asymmetrically during arm-up/arm-down arcs.
+ *
+ * Both inputs are radians, valid range 0.10..1.00. Values are clamped, then
+ * encoded as ×100 bytes packed into a uint16 (high=pitch, low=rollYaw).
+ */
+/**
+ * Toggle diagnostic firehose on the firmware. When on, every IMU sample is
+ * mirrored over BLE and the app pushes one line per sample into DebugLog
+ * (start a session in the Logs screen first to capture to disk). Heavy
+ * BLE/CPU/storage cost — keep off in normal use.
+ */
+export function setDiagMode(enabled: boolean): Promise<void> {
+  console.log(`[BLE] setDiagMode → ${enabled}`);
+  return BLEServiceNative.setDiagMode(enabled);
+}
+
+export function setMinIntegrals(pitchRad: number, rollYawRad: number): Promise<void> {
+  const clamp = (x: number) => Math.max(0.10, Math.min(1.00, x));
+  const pitchX100   = Math.round(clamp(pitchRad)   * 100);
+  const rollYawX100 = Math.round(clamp(rollYawRad) * 100);
+  const packed = ((pitchX100 & 0xFF) << 8) | (rollYawX100 & 0xFF);
+  console.log(`[BLE] setMinIntegrals → pitch=${(pitchX100/100).toFixed(2)} rollyaw=${(rollYawX100/100).toFixed(2)} (packed=0x${packed.toString(16)})`);
+  return BLEServiceNative.setMinIntegrals(packed);
 }
 
 // Force a fresh baseline capture on firmware. Caller should snapshot

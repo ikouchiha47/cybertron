@@ -53,47 +53,62 @@ struct ISleepPolicy {
 
 static constexpr uint8_t  WAKE_SENSOR_SHAKE   = 0x19;
 static constexpr uint8_t  WAKE_SENSOR_SIGMOTION = 0x12;
-static constexpr uint32_t SHAKE_POLL_INTERVAL_US  = 10000UL;    // 10ms — must be << drainFifo window so event arrives before INT-HIGH early exit
+// Event sensors (TAP, SHAKE, SIGMOTION) per SH-2: interval_us = 0 ARMS them.
+// Non-zero values cause the BNO to emit periodic shake reports at that
+// cadence regardless of actual motion — confirmed via [Drain] diag logs in
+// commit-a1ce55a regression. Keep at 0 so the shake detector only fires on
+// a genuine shake waveform, not a poll cycle.
+static constexpr uint32_t SHAKE_POLL_INTERVAL_US  = 0UL;
 static constexpr uint32_t SIGMOTION_INTERVAL_US   = 2000000UL;  // 2s
 
 // ── Concrete policies ────────────────────────────────────────────────────────
 
-// ShakeSleepPolicy — light sleep.
-// Software timer: every cycleMs wake the BNO085, drain FIFO, look for 0x19.
-// Configures shake with wakeupEnabled=false — no INT-pin dependency.
+// ShakeSleepPolicy — light sleep, INT-driven.
+//
+// Configures the shake detector with wakeupEnabled=true so it runs in the
+// BNO's always-on domain while the SH-2 hub is in modeSleep. On a real shake
+// (matched waveform) the BNO asserts INT LOW; tick() observes that and wakes.
+//
+// History: previous incarnation polled (modeOn + drain every 30s with
+// wakeupEnabled=false). That meant the shake detector was only actually
+// running for ~200ms out of every 30s — real shakes were almost always
+// missed. A non-zero SHAKE_POLL_INTERVAL_US masked the bug by causing
+// the BNO to emit periodic fake shake reports during the drain window,
+// triggering false wakes that *looked* like working detection. With
+// always-on + interval=0, the detector fires only on real shakes and
+// the host wakes immediately via INT.
+//
+// cycleMs() retained as a hint for the loop's outer wait timeout, but the
+// actual wake is INT-edge driven, not timer driven.
 struct ShakeSleepPolicy : ISleepPolicy {
   uint32_t _cycleMs;
-  uint32_t _cycleStartMs = 0;
 
   explicit ShakeSleepPolicy(uint32_t cycleMs = 30000)
     : _cycleMs(cycleMs) {}
 
   void arm(IHardware& hw) override {
-    hw.configureSensor(WAKE_SENSOR_SHAKE, SHAKE_POLL_INTERVAL_US, false);
+    // wakeupEnabled=true → always-on domain → detector runs during modeSleep.
+    // interval=0 arms the event sensor in event-mode (per SH-2 convention for
+    // event sensors: TAP, SHAKE, SIGMOTION).
+    hw.configureSensor(WAKE_SENSOR_SHAKE, SHAKE_POLL_INTERVAL_US, true);
     hw.modeSleep();
-    _cycleStartMs = hw.nowMs();
   }
 
   void disarm(IHardware& hw) override {
     hw.modeOn();
     hw.drainFifo(200);
+    // Drop wakeup-enabled on disarm so the shake detector doesn't keep
+    // firing during normal-use modeOn (it would generate spurious gestures
+    // every time the wrist is jostled).
+    hw.configureSensor(WAKE_SENSOR_SHAKE, 0, false);
   }
 
   bool tick(IHardware& hw) override {
-    if (hw.nowMs() - _cycleStartMs < _cycleMs)
-      return false;
-
-    // Cycle expired: wake, drain, check for shake.
+    // Wake only on real INT assertion from the BNO. No periodic polling.
+    if (!hw.intPinLow()) return false;
     hw.modeOn();
     hw.drainFifo(200);
-    bool shook = (hw.lastDrainedEventId() == WAKE_SENSOR_SHAKE);
-    if (shook)
-      return true;
-
-    // No shake — go back to sleep for the next cycle.
-    hw.modeSleep();
-    _cycleStartMs = hw.nowMs();
-    return false;
+    return (hw.lastDrainedEventId() == WAKE_SENSOR_SHAKE);
   }
 
   uint32_t cycleMs() override { return _cycleMs; }

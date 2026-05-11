@@ -4,6 +4,7 @@ import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { AppNavigator } from "./src/navigation/AppNavigator";
 import { BLEServiceNative } from "./src/ble/BLEServiceNative";
+import { DebugLog }         from "./src/debug/DebugLog";
 
 async function requestBLEPermissions() {
   if (Platform.OS !== "android") return;
@@ -23,6 +24,10 @@ async function requestBLEPermissions() {
 
 export default function App() {
   useEffect(() => {
+    // Recover any logs/active/<id>/ directories left behind by a previous
+    // run that did not call DebugLog.stopSession (app crash, force-close).
+    // Idempotent — safe to call every launch.
+    DebugLog.init().catch(console.error);
     requestBLEPermissions()
       .then(() => BLEServiceNative.start())
       .catch(console.error);
