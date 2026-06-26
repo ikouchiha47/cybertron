@@ -7,7 +7,7 @@ import type { GestureEvent, RawSample } from "../types";
 // is the firmware-reported millis (monotonic since boot) when available.
 export type SessionEvent =
   | { t: number; type: "gesture"; name: string; roll?: number; pitch?: number; yaw?: number; delta?: number; value?: number }
-  | { t: number; type: "raw"; roll: number; pitch: number; yaw: number }
+  | { t: number; type: "raw"; roll: number; pitch: number; yaw: number; gyroMagDps?: number; seq?: number }
   | { t: number; t_fw?: number; type: "state"; raw: string }
   | { t: number; type: "baseline"; roll: number; pitch: number; yaw: number }
   | { t: number; type: "combo"; combo: string }

@@ -55,6 +55,8 @@ export interface RawSample {
   roll: number;
   pitch: number;
   yaw: number;
+  gyroMagDps?: number;
+  seq?: number;
 }
 
 const GESTURE_NAMES = new Set<string>([

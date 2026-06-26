@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EMG Visualizer</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:       #0f1117;
+    --surface:  #1a1d27;
+    --border:   #2a2d3a;
+    --text:     #e2e4f0;
+    --muted:    #6b7280;
+    --accent:   #6366f1;
+    --green:    #22c55e;
+    --red:      #ef4444;
+    --yellow:   #f59e0b;
+
+    --c-raw:      #60a5fa;
+    --c-baseline: #a78bfa;
+    --c-envelope: #34d399;
+    --c-thr:      #f59e0b;
+    --c-active:   rgba(99,102,241,0.18);
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 13px;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+
+  header h1 { font-size: 15px; font-weight: 600; flex: 1; }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 12px;
+    border-radius: 99px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  .pill:hover { background: var(--border); }
+  .pill.active { border-color: var(--accent); color: var(--accent); }
+  .pill.danger { border-color: var(--red); color: var(--red); }
+  .pill.success { border-color: var(--green); color: var(--green); }
+
+  .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--muted);
+  }
+  .dot.on  { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot.rec { background: var(--red);   animation: blink 1s step-start infinite; }
+
+  @keyframes blink { 50% { opacity: 0; } }
+
+  main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 16px 20px;
+    gap: 14px;
+  }
+
+  /* ── Chart ── */
+  .chart-wrap {
+    position: relative;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--surface);
+  }
+
+  canvas#chart {
+    display: block;
+    width: 100%;
+    height: 260px;
+  }
+
+  .chart-legend {
+    display: flex;
+    gap: 16px;
+    padding: 6px 12px;
+    border-top: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .legend-item { display: flex; align-items: center; gap: 5px; }
+  .legend-swatch {
+    width: 18px; height: 2px; border-radius: 1px;
+  }
+
+  /* ── Stats bar ── */
+  .stats {
+    display: flex;
+    gap: 20px;
+    font-size: 12px;
+    color: var(--muted);
+    padding: 2px 0;
+  }
+  .stat-val { color: var(--text); font-weight: 600; }
+  .stat-active { color: var(--green); }
+
+  /* ── Controls ── */
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .controls-label {
+    color: var(--muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-right: 4px;
+  }
+
+  .label-btn {
+    padding: 5px 14px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    cursor: pointer;
+    transition: background 0.12s, border-color 0.12s, color 0.12s;
+  }
+  .label-btn:hover { background: var(--border); }
+  .label-btn.selected {
+    border-color: var(--accent);
+    background: rgba(99,102,241,0.15);
+    color: var(--accent);
+  }
+
+  .custom-label-wrap {
+    display: flex;
+    gap: 6px;
+  }
+  input#customLabel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font: inherit;
+    padding: 5px 10px;
+    width: 110px;
+    outline: none;
+  }
+  input#customLabel:focus { border-color: var(--accent); }
+
+  /* ── Session log ── */
+  .session-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    color: var(--muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
+  .session-log {
+    max-height: 130px;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+  }
+
+  .session-log table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  .session-log th {
+    text-align: left;
+    padding: 6px 12px;
+    color: var(--muted);
+    border-bottom: 1px solid var(--border);
+    font-weight: 500;
+    position: sticky;
+    top: 0;
+    background: var(--surface);
+  }
+  .session-log td {
+    padding: 5px 12px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+  .session-log tr:last-child td { border-bottom: none; }
+  .tag-pinch  { color: #f472b6; }
+  .tag-flex   { color: #38bdf8; }
+  .tag-grip   { color: #fb923c; }
+  .tag-rest   { color: #a3e635; }
+  .tag-custom { color: #e879f9; }
+
+  .no-support {
+    display: none;
+    padding: 20px;
+    color: var(--red);
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<div class="no-support" id="noSupport">
+  WebSerial is not supported in this browser. Open in Chrome 89+ or Edge 89+.
+</div>
+
+<header>
+  <h1>EMG Visualizer</h1>
+  <span id="statusText" style="color:var(--muted);font-size:12px">disconnected</span>
+  <div class="dot" id="dot"></div>
+  <button class="pill" id="btnConnect">Connect</button>
+  <button class="pill" id="btnRecord" disabled>● Rec</button>
+  <button class="pill" id="btnExport" disabled>↓ CSV</button>
+</header>
+
+<main>
+
+  <!-- Chart -->
+  <div class="chart-wrap">
+    <canvas id="chart"></canvas>
+    <div class="chart-legend">
+      <div class="legend-item"><div class="legend-swatch" style="background:var(--c-raw)"></div>raw</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:var(--c-baseline)"></div>baseline</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:var(--c-envelope)"></div>envelope</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:var(--c-thr)"></div>threshold</div>
+    </div>
+  </div>
+
+  <!-- Stats -->
+  <div class="stats">
+    <span>raw: <span class="stat-val" id="sRaw">–</span></span>
+    <span>baseline: <span class="stat-val" id="sBase">–</span></span>
+    <span>envelope: <span class="stat-val" id="sEnv">–</span></span>
+    <span>threshold: <span class="stat-val" id="sThr">–</span></span>
+    <span>status: <span class="stat-val" id="sStatus">–</span></span>
+    <span>rate: <span class="stat-val" id="sRate">–</span></span>
+  </div>
+
+  <!-- Label controls -->
+  <div class="controls">
+    <span class="controls-label">Label</span>
+    <button class="label-btn selected" data-label="pinch">pinch</button>
+    <button class="label-btn" data-label="flex">flex</button>
+    <button class="label-btn" data-label="grip">grip</button>
+    <button class="label-btn" data-label="rest">rest</button>
+    <div class="custom-label-wrap">
+      <input id="customLabel" type="text" placeholder="custom…" maxlength="20">
+      <button class="label-btn" id="btnAddLabel">+ add</button>
+    </div>
+  </div>
+
+  <!-- Session log -->
+  <div>
+    <div class="session-header">
+      <span>Recorded segments</span>
+      <span id="segCount">0 segments</span>
+    </div>
+    <div class="session-log">
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>label</th>
+            <th>start (s)</th>
+            <th>duration (ms)</th>
+            <th>samples</th>
+            <th>peak env</th>
+            <th>mean env</th>
+          </tr>
+        </thead>
+        <tbody id="segBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+</main>
+
+<script>
+// ── Config ────────────────────────────────────────────────────────────────────
+const BAUD_RATE   = 115200;
+const WINDOW_MS   = 4000;    // visible time window
+const SAMPLE_HZ   = 1000;    // expected sample rate
+const BUF_SIZE    = WINDOW_MS * SAMPLE_HZ; // ring buffer capacity
+const ADC_MAX     = 4095;
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let port = null, reader = null;
+let connected = false, recording = false;
+let currentLabel = 'pinch';
+let sessionStart  = null;
+
+// Ring buffer: each entry { raw, base, env, thr, active, t }
+const buf = [];
+let recStart = null;
+let recBuf   = [];
+const segments = [];
+
+// Rate counter
+let rateCount = 0, rateLast = performance.now(), rateHz = 0;
+
+// ── DOM ───────────────────────────────────────────────────────────────────────
+const canvas   = document.getElementById('chart');
+const ctx      = canvas.getContext('2d');
+const btnConn  = document.getElementById('btnConnect');
+const btnRec   = document.getElementById('btnRecord');
+const btnExp   = document.getElementById('btnExport');
+const dotEl    = document.getElementById('dot');
+const statText = document.getElementById('statusText');
+const segBody  = document.getElementById('segBody');
+const segCount = document.getElementById('segCount');
+
+const sRaw    = document.getElementById('sRaw');
+const sBase   = document.getElementById('sBase');
+const sEnv    = document.getElementById('sEnv');
+const sThr    = document.getElementById('sThr');
+const sStatus = document.getElementById('sStatus');
+const sRate   = document.getElementById('sRate');
+
+// ── WebSerial check ───────────────────────────────────────────────────────────
+if (!('serial' in navigator)) {
+  document.getElementById('noSupport').style.display = 'block';
+}
+
+// ── Connect / disconnect ──────────────────────────────────────────────────────
+btnConn.addEventListener('click', async () => {
+  if (connected) { await disconnect(); return; }
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: BAUD_RATE });
+    connected = true;
+    sessionStart = performance.now();
+    dotEl.classList.add('on');
+    statText.textContent = 'connected';
+    btnConn.textContent  = 'Disconnect';
+    btnConn.classList.add('danger');
+    btnRec.disabled = false;
+    readLoop();
+  } catch (e) {
+    if (e.name !== 'NotFoundError') console.error(e);
+  }
+});
+
+async function disconnect() {
+  connected = false;
+  if (recording) stopRecording();
+  try { await reader?.cancel(); } catch {}
+  try { await port?.close();   } catch {}
+  dotEl.classList.remove('on');
+  statText.textContent = 'disconnected';
+  btnConn.textContent  = 'Connect';
+  btnConn.classList.remove('danger');
+  btnRec.disabled = true;
+  btnRec.textContent = '● Rec';
+  btnRec.classList.remove('active');
+}
+
+// ── Serial read loop ──────────────────────────────────────────────────────────
+async function readLoop() {
+  const decoder = new TextDecoderStream();
+  port.readable.pipeTo(decoder.writable);
+  reader = decoder.readable.getReader();
+  let partial = '';
+
+  try {
+    while (connected) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      partial += value;
+      const lines = partial.split('\n');
+      partial = lines.pop();
+      for (const line of lines) parseLine(line.trim());
+    }
+  } catch {}
+}
+
+function parseLine(line) {
+  // Skip comment lines from firmware
+  if (line.startsWith('#') || line === '') return;
+
+  const parts = line.split(/\s+/);
+  if (parts.length < 5) return;
+
+  const raw  = parseInt(parts[0], 10);
+  const base = parseInt(parts[1], 10);
+  const env  = parseInt(parts[2], 10);
+  const thr  = parseInt(parts[3], 10);
+  const act  = parseInt(parts[4], 10) > 0;
+
+  if (isNaN(raw) || isNaN(base) || isNaN(env) || isNaN(thr)) return;
+
+  const t = performance.now() - sessionStart;
+  const sample = { raw, base, env, thr, act, t };
+
+  buf.push(sample);
+  if (buf.length > BUF_SIZE) buf.shift();
+
+  if (recording) recBuf.push(sample);
+
+  // rate
+  rateCount++;
+  const now = performance.now();
+  if (now - rateLast >= 1000) {
+    rateHz = Math.round(rateCount * 1000 / (now - rateLast));
+    rateCount = 0;
+    rateLast  = now;
+  }
+
+  // update stats every 10 samples to avoid DOM thrash
+  if (buf.length % 10 === 0) updateStats(sample);
+}
+
+function updateStats(s) {
+  sRaw.textContent    = s.raw;
+  sBase.textContent   = s.base;
+  sEnv.textContent    = s.env;
+  sThr.textContent    = s.thr;
+  sStatus.textContent = s.act ? 'ACTIVE' : 'idle';
+  sStatus.className   = s.act ? 'stat-val stat-active' : 'stat-val';
+  sRate.textContent   = rateHz + ' Hz';
+}
+
+// ── Record ────────────────────────────────────────────────────────────────────
+btnRec.addEventListener('click', () => {
+  if (!recording) startRecording(); else stopRecording();
+});
+
+function startRecording() {
+  recording = true;
+  recBuf    = [];
+  recStart  = performance.now() - sessionStart;
+  btnRec.textContent = '■ Stop';
+  btnRec.classList.add('active');
+  dotEl.classList.remove('on');
+  dotEl.classList.add('rec');
+}
+
+function stopRecording() {
+  if (!recording) return;
+  recording = false;
+
+  if (recBuf.length > 0) {
+    const envVals = recBuf.map(s => s.env);
+    const peak    = Math.max(...envVals);
+    const mean    = Math.round(envVals.reduce((a, b) => a + b, 0) / envVals.length);
+    const dur     = Math.round(recBuf[recBuf.length-1].t - recBuf[0].t);
+
+    segments.push({
+      label: currentLabel,
+      start: recStart,
+      dur,
+      samples: recBuf.length,
+      peak,
+      mean,
+      data: recBuf.slice()
+    });
+    updateSegTable();
+    btnExp.disabled = false;
+  }
+
+  recBuf = [];
+  btnRec.textContent = '● Rec';
+  btnRec.classList.remove('active');
+  dotEl.classList.remove('rec');
+  dotEl.classList.add('on');
+}
+
+function updateSegTable() {
+  segCount.textContent = `${segments.length} segment${segments.length !== 1 ? 's' : ''}`;
+  segBody.innerHTML = segments.map((seg, i) => {
+    const cls = `tag-${['pinch','flex','grip','rest'].includes(seg.label) ? seg.label : 'custom'}`;
+    return `<tr>
+      <td>${i + 1}</td>
+      <td class="${cls}">${seg.label}</td>
+      <td>${(seg.start / 1000).toFixed(2)}</td>
+      <td>${seg.dur}</td>
+      <td>${seg.samples}</td>
+      <td>${seg.peak}</td>
+      <td>${seg.mean}</td>
+    </tr>`;
+  }).join('');
+  // scroll to bottom
+  const log = segBody.closest('.session-log');
+  log.scrollTop = log.scrollHeight;
+}
+
+// ── Label buttons ─────────────────────────────────────────────────────────────
+document.querySelectorAll('.label-btn[data-label]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.label-btn').forEach(b => b.classList.remove('selected'));
+    btn.classList.add('selected');
+    currentLabel = btn.dataset.label;
+  });
+});
+
+document.getElementById('btnAddLabel').addEventListener('click', () => {
+  const val = document.getElementById('customLabel').value.trim();
+  if (!val) return;
+
+  // avoid duplicate buttons
+  const existing = document.querySelector(`.label-btn[data-label="${val}"]`);
+  if (existing) {
+    existing.click();
+    return;
+  }
+
+  const btn = document.createElement('button');
+  btn.className  = 'label-btn';
+  btn.dataset.label = val;
+  btn.textContent = val;
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.label-btn').forEach(b => b.classList.remove('selected'));
+    btn.classList.add('selected');
+    currentLabel = val;
+  });
+  document.getElementById('btnAddLabel').insertAdjacentElement('beforebegin', btn);
+  btn.click();
+  document.getElementById('customLabel').value = '';
+});
+
+// ── Export CSV ────────────────────────────────────────────────────────────────
+btnExp.addEventListener('click', () => {
+  const rows = ['t_ms,label,raw,baseline,envelope,threshold,active'];
+  for (const seg of segments) {
+    for (const s of seg.data) {
+      rows.push(`${s.t.toFixed(1)},${seg.label},${s.raw},${s.base},${s.env},${s.thr},${s.act ? 1 : 0}`);
+    }
+  }
+  const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
+  const a    = document.createElement('a');
+  a.href     = URL.createObjectURL(blob);
+  a.download = `emg_${Date.now()}.csv`;
+  a.click();
+});
+
+// ── Canvas chart ──────────────────────────────────────────────────────────────
+function resizeCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width  = rect.width  * dpr;
+  canvas.height = rect.height * dpr;
+  ctx.scale(dpr, dpr);
+}
+
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+function drawChart() {
+  requestAnimationFrame(drawChart);
+
+  const dpr = window.devicePixelRatio || 1;
+  const W   = canvas.width  / dpr;
+  const H   = canvas.height / dpr;
+
+  ctx.clearRect(0, 0, W, H);
+
+  // background
+  ctx.fillStyle = '#1a1d27';
+  ctx.fillRect(0, 0, W, H);
+
+  if (buf.length < 2) {
+    ctx.fillStyle = '#6b7280';
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('waiting for data…', W/2, H/2);
+    return;
+  }
+
+  const now      = buf[buf.length - 1].t;
+  const tStart   = now - WINDOW_MS;
+  const visible  = buf.filter(s => s.t >= tStart);
+
+  if (visible.length < 2) return;
+
+  function xOf(t)   { return (t - tStart) / WINDOW_MS * W; }
+  function yOf(v)   { return H - (v / ADC_MAX) * H; }
+  function yEnv(v)  { return H - (v / (ADC_MAX * 0.3)) * H; }  // env scaled to 30% of ADC range
+
+  // ── grid lines
+  ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+  ctx.lineWidth   = 1;
+  for (let i = 0; i <= 4; i++) {
+    const x = (i / 4) * W;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+  }
+  for (let i = 1; i <= 3; i++) {
+    const y = (i / 4) * H;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+
+  // ── activation shading
+  let inActive = false, axStart = 0;
+  ctx.fillStyle = 'rgba(99,102,241,0.12)';
+  for (let i = 0; i < visible.length; i++) {
+    const s = visible[i];
+    const x = xOf(s.t);
+    if (s.act && !inActive) { inActive = true; axStart = x; }
+    if (!s.act && inActive) {
+      ctx.fillRect(axStart, 0, x - axStart, H);
+      inActive = false;
+    }
+  }
+  if (inActive) ctx.fillRect(axStart, 0, W - axStart, H);
+
+  // ── recorded segment shading (distinct color)
+  if (recording) {
+    const rx = xOf(recStart + sessionStart ?? 0);
+    ctx.fillStyle = 'rgba(239,68,68,0.10)';
+    ctx.fillRect(Math.max(0, rx), 0, W - Math.max(0, rx), H);
+  }
+
+  // downsample to max one point per pixel
+  const step  = Math.max(1, Math.floor(visible.length / W));
+
+  function drawLine(getter, color, lw = 1.5) {
+    ctx.beginPath();
+    ctx.strokeStyle = color;
+    ctx.lineWidth   = lw;
+    let first = true;
+    for (let i = 0; i < visible.length; i += step) {
+      const s = visible[i];
+      const x = xOf(s.t);
+      const y = getter(s);
+      if (first) { ctx.moveTo(x, y); first = false; } else { ctx.lineTo(x, y); }
+    }
+    ctx.stroke();
+  }
+
+  drawLine(s => yOf(s.raw),  '#60a5fa', 1);
+  drawLine(s => yOf(s.base), '#a78bfa', 1.5);
+  drawLine(s => yEnv(s.env), '#34d399', 2);
+
+  // threshold line (constant across window from last value)
+  const lastThr = visible[visible.length - 1].thr;
+  const yThr    = yEnv(lastThr);
+  ctx.beginPath();
+  ctx.strokeStyle = '#f59e0b';
+  ctx.lineWidth   = 1;
+  ctx.setLineDash([6, 4]);
+  ctx.moveTo(0, yThr); ctx.lineTo(W, yThr);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // ── time axis labels
+  ctx.fillStyle = '#6b7280';
+  ctx.font = '10px monospace';
+  ctx.textAlign = 'center';
+  for (let i = 0; i <= 4; i++) {
+    const t   = tStart + (i / 4) * WINDOW_MS;
+    const x   = (i / 4) * W;
+    const sec = (t / 1000).toFixed(1);
+    ctx.fillText(sec + 's', x, H - 4);
+  }
+
+  // ── recording indicator
+  if (recording) {
+    ctx.fillStyle = '#ef4444';
+    ctx.font = 'bold 11px monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText(`● REC  ${currentLabel}`, W - 8, 16);
+  }
+}
+
+drawChart();
+</script>
+</body>
+</html>

@@ -1,0 +1,731 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Session Labeler — WristTurn</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: #0d0d0d;
+  color: #ddd;
+  font-family: 'Menlo', 'Consolas', monospace;
+  font-size: 13px;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+#header {
+  padding: 10px 16px;
+  background: #111;
+  border-bottom: 1px solid #1f1f1f;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+#header h1 { font-size: 14px; color: #fff; font-weight: 600; }
+
+#file-btn {
+  background: #1a3a6a;
+  color: #4a9eff;
+  border: none;
+  padding: 5px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+}
+#file-btn:hover { background: #1e4a8a; }
+
+#status { color: #555; font-size: 11px; }
+
+#main {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+/* ── Left: timeline canvas ── */
+#canvas-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 8px;
+  gap: 6px;
+}
+
+#canvas-wrap {
+  position: relative;
+  flex: 1;
+  background: #111;
+  border: 1px solid #1f1f1f;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+#canvas { display: block; }
+
+#cursor-line {
+  position: absolute;
+  top: 0; bottom: 0;
+  width: 2px;
+  background: #fff8;
+  pointer-events: none;
+}
+
+#time-label {
+  position: absolute;
+  top: 4px;
+  color: #888;
+  font-size: 10px;
+  pointer-events: none;
+  background: #0d0d0d88;
+  padding: 2px 4px;
+  border-radius: 3px;
+}
+
+/* ── Segment markers on canvas ── */
+.seg-marker {
+  position: absolute;
+  top: 0; bottom: 0;
+  pointer-events: none;
+}
+
+/* ── Right: sidebar ── */
+#sidebar {
+  width: 240px;
+  border-left: 1px solid #1f1f1f;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  padding: 10px;
+  gap: 12px;
+}
+
+.panel-title {
+  color: #555;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 6px;
+}
+
+/* ── Keyboard shortcuts ── */
+#shortcuts { flex-shrink: 0; }
+
+.key-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+}
+.key {
+  display: inline-block;
+  background: #1c1c1c;
+  border: 1px solid #333;
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 11px;
+  color: #aaa;
+  min-width: 28px;
+  text-align: center;
+}
+.key-desc { color: #666; font-size: 11px; }
+
+/* ── Gesture buttons ── */
+#gesture-panel { flex-shrink: 0; }
+
+.gesture-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  background: #1a1a1a;
+  border: 1px solid #2a2a2a;
+  border-radius: 6px;
+  color: #ddd;
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  margin-bottom: 4px;
+  text-align: left;
+}
+.gesture-btn:hover { background: #222; border-color: #3a3a3a; }
+.gesture-btn .gkey {
+  background: #1e3a6a;
+  color: #4a9eff;
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 11px;
+  min-width: 20px;
+  text-align: center;
+}
+
+/* ── Segment list ── */
+#seg-list { flex: 1; overflow-y: auto; }
+
+.seg-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 8px;
+  background: #1a1a1a;
+  border-radius: 5px;
+  margin-bottom: 3px;
+  gap: 6px;
+  cursor: pointer;
+}
+.seg-item:hover { background: #222; }
+.seg-item.selected { border: 1px solid #4a9eff33; background: #0d1f3a; }
+.seg-label { color: #4a9eff; font-size: 11px; flex: 1; }
+.seg-time  { color: #555; font-size: 10px; }
+.seg-del   { color: #555; cursor: pointer; font-size: 14px; padding: 0 4px; }
+.seg-del:hover { color: #ff6b6b; }
+
+/* ── Export ── */
+#export-btn {
+  background: #1a4a2a;
+  color: #4cff80;
+  border: none;
+  padding: 8px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  width: 100%;
+  margin-top: 4px;
+}
+#export-btn:hover { background: #1e5a30; }
+#export-btn:disabled { opacity: 0.3; cursor: default; }
+
+/* ── Bottom bar ── */
+#bottom-bar {
+  background: #111;
+  border-top: 1px solid #1f1f1f;
+  padding: 6px 16px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  font-size: 11px;
+  color: #555;
+  flex-shrink: 0;
+}
+#bottom-bar span { color: #888; }
+
+/* ── Toast ── */
+#toast {
+  position: fixed;
+  bottom: 40px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #1a3a2a;
+  color: #4cff80;
+  padding: 8px 20px;
+  border-radius: 20px;
+  font-size: 12px;
+  opacity: 0;
+  transition: opacity 0.3s;
+  pointer-events: none;
+}
+#toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+
+<div id="header">
+  <h1>Session Labeler</h1>
+  <button id="file-btn" onclick="document.getElementById('file-input').click()">Load Session (.jsonl)</button>
+  <input id="file-input" type="file" accept=".jsonl" style="display:none">
+  <span id="status">No session loaded — drag & drop a .jsonl file or click Load</span>
+</div>
+
+<div id="main">
+  <div id="canvas-col">
+    <div id="canvas-wrap">
+      <canvas id="canvas"></canvas>
+      <div id="cursor-line" style="left:-10px"></div>
+      <div id="time-label" style="left:0">0.0s</div>
+    </div>
+    <!-- playhead position bar -->
+    <div style="color:#444;font-size:10px;padding-left:4px">
+      Click to seek · Space = mark start/end · 1-4 = label · Z = undo last · Arrow keys = nudge 100ms
+    </div>
+  </div>
+
+  <div id="sidebar">
+    <div id="shortcuts">
+      <div class="panel-title">Keyboard</div>
+      <div class="key-row"><span class="key">Space</span><span class="key-desc">mark segment start / end</span></div>
+      <div class="key-row"><span class="key">1</span><span class="key-desc">Turn Left</span></div>
+      <div class="key-row"><span class="key">2</span><span class="key-desc">Turn Right</span></div>
+      <div class="key-row"><span class="key">3</span><span class="key-desc">Pitch Up</span></div>
+      <div class="key-row"><span class="key">4</span><span class="key-desc">Pitch Down</span></div>
+      <div class="key-row"><span class="key">Z</span><span class="key-desc">undo last segment</span></div>
+      <div class="key-row"><span class="key">←→</span><span class="key-desc">nudge playhead ±100ms</span></div>
+      <div class="key-row"><span class="key">Del</span><span class="key-desc">delete selected segment</span></div>
+    </div>
+
+    <div id="gesture-panel">
+      <div class="panel-title">Gestures</div>
+      <button class="gesture-btn" onclick="labelLast('turn_left')"><span class="gkey">1</span>Turn Left</button>
+      <button class="gesture-btn" onclick="labelLast('turn_right')"><span class="gkey">2</span>Turn Right</button>
+      <button class="gesture-btn" onclick="labelLast('pitch_up')"><span class="gkey">3</span>Pitch Up</button>
+      <button class="gesture-btn" onclick="labelLast('pitch_down')"><span class="gkey">4</span>Pitch Down</button>
+    </div>
+
+    <div id="seg-list-panel">
+      <div class="panel-title">Segments (<span id="seg-count">0</span>)</div>
+      <div id="seg-list"></div>
+    </div>
+
+    <div>
+      <button id="export-btn" disabled onclick="exportTemplates()">Export Templates JSON</button>
+    </div>
+  </div>
+</div>
+
+<div id="bottom-bar">
+  <span id="bb-events">0 events</span>
+  <span id="bb-duration">0.0s</span>
+  <span id="bb-cursor">t=0.000s</span>
+  <span id="bb-mark">mark: —</span>
+</div>
+
+<div id="toast" id="toast"></div>
+
+<script>
+// ── State ─────────────────────────────────────────────────────────────────────
+
+let events = [];        // parsed JSONL events (type: raw only)
+let allEvents = [];     // all events for annotation overlay
+let tStart = 0;         // session start timestamp
+let duration = 0;       // ms
+let cursorT = 0;        // ms from start
+let markT = null;       // pending segment start mark (ms from start), or null
+let segments = [];      // { start, end, label } all in ms from start
+let selectedSeg = -1;
+
+// Canvas
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+let canvasW = 0, canvasH = 0;
+
+// ── File loading ──────────────────────────────────────────────────────────────
+
+document.getElementById('file-input').addEventListener('change', e => {
+  const f = e.target.files[0];
+  if (f) loadFile(f);
+});
+
+document.addEventListener('dragover', e => { e.preventDefault(); });
+document.addEventListener('drop', e => {
+  e.preventDefault();
+  const f = e.dataTransfer.files[0];
+  if (f) loadFile(f);
+});
+
+function loadFile(f) {
+  const reader = new FileReader();
+  reader.onload = e => parseSession(e.target.result, f.name);
+  reader.readAsText(f);
+}
+
+function parseSession(text, fname) {
+  const lines = text.split('\n').filter(l => l.trim());
+  allEvents = [];
+  for (const line of lines) {
+    try { allEvents.push(JSON.parse(line)); } catch {}
+  }
+
+  // Extract raw samples for timeline
+  const raw = allEvents.filter(e => e.type === 'raw');
+  if (raw.length === 0) {
+    setStatus(`No raw samples in ${fname}`);
+    return;
+  }
+
+  tStart = raw[0].t;
+  const tEnd = raw[raw.length - 1].t;
+  duration = tEnd - tStart;
+
+  events = raw.map(e => ({
+    t: e.t - tStart,
+    roll: e.roll ?? 0,
+    pitch: e.pitch ?? 0,
+    yaw: e.yaw ?? 0,
+  }));
+
+  // Gesture events as annotations
+  segments = allEvents
+    .filter(e => e.type === 'annotation')
+    .map(e => ({ start: e.t - tStart, end: e.t - tStart + 500, label: e.label, fromFile: true }));
+
+  cursorT = 0;
+  markT = null;
+  selectedSeg = -1;
+
+  setStatus(`${fname} — ${events.length} samples, ${(duration/1000).toFixed(1)}s`);
+  updateBottomBar();
+  renderCanvas();
+  renderSegList();
+  updateExportBtn();
+}
+
+function setStatus(msg) {
+  document.getElementById('status').textContent = msg;
+}
+
+// ── Canvas ────────────────────────────────────────────────────────────────────
+
+const wrap = document.getElementById('canvas-wrap');
+
+function resizeCanvas() {
+  const rect = wrap.getBoundingClientRect();
+  canvasW = Math.floor(rect.width);
+  canvasH = Math.floor(rect.height);
+  canvas.width  = canvasW;
+  canvas.height = canvasH;
+  renderCanvas();
+}
+
+window.addEventListener('resize', resizeCanvas);
+setTimeout(resizeCanvas, 50);
+
+function tToX(t) { return duration ? (t / duration) * canvasW : 0; }
+function xToT(x) { return duration ? (x / canvasW) * duration : 0; }
+
+function renderCanvas() {
+  ctx.clearRect(0, 0, canvasW, canvasH);
+  ctx.fillStyle = '#111';
+  ctx.fillRect(0, 0, canvasW, canvasH);
+
+  if (events.length === 0) {
+    ctx.fillStyle = '#333';
+    ctx.font = '12px Menlo, monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('Load a .jsonl session file', canvasW/2, canvasH/2);
+    return;
+  }
+
+  const TRACK_H = Math.floor(canvasH / 3) - 4;
+  const tracks = [
+    { key: 'roll',  color: '#4a9eff', label: 'roll',  y: 2 },
+    { key: 'pitch', color: '#ff9f44', label: 'pitch', y: TRACK_H + 6 },
+    { key: 'yaw',   color: '#c084fc', label: 'yaw',   y: TRACK_H * 2 + 10 },
+  ];
+
+  for (const track of tracks) {
+    const vals = events.map(e => e[track.key]);
+    const min = Math.min(...vals);
+    const max = Math.max(...vals);
+    const range = max - min || 1;
+
+    // Track background
+    ctx.fillStyle = '#161616';
+    ctx.fillRect(0, track.y, canvasW, TRACK_H);
+
+    // Zero line
+    const zeroY = track.y + TRACK_H * (1 - (-min / range));
+    ctx.strokeStyle = '#2a2a2a';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, zeroY);
+    ctx.lineTo(canvasW, zeroY);
+    ctx.stroke();
+
+    // Draw segments highlight
+    for (const seg of segments) {
+      const x1 = tToX(seg.start);
+      const x2 = tToX(seg.end);
+      ctx.fillStyle = labelColor(seg.label) + '22';
+      ctx.fillRect(x1, track.y, x2-x1, TRACK_H);
+    }
+
+    // Mark region
+    if (markT !== null) {
+      const x1 = Math.min(tToX(markT), tToX(cursorT));
+      const x2 = Math.max(tToX(markT), tToX(cursorT));
+      ctx.fillStyle = '#ffffff18';
+      ctx.fillRect(x1, track.y, x2-x1, TRACK_H);
+    }
+
+    // Signal line
+    ctx.strokeStyle = track.color;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    let first = true;
+    for (const e of events) {
+      const x = tToX(e.t);
+      const y = track.y + TRACK_H * (1 - ((e[track.key] - min) / range));
+      if (first) { ctx.moveTo(x, y); first = false; }
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Track label
+    ctx.fillStyle = track.color + 'aa';
+    ctx.font = '10px Menlo, monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(track.label, 4, track.y + 12);
+  }
+
+  // Segment border lines
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    const x1 = tToX(seg.start);
+    const x2 = tToX(seg.end);
+    ctx.strokeStyle = labelColor(seg.label);
+    ctx.lineWidth = i === selectedSeg ? 2 : 1;
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.moveTo(x1, 0); ctx.lineTo(x1, canvasH);
+    ctx.moveTo(x2, 0); ctx.lineTo(x2, canvasH);
+    ctx.stroke();
+
+    // Label above segment
+    ctx.fillStyle = labelColor(seg.label);
+    ctx.font = '10px Menlo, monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(seg.label, x1 + 2, 10);
+  }
+
+  // Cursor
+  updateCursorDOM();
+}
+
+function labelColor(label) {
+  switch(label) {
+    case 'turn_left':  return '#4a9eff';
+    case 'turn_right': return '#4cff80';
+    case 'pitch_up':   return '#ff9f44';
+    case 'pitch_down': return '#c084fc';
+    default:           return '#888';
+  }
+}
+
+function updateCursorDOM() {
+  const x = tToX(cursorT);
+  const line = document.getElementById('cursor-line');
+  const label = document.getElementById('time-label');
+  line.style.left = x + 'px';
+  label.style.left = (x + 4) + 'px';
+  label.textContent = (cursorT/1000).toFixed(3) + 's';
+}
+
+// ── Mouse interaction ─────────────────────────────────────────────────────────
+
+wrap.addEventListener('mousemove', e => {
+  if (events.length === 0) return;
+  const rect = wrap.getBoundingClientRect();
+  cursorT = Math.max(0, Math.min(duration, xToT(e.clientX - rect.left)));
+  updateCursorDOM();
+  updateBottomBar();
+});
+
+wrap.addEventListener('click', e => {
+  if (events.length === 0) return;
+  const rect = wrap.getBoundingClientRect();
+  cursorT = Math.max(0, Math.min(duration, xToT(e.clientX - rect.left)));
+
+  // Select segment under cursor
+  selectedSeg = -1;
+  for (let i = 0; i < segments.length; i++) {
+    if (cursorT >= segments[i].start && cursorT <= segments[i].end) {
+      selectedSeg = i;
+      break;
+    }
+  }
+
+  renderCanvas();
+  renderSegList();
+  updateBottomBar();
+});
+
+// ── Keyboard ──────────────────────────────────────────────────────────────────
+
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+
+  switch(e.key) {
+    case ' ':
+      e.preventDefault();
+      onSpacePress();
+      break;
+    case '1': labelLast('turn_left');  break;
+    case '2': labelLast('turn_right'); break;
+    case '3': labelLast('pitch_up');   break;
+    case '4': labelLast('pitch_down'); break;
+    case 'z': case 'Z': undoLast(); break;
+    case 'ArrowLeft':
+      e.preventDefault();
+      cursorT = Math.max(0, cursorT - 100);
+      renderCanvas();
+      updateBottomBar();
+      break;
+    case 'ArrowRight':
+      e.preventDefault();
+      cursorT = Math.min(duration, cursorT + 100);
+      renderCanvas();
+      updateBottomBar();
+      break;
+    case 'Delete': case 'Backspace':
+      if (selectedSeg >= 0) {
+        segments.splice(selectedSeg, 1);
+        selectedSeg = -1;
+        renderCanvas();
+        renderSegList();
+        updateExportBtn();
+      }
+      break;
+  }
+});
+
+function onSpacePress() {
+  if (events.length === 0) return;
+  if (markT === null) {
+    // First press: set start mark
+    markT = cursorT;
+    document.getElementById('bb-mark').textContent = `mark: ${(markT/1000).toFixed(2)}s`;
+    renderCanvas();
+  } else {
+    // Second press: close segment (unlabeled for now)
+    const start = Math.min(markT, cursorT);
+    const end   = Math.max(markT, cursorT);
+    if (end - start > 50) {
+      segments.push({ start, end, label: 'unlabeled' });
+      selectedSeg = segments.length - 1;
+      renderCanvas();
+      renderSegList();
+      updateExportBtn();
+      toast('Segment marked — press 1-4 to label');
+    }
+    markT = null;
+    document.getElementById('bb-mark').textContent = 'mark: —';
+  }
+}
+
+function labelLast(gesture) {
+  if (selectedSeg >= 0) {
+    segments[selectedSeg].label = gesture;
+    renderCanvas();
+    renderSegList();
+    updateExportBtn();
+    toast(gesture);
+  } else if (segments.length > 0) {
+    segments[segments.length - 1].label = gesture;
+    selectedSeg = segments.length - 1;
+    renderCanvas();
+    renderSegList();
+    updateExportBtn();
+    toast(gesture);
+  }
+}
+
+function undoLast() {
+  if (markT !== null) {
+    markT = null;
+    document.getElementById('bb-mark').textContent = 'mark: —';
+    renderCanvas();
+  } else if (segments.length > 0) {
+    segments.pop();
+    selectedSeg = -1;
+    renderCanvas();
+    renderSegList();
+    updateExportBtn();
+  }
+}
+
+// ── Segment list ──────────────────────────────────────────────────────────────
+
+function renderSegList() {
+  const container = document.getElementById('seg-list');
+  document.getElementById('seg-count').textContent = segments.length;
+  container.innerHTML = '';
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    const div = document.createElement('div');
+    div.className = 'seg-item' + (i === selectedSeg ? ' selected' : '');
+    div.innerHTML = `
+      <span class="seg-label" style="color:${labelColor(seg.label)}">${seg.label}</span>
+      <span class="seg-time">${(seg.start/1000).toFixed(2)}–${(seg.end/1000).toFixed(2)}s</span>
+      <span class="seg-del" onclick="deleteSeg(${i})">×</span>
+    `;
+    div.addEventListener('click', () => {
+      selectedSeg = i;
+      cursorT = seg.start;
+      renderCanvas();
+      renderSegList();
+    });
+    container.appendChild(div);
+  }
+}
+
+function deleteSeg(i) {
+  segments.splice(i, 1);
+  if (selectedSeg >= segments.length) selectedSeg = segments.length - 1;
+  renderCanvas();
+  renderSegList();
+  updateExportBtn();
+}
+
+// ── Export ────────────────────────────────────────────────────────────────────
+
+function updateExportBtn() {
+  const btn = document.getElementById('export-btn');
+  const labeled = segments.filter(s => s.label !== 'unlabeled');
+  btn.disabled = labeled.length === 0;
+  btn.textContent = `Export Templates JSON (${labeled.length} labeled)`;
+}
+
+function exportTemplates() {
+  const labeled = segments.filter(s => s.label !== 'unlabeled');
+  const templates = labeled.map(seg => {
+    // Extract raw samples within this time window
+    const pts = events
+      .filter(e => e.t >= seg.start && e.t <= seg.end)
+      .map(e => ({ x: e.roll, y: e.pitch, z: e.yaw }));
+    return {
+      gesture: seg.label,
+      points: pts,
+      capturedAt: tStart + seg.start,
+      source: 'session_labeler',
+    };
+  });
+
+  // GestureTemplateStore-compatible format
+  const store = { version: 1, templates };
+
+  const blob = new Blob([JSON.stringify(store, null, 2)], { type: 'application/json' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href     = url;
+  a.download = 'gesture_templates.json';
+  a.click();
+  URL.revokeObjectURL(url);
+  toast(`Exported ${templates.length} templates`);
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+
+function updateBottomBar() {
+  document.getElementById('bb-events').textContent   = `${events.length} samples`;
+  document.getElementById('bb-duration').textContent = `${(duration/1000).toFixed(1)}s`;
+  document.getElementById('bb-cursor').textContent   = `t=${(cursorT/1000).toFixed(3)}s`;
+}
+
+let toastTimeout = null;
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimeout);
+  toastTimeout = setTimeout(() => el.classList.remove('show'), 1500);
+}
+</script>
+</body>
+</html>

@@ -129,6 +129,7 @@ export class MotionClassifier {
   }
 
   private _handleCalibrating(stab: number, now: number): void {
+    console.log(`[MC] cal: stab=${stab} calSub=${this.calSub} sawMotion=${this.sawMotion} collectStartMs=${this.collectStartMs > 0}`);
     if (stab === STAB_MOTION) {
       // Arm moved again — cancel any in-progress dwell and restart
       this._clearDwellTimer();
@@ -145,6 +146,7 @@ export class MotionClassifier {
     // a device resting on a desk doesn't accidentally self-calibrate.
     const stillEnough = isCalibrationStill(stab) || (this.sawMotion && stab === 1);
     if (!stillEnough) {
+      console.log(`[MC] cal: stab=${stab} not still enough, ignoring`);
       return;
     }
 

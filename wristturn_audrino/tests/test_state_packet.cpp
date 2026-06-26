@@ -29,8 +29,8 @@ int main() {
     check("sizeof StabPacket == 2",         sizeof(StabPacket)       == 2);
     check("sizeof AnglesPacket == 7",       sizeof(AnglesPacket)     == 7);
     check("sizeof ArmEvtPacket == 5",       sizeof(ArmEvtPacket)     == 5);
-    check("sizeof AnglesExtPacket == 9",    sizeof(AnglesExtPacket)  == 9);
-    check("STATE_PACKET_MAX_LEN == 9",      STATE_PACKET_MAX_LEN     == 9);
+    check("sizeof AnglesExtPacket == 11",   sizeof(AnglesExtPacket)  == 11);
+    check("STATE_PACKET_MAX_LEN == 11",     STATE_PACKET_MAX_LEN     == 11);
 
     // ── pkt_stab ────────────────────────────────────────────────────────────
     {
@@ -80,11 +80,11 @@ int main() {
     check("dps_to_u16 saturates at u16",  dps_to_u16(10000.0f)    == 65535);
     check("dps_to_u16 clamps negatives",  dps_to_u16(-5.0f)       ==     0);
 
-    // ── pkt_pose_ext roundtrip (12.0°, -3.5°, 0°, 25.0 dps) ─────────────────
+    // ── pkt_pose_ext roundtrip (12.0°, -3.5°, 0°, 25.0 dps, seq=42) ─────────
     {
         uint8_t buf[STATE_PACKET_MAX_LEN] = {0};
-        uint8_t n = pkt_pose_ext(buf, 12.0f, -3.5f, 0.0f, 25.0f);
-        check("pkt_pose_ext returns 9",       n == 9);
+        uint8_t n = pkt_pose_ext(buf, 12.0f, -3.5f, 0.0f, 25.0f, 42);
+        check("pkt_pose_ext returns 11",      n == 11);
         check("pkt_pose_ext tag",             buf[0] == PKT_POSE_EXT);
         auto read_i16 = [&](int off) -> int16_t {
             return (int16_t)((buf[off+1] << 8) | buf[off]);
@@ -96,15 +96,18 @@ int main() {
         check("pkt_pose_ext pitch_dd == -35", read_i16(3) == -35);
         check("pkt_pose_ext yaw_dd == 0",     read_i16(5) ==   0);
         check("pkt_pose_ext gyro_ddps == 250", read_u16(7) == 250);
+        check("pkt_pose_ext seq == 42",       read_u16(9) == 42);
     }
 
-    // ── pkt_pose_ext with high gyro near saturation ─────────────────────────
+    // ── pkt_pose_ext with high gyro near saturation + seq wrap ──────────────
     {
         uint8_t buf[STATE_PACKET_MAX_LEN] = {0};
-        uint8_t n = pkt_pose_ext(buf, 0.0f, 0.0f, 0.0f, 9999.0f);
-        check("pkt_pose_ext returns 9 (sat)", n == 9);
+        uint8_t n = pkt_pose_ext(buf, 0.0f, 0.0f, 0.0f, 9999.0f, 65535);
+        check("pkt_pose_ext returns 11 (sat)", n == 11);
         uint16_t g = (uint16_t)((buf[8] << 8) | buf[7]);
         check("pkt_pose_ext gyro saturates",  g == 65535);
+        uint16_t s = (uint16_t)((buf[10] << 8) | buf[9]);
+        check("pkt_pose_ext seq == 65535",    s == 65535);
     }
 
     printf("\n%s: %d failure(s)\n", failed ? "FAIL" : "PASS", failed);

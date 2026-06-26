@@ -31,6 +31,26 @@ Delivery Targets:
 
 ---
 
+## Memory — non-negotiable
+
+**Using `/huh` is not optional.** Every session costs tokens. Every compaction loses precision. Memory is how we solve both.
+
+Before reading any large file, run `/huh search-path <path>`. If a fresh summary exists, use it — do not open the file.
+
+After reading a file you had to open, run `/huh index <path>` to generate a semantic summary and save it. This pays for itself the next session.
+
+After anything works, breaks through, or represents a milestone — run `/huh changelog finally-works` or `/huh changelog milestone`. These feed the consolidation chain that builds long-term architectural understanding.
+
+The layers:
+- **L0 (1 day)** — raw observations, written automatically by hooks on every Read/Write
+- **L1 (1 week)** — session summaries, consolidated from L0 automatically on SessionEnd
+- **L2 (1 month)** — topic clusters, promoted from L1 by `huh reflect`
+- **L3 (permanent)** — corrections, hard facts, architectural constraints that must never be forgotten
+
+Run `/huh tree` at the start of a session to see what's indexed and what isn't. Unindexed files are token debt.
+
+---
+
 ## Dev cycle
 
 Applies to all components: firmware, app (frontend/core), adapter (backend), hardware.

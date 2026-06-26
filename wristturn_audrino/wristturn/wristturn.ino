@@ -1665,11 +1665,17 @@ static void handleRotationVector() {
       // app-side HoldDetector. App falls back gracefully if it sees only the
       // legacy PKT_POSE shape (older firmware), so the upgrade is one-way safe.
       {
+        // POSE_EXT emission throttle. Was 100ms (10Hz); dropped to 20ms (50Hz)
+        // to capture flicks faithfully — a flick is 200-400ms total, so 10Hz
+        // gave only 2-4 samples per gesture (too coarse to resolve shape).
+        // poseSeq is a monotonic counter that lets the app detect BLE-link
+        // drops independent of timing (wraps at 65535).
         static unsigned long lastPoseMs = 0;
-        if (now - lastPoseMs >= 100) {
+        static uint16_t poseSeq = 0;
+        if (now - lastPoseMs >= 20) {
           lastPoseMs = now;
           uint8_t pbuf[STATE_PACKET_MAX_LEN];
-          uint8_t pn = pkt_pose_ext(pbuf, roll, pitch, yaw, latestGyroMagDps);
+          uint8_t pn = pkt_pose_ext(pbuf, roll, pitch, yaw, latestGyroMagDps, poseSeq++);
           stateChar.notify(pbuf, pn);
         }
       }

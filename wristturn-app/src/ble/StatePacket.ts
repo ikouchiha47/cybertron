@@ -87,7 +87,7 @@ export const SIZE = {
   ANGLES:      7,
   ARM_EVT:     5,
   GRAV:        2,
-  ANGLES_EXT:  9,   // ANGLES + u16 gyro_mag_ddps
+  ANGLES_EXT:  11,  // ANGLES + u16 gyro_mag_ddps + u16 seq
 } as const;
 
 // ── Parsed-packet types ─────────────────────────────────────────────────────
@@ -95,7 +95,7 @@ export const SIZE = {
 export type StabPacket     = { type: "stab";     stab:  number };
 export type BaselinePacket = { type: "baseline"; roll:  number; pitch: number; yaw: number };
 export type PosePacket     = { type: "pose";     roll:  number; pitch: number; yaw: number };
-export type PoseExtPacket  = { type: "pose_ext"; roll:  number; pitch: number; yaw: number; gyroMagDps: number };
+export type PoseExtPacket  = { type: "pose_ext"; roll:  number; pitch: number; yaw: number; gyroMagDps: number; seq?: number };
 export type SleepPacket    = { type: "sleep" };
 export type WakePacket     = { type: "wake" };
 export type ArmEvtPacket   = { type: "arm_evt"; axis: number; state: number; delta: number };
@@ -126,6 +126,11 @@ function readU16LEDps(bytes: Uint8Array, offset: number): number {
   const lo = bytes[offset];
   const hi = bytes[offset + 1];
   return ((hi << 8) | lo) / 10.0;
+}
+
+/** Read a little-endian uint16. */
+function readU16LE(bytes: Uint8Array, offset: number): number {
+  return (bytes[offset + 1] << 8) | bytes[offset];
 }
 
 /** Decode an AnglesPacket payload starting at offset 1 (skip tag). */
@@ -163,11 +168,14 @@ export function parseStatePacket(input: Uint8Array | string): StatePacket | null
       return { type: "pose", ...parseAngles(bytes) };
 
     case PKT.POSE_EXT:
-      if (bytes.length < SIZE.ANGLES_EXT) return null;
+      // Backward compat: legacy firmware emits 9 bytes (no seq); new firmware
+      // emits 11 bytes (gyro + seq). Accept both — seq is optional.
+      if (bytes.length < 9) return null;
       return {
         type: "pose_ext",
         ...parseAngles(bytes),
         gyroMagDps: readU16LEDps(bytes, 7),
+        seq: bytes.length >= SIZE.ANGLES_EXT ? readU16LE(bytes, 9) : undefined,
       };
 
     case PKT.SLEEP: return { type: "sleep" };

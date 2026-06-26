@@ -2,3 +2,5 @@
 tmp/
 
 writstturn_adapter/shots/
+.kilo/
+.claude/code-memory/

@@ -535,6 +535,10 @@ export function SettingsScreen({ navigation }: Props) {
           </TouchableOpacity>
         </View>
       )}
+
+      <TouchableOpacity style={s.addToggle} onPress={() => navigation.navigate("CalibrationCapture")}>
+        <Text style={s.addToggleText}>⊙  Calibrate Gesture Templates</Text>
+      </TouchableOpacity>
     </View>
   );
 }

@@ -113,7 +113,9 @@ struct __attribute__((packed)) GravPacket {
 };
 static_assert(sizeof(GravPacket) == 2, "GravPacket must be 2 bytes");
 
-// PKT_POSE_EXT extends AnglesPacket with per-sample gyro magnitude.
+// PKT_POSE_EXT extends AnglesPacket with per-sample gyro magnitude and a
+// monotonically-increasing sequence number (wraps at 65535 ≈ 22 min @50Hz).
+// The seq lets the app detect BLE-link drops independent of wall-clock timing.
 // Required by the app-side HoldDetector (UNIFIED_GESTURE_DESIGN.md). Magnitude
 // is unsigned deci-dps (divide by 10 → dps, range 0–6553 dps), enough for any
 // realistic flick. App parser at wristturn-app/src/ble/StatePacket.ts mirrors.
@@ -123,8 +125,9 @@ struct __attribute__((packed)) AnglesExtPacket {
     int16_t  pitch_dd;
     int16_t  yaw_dd;
     uint16_t gyro_mag_ddps;
+    uint16_t seq;            // emit counter, wraps at 65535
 };
-static_assert(sizeof(AnglesExtPacket) == 9, "AnglesExtPacket must be 9 bytes");
+static_assert(sizeof(AnglesExtPacket) == 11, "AnglesExtPacket must be 11 bytes");
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -176,15 +179,17 @@ static inline uint8_t pkt_pose(uint8_t* out, float r, float p, float y) {
     return pkt_angles(out, PKT_POSE, r, p, y);
 }
 
-// Build a PKT_POSE_EXT packet (pose + per-sample gyro magnitude in dps).
+// Build a PKT_POSE_EXT packet (pose + per-sample gyro magnitude in dps + seq).
 // gyroMagDps must be non-negative; saturates at 6553.5 dps.
-static inline uint8_t pkt_pose_ext(uint8_t* out, float r, float p, float y, float gyroMagDps) {
+// seq is a caller-managed monotonic counter; wraps at 65535 by uint16 overflow.
+static inline uint8_t pkt_pose_ext(uint8_t* out, float r, float p, float y, float gyroMagDps, uint16_t seq) {
     AnglesExtPacket pkt {
         PKT_POSE_EXT,
         angle_to_i16(r),
         angle_to_i16(p),
         angle_to_i16(y),
         dps_to_u16(gyroMagDps),
+        seq,
     };
     memcpy(out, &pkt, sizeof(pkt));
     return sizeof(pkt);
@@ -221,4 +226,4 @@ static inline uint8_t pkt_grav(uint8_t* out, uint8_t pose) {
 
 // Max packet size across all types — used to size transmission buffers.
 // Must be kept in sync with the largest packed struct above.
-static constexpr uint8_t STATE_PACKET_MAX_LEN = sizeof(AnglesExtPacket);  // 9
+static constexpr uint8_t STATE_PACKET_MAX_LEN = sizeof(AnglesExtPacket);  // 11

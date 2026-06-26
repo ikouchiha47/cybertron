@@ -3,26 +3,51 @@
     "andrej-karpathy-skills@karpathy-skills": true
   },
   "hooks": {
-    "PreToolUse": [
+    "PostToolUse": [
       {
-        "matcher": "Read",
+        "matcher": "Write|Edit|MultiEdit|Read",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 tools/code_memory.py",
-            "timeout": 8
+            "command": "crisp-hook",
+            "args": ["claude-post-tool"],
+            "timeout": 10
           }
         ]
       }
     ],
-    "PostToolUse": [
+    "Stop": [
       {
-        "matcher": "Read|Write|Edit|MultiEdit",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 tools/code_memory.py",
-            "timeout": 12
+            "command": "crisp-hook",
+            "args": ["claude-stop"],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "crisp-hook",
+            "args": ["claude-session-end"],
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "crisp-hook",
+            "args": ["claude-pre-compact"],
+            "timeout": 30
           }
         ]
       }

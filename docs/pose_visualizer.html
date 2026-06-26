@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Pose Visualizer — WristTurn</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #0d0d0d; color: #ddd; font-family: Menlo, monospace; font-size: 12px; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+
+#header { padding: 8px 14px; background: #111; border-bottom: 1px solid #1f1f1f; display: flex; align-items: center; gap: 16px; }
+#header h1 { font-size: 13px; color: #fff; font-weight: 600; }
+#status { font-size: 11px; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }
+.dot.green { background: #4cff80; }
+.dot.red   { background: #ff4444; }
+.dot.grey  { background: #555; }
+
+#values { display: flex; gap: 24px; margin-left: auto; }
+.val-block { text-align: right; }
+.val-label { color: #555; font-size: 10px; text-transform: uppercase; }
+.val-num { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.val-roll  { color: #4a9eff; }
+.val-pitch { color: #ff9f44; }
+.val-yaw   { color: #c084fc; }
+
+#charts { flex: 1; display: flex; flex-direction: column; gap: 1px; background: #0a0a0a; padding: 8px; gap: 6px; }
+
+.track { flex: 1; position: relative; background: #111; border-radius: 5px; overflow: hidden; }
+.track-label { position: absolute; top: 4px; left: 6px; font-size: 10px; opacity: 0.6; z-index: 1; }
+canvas { display: block; width: 100%; height: 100%; }
+
+#gauge-row { display: flex; gap: 6px; padding: 0 8px 8px; height: 56px; }
+.gauge { flex: 1; background: #111; border-radius: 5px; display: flex; align-items: center; padding: 0 12px; gap: 10px; }
+.gauge-name { font-size: 10px; color: #555; width: 36px; text-transform: uppercase; }
+.bar-bg { flex: 1; height: 8px; background: #1a1a1a; border-radius: 4px; overflow: hidden; }
+.bar-fill { height: 100%; border-radius: 4px; transition: width 0.08s linear; }
+.bar-roll  .bar-fill { background: #4a9eff; }
+.bar-pitch .bar-fill { background: #ff9f44; }
+.bar-yaw   .bar-fill { background: #c084fc; }
+.gauge-num { font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums; width: 52px; text-align: right; }
+</style>
+</head>
+<body>
+
+<div id="header">
+  <h1>Pose Visualizer</h1>
+  <span id="status"><span class="dot grey" id="dot"></span><span id="status-text">Connecting…</span></span>
+  <div id="values">
+    <div class="val-block"><div class="val-label">Roll</div><div class="val-num val-roll" id="v-roll">—</div></div>
+    <div class="val-block"><div class="val-label">Pitch</div><div class="val-num val-pitch" id="v-pitch">—</div></div>
+    <div class="val-block"><div class="val-label">Yaw</div><div class="val-num val-yaw" id="v-yaw">—</div></div>
+  </div>
+</div>
+
+<div id="charts">
+  <div class="track" id="track-roll">
+    <span class="track-label" style="color:#4a9eff">ROLL</span>
+    <canvas id="c-roll"></canvas>
+  </div>
+  <div class="track" id="track-pitch">
+    <span class="track-label" style="color:#ff9f44">PITCH</span>
+    <canvas id="c-pitch"></canvas>
+  </div>
+  <div class="track" id="track-yaw">
+    <span class="track-label" style="color:#c084fc">YAW</span>
+    <canvas id="c-yaw"></canvas>
+  </div>
+</div>
+
+<div id="gauge-row">
+  <div class="gauge bar-roll">
+    <span class="gauge-name">Roll</span>
+    <div class="bar-bg"><div class="bar-fill" id="g-roll" style="width:50%"></div></div>
+    <span class="gauge-num val-roll" id="gv-roll">0°</span>
+  </div>
+  <div class="gauge bar-pitch">
+    <span class="gauge-name">Pitch</span>
+    <div class="bar-bg"><div class="bar-fill" id="g-pitch" style="width:50%"></div></div>
+    <span class="gauge-num val-pitch" id="gv-pitch">0°</span>
+  </div>
+  <div class="gauge bar-yaw">
+    <span class="gauge-name">Yaw</span>
+    <div class="bar-bg"><div class="bar-fill" id="g-yaw" style="width:50%"></div></div>
+    <span class="gauge-num val-yaw" id="gv-yaw">0°</span>
+  </div>
+</div>
+
+<script>
+const HISTORY  = 300;  // samples to keep
+const ROLL_RANGE  = 90;
+const PITCH_RANGE = 90;
+const YAW_RANGE   = 180;
+
+const history = { roll: [], pitch: [], yaw: [] };
+
+// ── Canvas setup ──────────────────────────────────────────────────────────────
+
+const tracks = [
+  { key: "roll",  canvas: document.getElementById("c-roll"),  color: "#4a9eff", range: ROLL_RANGE  },
+  { key: "pitch", canvas: document.getElementById("c-pitch"), color: "#ff9f44", range: PITCH_RANGE },
+  { key: "yaw",   canvas: document.getElementById("c-yaw"),   color: "#c084fc", range: YAW_RANGE   },
+];
+
+function resizeAll() {
+  for (const t of tracks) {
+    const rect = t.canvas.parentElement.getBoundingClientRect();
+    t.canvas.width  = Math.floor(rect.width);
+    t.canvas.height = Math.floor(rect.height);
+  }
+  drawAll();
+}
+
+window.addEventListener("resize", resizeAll);
+setTimeout(resizeAll, 50);
+
+function drawTrack(t) {
+  const c = t.canvas;
+  const ctx = c.getContext("2d");
+  const W = c.width, H = c.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = "#111";
+  ctx.fillRect(0, 0, W, H);
+
+  const data = history[t.key];
+  if (data.length < 2) return;
+
+  // Zero line
+  const zeroY = H / 2;
+  ctx.strokeStyle = "#222";
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, zeroY); ctx.lineTo(W, zeroY); ctx.stroke();
+
+  // ±45 guide lines
+  const q = H / 4;
+  ctx.strokeStyle = "#191919";
+  ctx.beginPath(); ctx.moveTo(0, q);   ctx.lineTo(W, q);   ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0, 3*q); ctx.lineTo(W, 3*q); ctx.stroke();
+
+  // Signal
+  ctx.strokeStyle = t.color;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for (let i = 0; i < data.length; i++) {
+    const x = (i / (HISTORY - 1)) * W;
+    const y = H/2 - (data[i] / t.range) * (H/2) * 0.9;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // Latest value dot
+  const last = data[data.length - 1];
+  const lx = W - 1;
+  const ly = H/2 - (last / t.range) * (H/2) * 0.9;
+  ctx.fillStyle = t.color;
+  ctx.beginPath(); ctx.arc(lx, ly, 3, 0, Math.PI * 2); ctx.fill();
+}
+
+function drawAll() { for (const t of tracks) drawTrack(t); }
+
+// ── Gauge update ──────────────────────────────────────────────────────────────
+
+function updateGauge(key, val, range) {
+  const pct = Math.min(100, Math.max(0, ((val + range) / (2 * range)) * 100));
+  document.getElementById(`g-${key}`).style.width = pct + "%";
+  document.getElementById(`gv-${key}`).textContent = val.toFixed(1) + "°";
+}
+
+// ── WebSocket ─────────────────────────────────────────────────────────────────
+
+let ws, reconnectTimer;
+
+function connect() {
+  ws = new WebSocket("ws://localhost:7701");
+
+  ws.onopen = () => {
+    document.getElementById("dot").className = "dot green";
+    document.getElementById("status-text").textContent = "Live";
+    clearTimeout(reconnectTimer);
+  };
+
+  ws.onclose = () => {
+    document.getElementById("dot").className = "dot red";
+    document.getElementById("status-text").textContent = "Disconnected — retrying…";
+    reconnectTimer = setTimeout(connect, 2000);
+  };
+
+  ws.onerror = () => ws.close();
+
+  ws.onmessage = (e) => {
+    const { roll, pitch, yaw } = JSON.parse(e.data);
+
+    history.roll.push(roll);   if (history.roll.length  > HISTORY) history.roll.shift();
+    history.pitch.push(pitch); if (history.pitch.length > HISTORY) history.pitch.shift();
+    history.yaw.push(yaw);     if (history.yaw.length   > HISTORY) history.yaw.shift();
+
+    drawAll();
+
+    document.getElementById("v-roll").textContent  = roll.toFixed(1)  + "°";
+    document.getElementById("v-pitch").textContent = pitch.toFixed(1) + "°";
+    document.getElementById("v-yaw").textContent   = yaw.toFixed(1)   + "°";
+
+    updateGauge("roll",  roll,  ROLL_RANGE);
+    updateGauge("pitch", pitch, PITCH_RANGE);
+    updateGauge("yaw",   yaw,   YAW_RANGE);
+  };
+}
+
+connect();
+</script>
+</body>
+</html>

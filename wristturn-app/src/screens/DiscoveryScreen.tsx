@@ -266,6 +266,11 @@ export function DiscoveryScreen({ navigation }: Props) {
   // motions where pitch_down fires mid-arc and would accidentally select a
   // device. Updated on every gesture this screen sees.
   const lastGestureMsRef = useRef<number>(0);
+  // Focused-gate: handleGesture must early-return when Discovery isn't the active
+  // screen (e.g. CalibrationCaptureScreen pushed over the stack). Without this,
+  // gesture events from BLE still reach this handler and pitch_down in BROWSING
+  // state would call openDevice() mid-calibration.
+  const focusedRef       = useRef<boolean>(true);
   const insets           = useSafeAreaInsets();
   const iconRot        = useRef(new Animated.Value(0)).current;
 
@@ -277,6 +282,10 @@ export function DiscoveryScreen({ navigation }: Props) {
 
   // Stable gesture handler — reads discState via ref, no dependency churn
   const handleGesture = React.useCallback((g: string) => {
+    if (!focusedRef.current) {
+      DebugLog.push("DISCOVERY", `gesture ${g} dropped: screen not focused`);
+      return;
+    }
     const ds = discStateRef.current;
     const now = Date.now();
     const sinceLast = now - lastGestureMsRef.current;
@@ -555,6 +564,21 @@ export function DiscoveryScreen({ navigation }: Props) {
       armDevice().catch((e) => log(`E7: armDevice error: ${e}`));
     }
   }, [discState]);
+
+  // Track focus state for handleGesture gating. Bottom-tab screens stay mounted
+  // when stack screens push over them, so the BLE gesture subscription survives —
+  // we must drop events ourselves when not focused.
+  useEffect(() => {
+    const unFocus = navigation.addListener("focus", () => {
+      focusedRef.current = true;
+      console.log("[Discovery] focus → gesture handler ENABLED");
+    });
+    const unBlur = navigation.addListener("blur", () => {
+      focusedRef.current = false;
+      console.log("[Discovery] blur → gesture handler DISABLED");
+    });
+    return () => { unFocus(); unBlur(); };
+  }, [navigation]);
 
   // E8: Focus — re-send baseline to firmware, or trigger recalibration if cleared in settings
   useEffect(() => {

@@ -256,7 +256,7 @@ const ELEC_INNER_R = WRIST_R - (BAND_THICK / 2) - 0.75;
 
 // We need 9mm long tangentially (along Z), 6mm wide (along X).
 // Geometry: Box(X=6, Y=1.5, Z=9)
-[[122, 155, 188], [242, 275, 308]].forEach(angles => {
+[[147, 180, 213], [267, 300, 333]].forEach(angles => {
   angles.forEach((deg, padIdx) => {
     const a   = deg * Math.PI / 180;
     const ez  = ELEC_INNER_R * Math.sin(a);

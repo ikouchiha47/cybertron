@@ -1,4 +1,5 @@
 import React from "react";
+import { View } from "react-native";
 import { NavigationContainer } from "@react-navigation/native";
 import { createStackNavigator } from "@react-navigation/stack";
 import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
@@ -11,6 +12,8 @@ import { SettingsScreen } from "../screens/SettingsScreen";
 import { WizProvisionScreen } from "../screens/WizProvisionScreen";
 import { LogsScreen } from "../screens/LogsScreen";
 import { SessionScreen } from "../screens/SessionScreen";
+import { CalibrationCaptureScreen } from "../screens/CalibrationCaptureScreen";
+import { GlobalErrorOverlay } from "../ui/GlobalErrorOverlay";
 import type { Baseline } from "../types";
 
 export type TabParams = {
@@ -21,11 +24,12 @@ export type TabParams = {
 };
 
 export type RootStackParams = {
-  Tabs:          undefined;
-  GestureMapping: { deviceId: string };
-  ActiveControl:  { deviceId: string; homeBaseline?: Baseline | null };
-  Pairing:        { deviceId: string };
-  WizProvision:   undefined;
+  Tabs:               undefined;
+  GestureMapping:     { deviceId: string };
+  ActiveControl:      { deviceId: string; homeBaseline?: Baseline | null };
+  Pairing:            { deviceId: string };
+  WizProvision:       undefined;
+  CalibrationCapture: undefined;
 };
 
 const Tab   = createBottomTabNavigator<TabParams>();
@@ -73,14 +77,18 @@ function TabNavigator() {
 
 export function AppNavigator() {
   return (
-    <NavigationContainer>
-      <Stack.Navigator screenOptions={stackOptions}>
-        <Stack.Screen name="Tabs"           component={TabNavigator}         options={{ headerShown: false }} />
-        <Stack.Screen name="GestureMapping" component={GestureMappingScreen} options={{ title: "Map Gestures" }} />
-        <Stack.Screen name="ActiveControl"  component={ActiveControlScreen}  options={{ title: "" }} />
-        <Stack.Screen name="Pairing"        component={PairingScreen}        options={{ title: "Pair Device" }} />
-        <Stack.Screen name="WizProvision"   component={WizProvisionScreen}   options={{ title: "Add Smart Bulb" }} />
-      </Stack.Navigator>
-    </NavigationContainer>
+    <View style={{ flex: 1 }}>
+      <NavigationContainer>
+        <Stack.Navigator screenOptions={stackOptions}>
+          <Stack.Screen name="Tabs"           component={TabNavigator}         options={{ headerShown: false }} />
+          <Stack.Screen name="GestureMapping" component={GestureMappingScreen} options={{ title: "Map Gestures" }} />
+          <Stack.Screen name="ActiveControl"  component={ActiveControlScreen}  options={{ title: "" }} />
+          <Stack.Screen name="Pairing"        component={PairingScreen}        options={{ title: "Pair Device" }} />
+          <Stack.Screen name="WizProvision"       component={WizProvisionScreen}       options={{ title: "Add Smart Bulb" }} />
+          <Stack.Screen name="CalibrationCapture" component={CalibrationCaptureScreen} options={{ title: "Calibrate Gestures" }} />
+        </Stack.Navigator>
+      </NavigationContainer>
+      <GlobalErrorOverlay />
+    </View>
   );
 }
