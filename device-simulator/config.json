@@ -1,0 +1,76 @@
+{
+  "categories": {
+    "bulb": {
+      "icon": "💡",
+      "initialState": { "on": false, "brightness": 100, "hue": 0 },
+      "routes": {
+        "POST /power":      { "merge": { "on": "$body.on" } },
+        "POST /brightness": { "merge": { "brightness": { "clamp": ["$body.value", 0, 100] } } },
+        "POST /hue":        { "merge": { "hue": { "wrap": ["$body.value", 0, 360] } } }
+      },
+      "controls": [
+        { "type": "power",   "onPath": "/power",      "onBody": { "on": true },  "offBody": { "on": false } },
+        { "type": "slider",  "label": "Brightness",   "path": "/brightness", "field": "value", "min": 0, "max": 100, "unit": "%" },
+        { "type": "slider",  "label": "Hue",          "path": "/hue",        "field": "value", "min": 0, "max": 359, "unit": "°", "style": "hue" }
+      ]
+    },
+
+    "fan": {
+      "icon": "🌀",
+      "initialState": { "on": false, "speed": 1, "mode": "normal" },
+      "routes": {
+        "POST /power": { "merge": { "on": "$body.on" } },
+        "POST /speed": { "merge": { "speed": { "clamp": [{ "stepFrom": ["$state.speed", "$body.direction", "up", "down"] }, 0, 5] } } },
+        "POST /mode":  { "merge": { "mode": "$body.mode" } }
+      },
+      "controls": [
+        { "type": "power",   "onPath": "/power", "onBody": { "on": true }, "offBody": { "on": false } },
+        { "type": "buttons", "label": "Speed",   "items": [
+          { "label": "⬆ Faster", "path": "/speed", "body": { "direction": "up" } },
+          { "label": "⬇ Slower", "path": "/speed", "body": { "direction": "down" } }
+        ]},
+        { "type": "pills",   "label": "Mode",    "path": "/mode", "field": "mode",
+          "options": ["normal", "breeze", "beach", "sleep", "turbo"] }
+      ]
+    },
+
+    "tv": {
+      "icon": "📺",
+      "initialState": { "on": true, "volume": 20, "focusedApp": null, "cursor": { "x": 0, "y": 0 } },
+      "routes": {
+        "POST /remote": { "nav": { "field": "$body.action", "cursorField": "cursor", "selectField": "focusedApp" } },
+        "POST /volume": { "merge": { "volume": { "clamp": [{ "stepFrom": ["$state.volume", "$body.direction", "up", "down", 2] }, 0, 100] } } }
+      },
+      "controls": [
+        { "type": "dpad",    "label": "Navigation", "path": "/remote", "field": "action",
+          "actions": { "up": "up", "down": "down", "left": "left", "right": "right", "center": "select", "back": "back" } },
+        { "type": "buttons", "label": "Volume", "items": [
+          { "label": "🔊 Vol +", "path": "/volume", "body": { "direction": "up" } },
+          { "label": "🔉 Vol −", "path": "/volume", "body": { "direction": "down" } }
+        ]},
+        { "type": "buttons", "label": "Navigation", "items": [
+          { "label": "← Back", "path": "/remote", "body": { "action": "back" } }
+        ]}
+      ]
+    },
+
+    "monitor": {
+      "icon": "🖥️",
+      "initialState": { "activeDesktop": 1, "focusedApp": null },
+      "routes": {
+        "POST /desktop":    { "merge": { "activeDesktop": { "step": ["$state.activeDesktop", "$body.direction", "next", "prev", 1, 1] } } },
+        "POST /switch-app": { "merge": { "focusedApp": { "if": ["$body.reverse", "prev-app", "next-app"] } } }
+      },
+      "controls": [
+        { "type": "buttons", "label": "Desktop", "items": [
+          { "label": "◀ Prev", "path": "/desktop",    "body": { "direction": "prev" } },
+          { "label": "Next ▶", "path": "/desktop",    "body": { "direction": "next" } }
+        ]},
+        { "type": "buttons", "label": "Switch App", "items": [
+          { "label": "⇥ Next App",  "hint": "⌘Tab",   "path": "/switch-app", "body": { "reverse": false } },
+          { "label": "⇤ Prev App",  "hint": "⌘⇧Tab",  "path": "/switch-app", "body": { "reverse": true } }
+        ]}
+      ]
+    }
+  }
+}
