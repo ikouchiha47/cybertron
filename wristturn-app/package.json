@@ -9,6 +9,7 @@
     "web": "expo start --web",
     "validate-combos": "tsx scripts/validate-combos.ts",
     "sync-native": "bash scripts/sync-native-overlay.sh",
+    "install-release": "bash scripts/install-release.sh",
     "prebuild": "expo prebuild && npm run sync-native",
     "postinstall": "[ -d android ] && npm run sync-native || true"
   },

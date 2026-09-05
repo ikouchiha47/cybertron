@@ -30,7 +30,7 @@ int main() {
     check("sizeof AnglesPacket == 7",       sizeof(AnglesPacket)     == 7);
     check("sizeof ArmEvtPacket == 5",       sizeof(ArmEvtPacket)     == 5);
     check("sizeof AnglesExtPacket == 11",   sizeof(AnglesExtPacket)  == 11);
-    check("STATE_PACKET_MAX_LEN == 11",     STATE_PACKET_MAX_LEN     == 11);
+    check("STATE_PACKET_MAX_LEN == 14",     STATE_PACKET_MAX_LEN     == 14);
 
     // ── pkt_stab ────────────────────────────────────────────────────────────
     {
@@ -108,6 +108,46 @@ int main() {
         check("pkt_pose_ext gyro saturates",  g == 65535);
         uint16_t s = (uint16_t)((buf[10] << 8) | buf[9]);
         check("pkt_pose_ext seq == 65535",    s == 65535);
+    }
+
+    // ── pkt_arb_debug roundtrip ──────────────────────────────────────────────
+    // A misclassified "roll turn" fired as pitch: pitch's integral (0.45 rad)
+    // beat roll's (0.20 rad) — this is the exact shape that tells apart
+    // wrong-axis misclassification from cross-axis bleed.
+    {
+        uint8_t buf[STATE_PACKET_MAX_LEN] = {0};
+        uint8_t n = pkt_arb_debug(buf, AXIS_PITCH,
+                                   0.20f, 0.45f, 0.05f,   // roll/pitch/yaw integrals (rad)
+                                   3.0f,  6.5f,  1.0f);   // roll/pitch/yaw peak rates (rad/s)
+        check("pkt_arb_debug returns 14",  n == 14);
+        check("pkt_arb_debug tag",         buf[0] == PKT_ARB_DEBUG);
+        check("pkt_arb_debug firedAxis",   buf[1] == AXIS_PITCH);
+        auto read_i16 = [&](int off) -> int16_t {
+            return (int16_t)((buf[off+1] << 8) | buf[off]);
+        };
+        auto read_u16 = [&](int off) -> uint16_t {
+            return (uint16_t)((buf[off+1] << 8) | buf[off]);
+        };
+        check("pkt_arb_debug roll_integ_mrad == 200",   read_i16(2)  == 200);
+        check("pkt_arb_debug pitch_integ_mrad == 450",  read_i16(4)  == 450);
+        check("pkt_arb_debug yaw_integ_mrad == 50",     read_i16(6)  == 50);
+        check("pkt_arb_debug roll_peak_crdps == 300",   read_u16(8)  == 300);
+        check("pkt_arb_debug pitch_peak_crdps == 650",  read_u16(10) == 650);
+        check("pkt_arb_debug yaw_peak_crdps == 100",    read_u16(12) == 100);
+    }
+
+    // ── pkt_arb_debug negative integral + saturation ────────────────────────
+    {
+        uint8_t buf[STATE_PACKET_MAX_LEN] = {0};
+        pkt_arb_debug(buf, AXIS_ROLL, -0.30f, 0.0f, 0.0f, 999.0f, 0.0f, 0.0f);
+        auto read_i16 = [&](int off) -> int16_t {
+            return (int16_t)((buf[off+1] << 8) | buf[off]);
+        };
+        auto read_u16 = [&](int off) -> uint16_t {
+            return (uint16_t)((buf[off+1] << 8) | buf[off]);
+        };
+        check("pkt_arb_debug negative roll_integ_mrad == -300", read_i16(2) == -300);
+        check("pkt_arb_debug roll_peak_crdps saturates",        read_u16(8) == 65535);
     }
 
     printf("\n%s: %d failure(s)\n", failed ? "FAIL" : "PASS", failed);

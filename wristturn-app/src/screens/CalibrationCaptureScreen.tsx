@@ -11,6 +11,7 @@ import { parseStatePacket } from "../ble/StatePacket";
 import { SessionRecorder } from "../debug/SessionRecorder";
 import type { Point3D } from "../gestures/recognizer/PointCloudRecognizer";
 import { GestureTemplateStore } from "../gestures/GestureTemplateStore";
+import { GestureCaptureDial } from "../ui/GestureCaptureDial";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -19,9 +20,18 @@ const GESTURES: { id: string; label: string; hint: string }[] = [
   { id: "turn_right",  label: "↻ Turn Right",   hint: "Rotate wrist clockwise" },
   { id: "pitch_up",    label: "↑ Pitch Up",     hint: "Tilt hand up (knuckles toward you)" },
   { id: "pitch_down",  label: "↓ Pitch Down",   hint: "Tilt hand down (palm toward floor)" },
+  { id: "yaw_left",    label: "← Yaw Left",     hint: "Turn wrist left, like waving goodbye" },
+  { id: "yaw_right",   label: "→ Yaw Right",    hint: "Turn wrist right, like waving goodbye" },
   { id: "flick_left",  label: "↺↩ Flick Left",  hint: "Snap wrist left and return to neutral" },
   { id: "flick_right", label: "↻↩ Flick Right", hint: "Snap wrist right and return to neutral" },
 ];
+
+// Visual-only threshold for "is this a flick right now" — separate from and
+// looser than firmware's own AxisDetector thresholds (JERK_ONSET_THRESHOLD
+// etc. in gesture/AxisDetector.h). This just drives the compass's flick
+// color so the user can see when a fast motion registered, not a firing
+// decision.
+const FLICK_DPS_THRESHOLD = 150;
 
 const SAMPLES_PER_GESTURE = 3;  // reps per gesture
 const COUNTDOWN_SEC       = 3;  // prepare time before capture
@@ -58,6 +68,15 @@ export function CalibrationCaptureScreen({ navigation }: Props) {
   // emit counter — lets the app prove BLE-link drops post-hoc from JSONL.
   const latestPose = useRef<{ roll: number; pitch: number; yaw: number; gyroMagDps?: number; seq?: number } | null>(null);
 
+  // Same values as latestPose, but as state so the PoseCompass actually
+  // re-renders live — latestPose alone (a ref) never triggers a render.
+  // This is purely for the visual widget; the capture data path above is
+  // untouched and still reads from the ref/sink, not this state.
+  const [livePose, setLivePose] = useState<{ roll: number; pitch: number; yaw: number; gyroMagDps: number }>({
+    roll: 0, pitch: 0, yaw: 0, gyroMagDps: 0,
+  });
+  const poseOriginRef = useRef<{ roll: number; pitch: number; yaw: number } | null>(null);
+
   // Active capture sink: when set, every POSE_EXT received pushes directly into
   // it (no polling, no jitter, no dupes). beginCapture() installs this; the
   // capture-end timer clears it. Required for flicks where the entire gesture
@@ -85,6 +104,19 @@ export function CalibrationCaptureScreen({ navigation }: Props) {
         // If a capture is in progress, push every native POSE_EXT directly — no
         // polling, no jitter, no dupes. Critical for fast gestures (flicks).
         if (captureSinkRef.current) captureSinkRef.current(sample);
+
+        // Live widget feed. First sample becomes the visual "neutral" origin
+        // so the compass starts centered instead of wherever the wrist
+        // happened to be pointed at connect time — this screen has no
+        // baseline-capture ceremony of its own to anchor against.
+        if (!poseOriginRef.current) poseOriginRef.current = { roll: pkt.roll, pitch: pkt.pitch, yaw: pkt.yaw };
+        const origin = poseOriginRef.current;
+        setLivePose({
+          roll: pkt.roll - origin.roll,
+          pitch: pkt.pitch - origin.pitch,
+          yaw: pkt.yaw - origin.yaw,
+          gyroMagDps: gyroMagDps ?? 0,
+        });
       }
     }) ?? null;
 
@@ -223,7 +255,6 @@ export function CalibrationCaptureScreen({ navigation }: Props) {
 
   function renderCountdown(p: Extract<Phase, { tag: "countdown" }>) {
     const g = GESTURES[p.gestureIdx];
-    const ringFill = ring.interpolate({ inputRange: [0, 1], outputRange: ["0%", "100%"] });
     const total = GESTURES.length * SAMPLES_PER_GESTURE;
     const done  = p.gestureIdx * SAMPLES_PER_GESTURE + p.repIdx;
     return (
@@ -233,10 +264,12 @@ export function CalibrationCaptureScreen({ navigation }: Props) {
         <Text style={s.hint}>{g.hint}</Text>
         <Text style={s.repLabel}>Rep {p.repIdx + 1} of {SAMPLES_PER_GESTURE}</Text>
 
-        <View style={s.countdownRing}>
-          <Text style={s.countdownNum}>{p.remaining}</Text>
-          <Animated.View style={[s.ringBar, { width: ringFill as any }]} />
-        </View>
+        <GestureCaptureDial
+          roll={livePose.roll} pitch={livePose.pitch} yaw={livePose.yaw}
+          ringColor="#4a9eff"
+          centerLabel={String(p.remaining)}
+        />
+        <PoseReadout pose={livePose} />
         <Text style={s.subHint}>Get ready…</Text>
       </View>
     );
@@ -244,16 +277,17 @@ export function CalibrationCaptureScreen({ navigation }: Props) {
 
   function renderCapturing(p: Extract<Phase, { tag: "capturing" }>) {
     const g = GESTURES[p.gestureIdx];
-    const ringFill = ring.interpolate({ inputRange: [0, 1], outputRange: ["0%", "100%"] });
     return (
       <View style={s.center}>
         <Text style={s.gestureLabel}>{g.label}</Text>
         <Text style={s.hint}>{g.hint}</Text>
 
-        <View style={[s.countdownRing, s.captureRing]}>
-          <Text style={s.captureNow}>GO</Text>
-          <Animated.View style={[s.ringBar, s.ringBarGreen, { width: ringFill as any }]} />
-        </View>
+        <GestureCaptureDial
+          roll={livePose.roll} pitch={livePose.pitch} yaw={livePose.yaw}
+          ringColor="#4cff80"
+        />
+        <PoseReadout pose={livePose} />
+        <Text style={[s.subHint, s.subHintGo]}>Recording — GO</Text>
 
         <Text style={s.sampleCount}>{p.pts.length} samples</Text>
       </View>
@@ -301,6 +335,16 @@ export function CalibrationCaptureScreen({ navigation }: Props) {
   );
 }
 
+function PoseReadout({ pose }: { pose: { roll: number; pitch: number; yaw: number } }) {
+  return (
+    <View style={s.readoutRow}>
+      <Text style={s.readoutItem}><Text style={s.readoutLabel}>R </Text>{Math.round(pose.roll)}°</Text>
+      <Text style={s.readoutItem}><Text style={s.readoutLabel}>P </Text>{Math.round(pose.pitch)}°</Text>
+      <Text style={s.readoutItem}><Text style={s.readoutLabel}>Y </Text>{Math.round(pose.yaw)}°</Text>
+    </View>
+  );
+}
+
 const s = StyleSheet.create({
   container:       { flex: 1, backgroundColor: "#0f0f0f", padding: 20 },
   center:          { flex: 1, alignItems: "center", justifyContent: "center", gap: 12 },
@@ -311,7 +355,12 @@ const s = StyleSheet.create({
   progressText:    { fontSize: 12, color: "#444", textAlign: "center" },
   body:            { fontSize: 14, color: "#aaa", textAlign: "center", lineHeight: 22, maxWidth: 300 },
   subHint:         { fontSize: 13, color: "#555" },
+  subHintGo:       { color: "#4cff80", fontWeight: "700" },
   sampleCount:     { fontSize: 12, color: "#444", fontFamily: "monospace" },
+  compassWrap:     { marginVertical: 4, alignItems: "center", gap: 8 },
+  readoutRow:      { flexDirection: "row", gap: 18 },
+  readoutItem:     { fontSize: 13, color: "#fff", fontFamily: "monospace", fontWeight: "700" },
+  readoutLabel:    { color: "#888", fontWeight: "600" },
   countdownRing:   {
     width: 140, height: 140, borderRadius: 70,
     borderWidth: 4, borderColor: "#333",

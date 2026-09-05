@@ -400,7 +400,10 @@ function startRuntime() {
     state.connected    = true;
     state.wristName    = p.name;
     state.wristAddress = p.address;
-    state.batteryPct   = null;
+    // Do NOT reset batteryPct here — native reads the battery char and emits
+    // BLE_BATTERY before it emits BLE_CONNECTED, so by the time this handler
+    // runs, state.batteryPct may already hold the fresh value for this
+    // connection. Resetting it here was clobbering that value with null.
     state.sleeping     = false;
     state.baselineReady = false;
     state.baselineCandidate = null;
@@ -661,6 +664,21 @@ function startRuntime() {
           holdDetector?.onGravPoseChange();
           notify();
         }
+        break;
+      }
+      case "arb_debug": {
+        // Diagnostic only — lets a normally-worn session's exported JSONL
+        // tell apart wrong-axis misclassification (a losing axis' integral
+        // close to the winner's) from clean single-axis motion (losing axes
+        // near zero), without a serial cable. See StatePacket.ts comment.
+        const axName = ["roll", "pitch", "yaw"];
+        console.log(
+          `[ArbDebug] fired=${axName[pkt.firedAxis] ?? pkt.firedAxis} ` +
+          `roll(i=${pkt.rollInteg.toFixed(3)},p=${pkt.rollPeak.toFixed(2)}) ` +
+          `pitch(i=${pkt.pitchInteg.toFixed(3)},p=${pkt.pitchPeak.toFixed(2)}) ` +
+          `yaw(i=${pkt.yawInteg.toFixed(3)},p=${pkt.yawPeak.toFixed(2)})`
+        );
+        SessionRecorder.recordArbDebug(pkt);
         break;
       }
       case "sleep":

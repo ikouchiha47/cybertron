@@ -1408,6 +1408,27 @@ static void handleGyroCalibrated() {
     _stabDetector.markMotion(lastMotionMs);
     LOG_I("[Gesture] %s gx=%.2f gy=%.2f gz=%.2f integ=%.2f peak=%.2f", gesture,
           gx, gy, gz, integ, peakRate);
+
+    // PKT_ARB_DEBUG — all-three-axis candidate snapshot at fire time, over
+    // BLE. Lets the app tell wrong-axis misclassification (a losing axis'
+    // integral was close to the winner's) apart from cross-axis bleed
+    // (losing axes near zero) from a normally-worn session — no serial
+    // cable needed. See state_packet.h comment on PKT_ARB_DEBUG.
+    {
+      uint8_t firedAxis;
+      if (strncmp(gesture, "turn_", 5) == 0)       firedAxis = AXIS_ROLL;
+      else if (strncmp(gesture, "pitch_", 6) == 0) firedAxis = AXIS_PITCH;
+      else                                         firedAxis = AXIS_YAW;
+      uint8_t dbuf[STATE_PACKET_MAX_LEN];
+      uint8_t dn = pkt_arb_debug(dbuf, firedAxis,
+                                  gestureDetector.lastRollInteg(),
+                                  gestureDetector.lastPitchInteg(),
+                                  gestureDetector.lastYawInteg(),
+                                  gestureDetector.lastRollPeak(),
+                                  gestureDetector.lastPitchPeak(),
+                                  gestureDetector.lastYawPeak());
+      stateChar.notify(dbuf, dn);
+    }
   } else {
     const ArbDebug& d = gestureDetector.lastArbDebug();
     if (d.hadCandidate && d.reject != ArbReject::NO_CAND) {

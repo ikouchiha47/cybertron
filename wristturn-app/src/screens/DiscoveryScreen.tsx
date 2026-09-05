@@ -711,7 +711,10 @@ export function DiscoveryScreen({ navigation }: Props) {
       <View style={s.wristRow}>
         <Text style={s.wristName}>{connected ? (wristName || WRISTTURN_NAME) : WRISTTURN_NAME}</Text>
         <View style={[s.pill, connected ? s.pillOn : s.pillOff]}>
-          <Text style={s.pillText}>{connected ? "Connected" : "Scanning..."}</Text>
+          <Text style={s.pillText}>
+            {connected ? "Connected" : "Scanning..."}
+            {connected && batteryPct !== null ? `  ${batteryPct}%` : ""}
+          </Text>
         </View>
       </View>
 

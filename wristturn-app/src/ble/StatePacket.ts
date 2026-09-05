@@ -57,6 +57,7 @@ export const PKT = {
   ARM_EVT:  0x06,
   GRAV:     0x07,
   POSE_EXT: 0x08,  // pose + per-sample gyro magnitude (Loop C.0 firmware contract)
+  ARB_DEBUG: 0x09, // arbitrator per-axis candidates at fire time
 } as const;
 
 /** Arm pose values carried in GravPacket. */
@@ -88,6 +89,7 @@ export const SIZE = {
   ARM_EVT:     5,
   GRAV:        2,
   ANGLES_EXT:  11,  // ANGLES + u16 gyro_mag_ddps + u16 seq
+  ARB_DEBUG:   14,  // tag + firedAxis + 3×i16 integ_mrad + 3×u16 peak_crdps
 } as const;
 
 // ── Parsed-packet types ─────────────────────────────────────────────────────
@@ -100,6 +102,17 @@ export type SleepPacket    = { type: "sleep" };
 export type WakePacket     = { type: "wake" };
 export type ArmEvtPacket   = { type: "arm_evt"; axis: number; state: number; delta: number };
 export type GravPacket     = { type: "grav";    pose: GravPoseValue };
+// Per-axis arbitrator candidates (radians / rad-per-second) at the instant a
+// gesture fired. firedAxis is an AXIS value. Losing axes near zero = clean
+// single-axis motion; a losing axis' integral close to the winner's =
+// wrong-axis misclassification, not cross-axis bleed (which is a *timing*
+// issue between two separate fires, not a single ambiguous arbitration).
+export type ArbDebugPacket = {
+  type: "arb_debug";
+  firedAxis: number;
+  rollInteg: number; pitchInteg: number; yawInteg: number;
+  rollPeak: number;  pitchPeak: number;  yawPeak: number;
+};
 
 export type StatePacket =
   | StabPacket
@@ -109,7 +122,8 @@ export type StatePacket =
   | SleepPacket
   | WakePacket
   | ArmEvtPacket
-  | GravPacket;
+  | GravPacket
+  | ArbDebugPacket;
 
 // ── Parsing ─────────────────────────────────────────────────────────────────
 
@@ -131,6 +145,19 @@ function readU16LEDps(bytes: Uint8Array, offset: number): number {
 /** Read a little-endian uint16. */
 function readU16LE(bytes: Uint8Array, offset: number): number {
   return (bytes[offset + 1] << 8) | bytes[offset];
+}
+
+/** Read a little-endian int16 milliradians and convert to radians. */
+function readI16LEMrad(bytes: Uint8Array, offset: number): number {
+  const lo = bytes[offset];
+  const hi = bytes[offset + 1];
+  const raw = (((hi << 8) | lo) << 16) >> 16;   // sign-extend
+  return raw / 1000.0;
+}
+
+/** Read a little-endian uint16 centirad/s and convert to rad/s. */
+function readU16LECrdps(bytes: Uint8Array, offset: number): number {
+  return readU16LE(bytes, offset) / 100.0;
 }
 
 /** Decode an AnglesPacket payload starting at offset 1 (skip tag). */
@@ -193,6 +220,19 @@ export function parseStatePacket(input: Uint8Array | string): StatePacket | null
     case PKT.GRAV:
       if (bytes.length < SIZE.GRAV) return null;
       return { type: "grav", pose: bytes[1] as GravPoseValue };
+
+    case PKT.ARB_DEBUG:
+      if (bytes.length < SIZE.ARB_DEBUG) return null;
+      return {
+        type: "arb_debug",
+        firedAxis: bytes[1],
+        rollInteg:  readI16LEMrad(bytes, 2),
+        pitchInteg: readI16LEMrad(bytes, 4),
+        yawInteg:   readI16LEMrad(bytes, 6),
+        rollPeak:   readU16LECrdps(bytes, 8),
+        pitchPeak:  readU16LECrdps(bytes, 10),
+        yawPeak:    readU16LECrdps(bytes, 12),
+      };
 
     default:
       return null;

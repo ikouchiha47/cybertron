@@ -9,10 +9,11 @@ TESTS_DIR = ../tests
 
 .PHONY: test test-all clean
 
-# Default: StabilityClassifierDetector + state_packet host tests
-test: test_stillness test_state_packet
+# Default: StabilityClassifierDetector + state_packet + gesture-detector host tests
+test: test_stillness test_state_packet test_gesture
 	./test_stillness
 	./test_state_packet
+	./test_gesture
 
 # Run with ManualZUPTDetector enabled (when constants are calibrated against real data)
 test-all: test_stillness_full test_state_packet
@@ -29,5 +30,10 @@ test_stillness_full: $(TESTS_DIR)/test_stillness.cpp StillnessDetector.h
 test_state_packet: $(TESTS_DIR)/test_state_packet.cpp state_packet.h
 	$(CXX) -std=c++17 -Wall -Wextra -I. -o $@ $(TESTS_DIR)/test_state_packet.cpp
 
+# GestureDetector is documented pure C++17 — needs c++17, not the c++14 used
+# for test_stillness above.
+test_gesture: $(TESTS_DIR)/test_gesture_detector.cpp gesture/GestureDetector.h gesture/AxisDetector.h gesture/GestureArbitrator.h
+	$(CXX) -std=c++17 -Wall -Wextra -I. -o $@ $(TESTS_DIR)/test_gesture_detector.cpp
+
 clean:
-	rm -f test_stillness test_stillness_full test_state_packet
+	rm -f test_stillness test_stillness_full test_state_packet test_gesture

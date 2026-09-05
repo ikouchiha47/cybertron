@@ -3,6 +3,7 @@
     "name": "Psytrix",
     "slug": "psytrix",
     "version": "1.0.0",
+    "scheme": "rune",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
@@ -17,7 +18,8 @@
       "infoPlist": {
         "NSBluetoothAlwaysUsageDescription": "Psytrix needs Bluetooth to receive gestures from the wrist device.",
         "NSBluetoothPeripheralUsageDescription": "Psytrix needs Bluetooth to receive gestures from the wrist device."
-      }
+      },
+      "bundleIdentifier": "com.psytrix.app"
     },
     "android": {
       "adaptiveIcon": {
@@ -34,7 +36,8 @@
         "CHANGE_WIFI_MULTICAST_STATE",
         "ACCESS_WIFI_STATE",
         "CHANGE_NETWORK_STATE",
-        "INTERNET"
+        "INTERNET",
+        "android.permission.ACCESS_FINE_LOCATION"
       ],
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,

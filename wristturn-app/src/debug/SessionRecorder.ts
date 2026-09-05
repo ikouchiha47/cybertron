@@ -11,6 +11,9 @@ export type SessionEvent =
   | { t: number; t_fw?: number; type: "state"; raw: string }
   | { t: number; type: "baseline"; roll: number; pitch: number; yaw: number }
   | { t: number; type: "combo"; combo: string }
+  | { t: number; type: "arb_debug"; firedAxis: number;
+      rollInteg: number; pitchInteg: number; yawInteg: number;
+      rollPeak: number; pitchPeak: number; yawPeak: number }
   | { t: number; type: "command"; cmdId: string; device: string }
   | { t: number; type: "annotation"; label: string };
 
@@ -72,6 +75,12 @@ class SessionRecorderImpl {
     const match = rawJson.match(/"t":\s*(\d+)/);
     if (match) t_fw = parseInt(match[1], 10);
     this.push({ t: Date.now(), t_fw, type: "state", raw: rawJson });
+  }
+
+  recordArbDebug(p: { firedAxis: number; rollInteg: number; pitchInteg: number; yawInteg: number;
+                       rollPeak: number; pitchPeak: number; yawPeak: number }): void {
+    if (!this.active) return;
+    this.push({ t: Date.now(), type: "arb_debug", ...p });
   }
 
   recordCombo(combo: string): void {

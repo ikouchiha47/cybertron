@@ -9,6 +9,7 @@ import { GestureMappingScreen } from "../screens/GestureMappingScreen";
 import { ActiveControlScreen } from "../screens/ActiveControlScreen";
 import { PairingScreen } from "../screens/PairingScreen";
 import { SettingsScreen } from "../screens/SettingsScreen";
+import { DevicesScreen } from "../screens/DevicesScreen";
 import { WizProvisionScreen } from "../screens/WizProvisionScreen";
 import { LogsScreen } from "../screens/LogsScreen";
 import { SessionScreen } from "../screens/SessionScreen";
@@ -30,6 +31,7 @@ export type RootStackParams = {
   Pairing:            { deviceId: string };
   WizProvision:       undefined;
   CalibrationCapture: undefined;
+  Devices:            undefined;
 };
 
 const Tab   = createBottomTabNavigator<TabParams>();
@@ -86,6 +88,7 @@ export function AppNavigator() {
           <Stack.Screen name="Pairing"        component={PairingScreen}        options={{ title: "Pair Device" }} />
           <Stack.Screen name="WizProvision"       component={WizProvisionScreen}       options={{ title: "Add Smart Bulb" }} />
           <Stack.Screen name="CalibrationCapture" component={CalibrationCaptureScreen} options={{ title: "Calibrate Gestures" }} />
+          <Stack.Screen name="Devices"            component={DevicesScreen}            options={{ title: "Devices" }} />
         </Stack.Navigator>
       </NavigationContainer>
       <GlobalErrorOverlay />

@@ -13,13 +13,19 @@ const SERVICE_TYPES: Array<{ service: string; transport: TransportType }> = [
 const SCAN_PLAN: Array<{ service: string; transport: TransportType }> = [
   SERVICE_TYPES[0],
   SERVICE_TYPES[1],
+  SERVICE_TYPES[3],
   SERVICE_TYPES[0],
   SERVICE_TYPES[1],
   SERVICE_TYPES[2],
   SERVICE_TYPES[3],
   SERVICE_TYPES[4],
 ];
-const SCAN_DURATION_MS = 3000;
+// _http._tcp is the broadest/most crowded service type (any generic HTTP
+// device — including the whole device-simulator fleet, which all register
+// under it at once). A shared 3s slot lets many simultaneous instances race
+// the resolver and drop mid-resolve, so it gets its own longer window.
+const SCAN_DURATION_MS      = 3000;
+const HTTP_SCAN_DURATION_MS = 6000;
 const SCAN_INTERVAL_MS = 300;
 const SCAN_IMPL = ImplType.DNSSD;
 
@@ -80,9 +86,12 @@ export function useMDNSDiscovery() {
     setScanning(true);
     console.log("[mDNS] scan cycle start");
 
-    SCAN_PLAN.forEach(({ service, transport }, i) => {
-      const startAt = i * (SCAN_DURATION_MS + SCAN_INTERVAL_MS);
-      const stopAt  = startAt + SCAN_DURATION_MS;
+    let cursor = 0;
+    SCAN_PLAN.forEach(({ service, transport }) => {
+      const duration = service === "http" ? HTTP_SCAN_DURATION_MS : SCAN_DURATION_MS;
+      const startAt = cursor;
+      const stopAt  = startAt + duration;
+      cursor = stopAt + SCAN_INTERVAL_MS;
       timers.current.push(
         setTimeout(() => {
           activeTransport.current = transport;
@@ -97,7 +106,7 @@ export function useMDNSDiscovery() {
       );
     });
 
-    const total = SCAN_PLAN.length * (SCAN_DURATION_MS + SCAN_INTERVAL_MS);
+    const total = cursor;
     timers.current.push(setTimeout(() => {
       zeroconf.stop(SCAN_IMPL);
       scanningRef.current = false;

@@ -1,7 +1,7 @@
 FQBN     := Seeeduino:nrf52:xiaonRF52840Sense
 SKETCH   := wristturn
 BUILDDIR := build
-UF2CONV  := python3 $(HOME)/Library/Arduino15/packages/Seeeduino/hardware/nrf52/1.1.12/tools/uf2conv/uf2conv.py
+UF2CONV  := python3 $(HOME)/Library/Arduino15/packages/Seeeduino/hardware/nrf52/1.1.13/tools/uf2conv/uf2conv.py
 UF2FAM   := 0xADA52840
 
 .PHONY: build clean flash

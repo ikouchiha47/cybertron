@@ -1,4 +1,4 @@
-package com.anonymous.wristturnapp
+package com.psytrix.app
 
 import android.app.NotificationChannel
 import android.app.NotificationManager

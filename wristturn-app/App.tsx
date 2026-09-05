@@ -1,10 +1,41 @@
 import React, { useEffect } from "react";
-import { Platform, PermissionsAndroid } from "react-native";
+import { Platform, PermissionsAndroid, Linking } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { AppNavigator } from "./src/navigation/AppNavigator";
 import { BLEServiceNative } from "./src/ble/BLEServiceNative";
 import { DebugLog }         from "./src/debug/DebugLog";
+import { registry } from "./src/devices/registry/DeviceRegistry";
+import { DEFAULT_PORT } from "./src/types";
+import type { TransportType } from "./src/types";
+
+const VALID_TRANSPORTS: TransportType[] = ["androidtv", "http", "websocket", "tcp", "macdaemon", "wiz"];
+
+// Handles rune://add-device?host=X&port=Y&name=Z&transport=http links.
+// Sole purpose: scripts/install-release.sh uses these to seed the
+// device-simulator's fleet into the saved-devices list after a fresh
+// install, since a release build's AsyncStorage isn't writable via adb
+// without root. Not used anywhere else — safe to ignore for normal use.
+function handleDeepLink(url: string | null) {
+  if (!url || !url.startsWith("rune://add-device")) return;
+  try {
+    const query = url.split("?")[1] ?? "";
+    const params = new URLSearchParams(query);
+    const host = params.get("host")?.trim();
+    if (!host) return;
+    const transportParam = params.get("transport") ?? "http";
+    const transport: TransportType = VALID_TRANSPORTS.includes(transportParam as TransportType)
+      ? (transportParam as TransportType)
+      : "http";
+    const port = parseInt(params.get("port") ?? "", 10) || DEFAULT_PORT[transport];
+    const name = params.get("name")?.trim() || host;
+    const id = `manual:${host}:${port}`;
+    registry.register({ id, name, host, port, transport, availableCommands: [] })
+      .catch((e) => console.error("[DeepLink] register failed:", e));
+  } catch (e) {
+    console.error("[DeepLink] parse failed:", url, e);
+  }
+}
 
 async function requestBLEPermissions() {
   if (Platform.OS !== "android") return;
@@ -31,6 +62,10 @@ export default function App() {
     requestBLEPermissions()
       .then(() => BLEServiceNative.start())
       .catch(console.error);
+
+    Linking.getInitialURL().then(handleDeepLink).catch(() => {});
+    const sub = Linking.addEventListener("url", ({ url }) => handleDeepLink(url));
+    return () => sub.remove();
   }, []);
 
   return (

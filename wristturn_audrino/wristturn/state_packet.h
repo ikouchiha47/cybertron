@@ -44,6 +44,7 @@ enum StatePacketType : uint8_t {
     PKT_ARM_EVT      = 0x06,  // per-axis arm/disarm           (sizeof ArmEvtPacket)
     PKT_GRAV         = 0x07,  // arm pose from gravity vector  (sizeof GravPacket)
     PKT_POSE_EXT     = 0x08,  // pose + gyro magnitude         (sizeof AnglesExtPacket)
+    PKT_ARB_DEBUG    = 0x09,  // arbitrator candidates at fire (sizeof ArbDebugPacket)
 };
 
 // Axis identifiers used in PKT_ARM_EVT.
@@ -129,6 +130,29 @@ struct __attribute__((packed)) AnglesExtPacket {
 };
 static_assert(sizeof(AnglesExtPacket) == 11, "AnglesExtPacket must be 11 bytes");
 
+// PKT_ARB_DEBUG — GestureArbitrator's per-axis candidate integrals at the
+// instant a gesture actually fired. Lets the app tell apart two distinct bug
+// classes from a normal worn session (no serial cable):
+//   - cross-axis bleed: fired axis is correct, a second incidental gesture
+//     follows a few hundred ms later (see GestureDetector::CROSS_AXIS_REFRACTORY_MS)
+//   - wrong-axis misclassification: the arbitrator itself picked the wrong
+//     axis as dominant for a single motion — this packet's roll/pitch/yaw
+//     integrals reveal whether the "losing" axes were genuinely close.
+// Integrals are radians × 1000 (milliradians, int16, ±32.767 rad — generous
+// headroom over realistic ~0.1-2.0 rad values). Peak rates are rad/s × 100
+// (centirad/s, uint16, 0-655.35 rad/s — realistic peaks are a few rad/s).
+struct __attribute__((packed)) ArbDebugPacket {
+    uint8_t  tag;
+    uint8_t  firedAxis;       // StatePacketAxis of the gesture that fired
+    int16_t  roll_integ_mrad;
+    int16_t  pitch_integ_mrad;
+    int16_t  yaw_integ_mrad;
+    uint16_t roll_peak_crdps;
+    uint16_t pitch_peak_crdps;
+    uint16_t yaw_peak_crdps;
+};
+static_assert(sizeof(ArbDebugPacket) == 14, "ArbDebugPacket must be 14 bytes");
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 // Convert a float in degrees to int16 deci-degrees, saturating at ±3276.7°.
@@ -195,6 +219,43 @@ static inline uint8_t pkt_pose_ext(uint8_t* out, float r, float p, float y, floa
     return sizeof(pkt);
 }
 
+// Convert a signed radians integral to int16 milliradians, saturating at ±32.767 rad.
+static inline int16_t rad_to_mrad_i16(float rad) {
+    float x = rad * 1000.0f;
+    if (x >  32767.0f) return  32767;
+    if (x < -32768.0f) return -32768;
+    return (int16_t)x;
+}
+
+// Convert a non-negative rad/s peak rate to uint16 centirad/s, saturating at 655.35 rad/s.
+static inline uint16_t radps_to_crdps_u16(float radps) {
+    if (radps < 0.0f) return 0;
+    float x = radps * 100.0f;
+    if (x > 65535.0f) return 65535;
+    return (uint16_t)x;
+}
+
+// Build a PKT_ARB_DEBUG packet — arbitrator candidate state at the instant a
+// gesture fired. firedAxis is a StatePacketAxis; the three integ/peak pairs
+// are the raw per-axis candidates (roll, pitch, yaw) the arbitrator compared
+// this sample, regardless of which one won.
+static inline uint8_t pkt_arb_debug(uint8_t* out, uint8_t firedAxis,
+                                     float rollInteg, float pitchInteg, float yawInteg,
+                                     float rollPeak, float pitchPeak, float yawPeak) {
+    ArbDebugPacket p {
+        PKT_ARB_DEBUG,
+        firedAxis,
+        rad_to_mrad_i16(rollInteg),
+        rad_to_mrad_i16(pitchInteg),
+        rad_to_mrad_i16(yawInteg),
+        radps_to_crdps_u16(rollPeak),
+        radps_to_crdps_u16(pitchPeak),
+        radps_to_crdps_u16(yawPeak),
+    };
+    memcpy(out, &p, sizeof(p));
+    return sizeof(p);
+}
+
 static inline uint8_t pkt_sleep(uint8_t* out) {
     TagOnlyPacket p { PKT_SLEEP };
     memcpy(out, &p, sizeof(p));
@@ -226,4 +287,4 @@ static inline uint8_t pkt_grav(uint8_t* out, uint8_t pose) {
 
 // Max packet size across all types — used to size transmission buffers.
 // Must be kept in sync with the largest packed struct above.
-static constexpr uint8_t STATE_PACKET_MAX_LEN = sizeof(AnglesExtPacket);  // 11
+static constexpr uint8_t STATE_PACKET_MAX_LEN = sizeof(ArbDebugPacket);  // 14

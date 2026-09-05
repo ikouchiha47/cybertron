@@ -1,4 +1,4 @@
-package com.anonymous.wristturnapp
+package com.psytrix.app
 
 import android.content.ComponentName
 import android.content.Context
