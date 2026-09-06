@@ -35,7 +35,13 @@ MountingAdapter mountAdapter({1, 2, -3});
 // ── Battery monitoring
 // ──────────────────────────────────────────────────────── PIN_VBAT (32 /
 // P0.31) already defined in variant.h — battery voltage divider
-#define PIN_CHARGE_STATUS 17 // P0.17 — BQ25101 CHRG, active LOW = charging
+// Arduino pin 23 on this board maps to P0.17 (~CHG) per this board's
+// variant.cpp g_ADigitalPinMap[] — NOT Arduino pin 17, which maps to P0.07
+// (the unused onboard LSM6DS3's I2C SDA line). The previous value (17) read
+// that unrelated pin the entire time; charging=X in every log line was
+// meaningless noise, never the real BQ25101 ~CHG signal. Confirmed against
+// the actual installed board package (Seeeduino nrf52 1.1.13) 2026-09-05.
+#define PIN_CHARGE_STATUS 23 // Arduino D23 == physical P0.17 — BQ25101 ~CHG, active LOW = charging
 
 const unsigned long BATTERY_POLL_MS = 30000; // read every 30s
 unsigned long lastBatteryMs = 0;
@@ -1955,10 +1961,19 @@ void loop() {
     uint8_t curStage = staged.currentStage;
     if (curStage != lastStage) {
       lastStage = curStage;
-      if (curStage == 0)
+      if (curStage == 0) {
         LOG_I("[Sleep] stage=0 light sleep (shake, 30s cycles)");
-      else
+      } else {
         LOG_I("[Sleep] stage=1 deep sleep (SigMotion, INT-based)");
+        // Force all three LEDs off entering deep sleep. blinkLED() already
+        // ends each call at LOW, but this is an explicit guarantee rather
+        // than relying on no other code path leaving one lit — deep sleep
+        // is the state most likely to run unattended for a long time, so
+        // any stray lit LED here is a real, avoidable current drain.
+        digitalWrite(LED_RED, LOW);
+        digitalWrite(LED_GREEN, LOW);
+        digitalWrite(LED_BLUE, LOW);
+      }
     }
 
     if (powerMgr.tick(hw)) {
