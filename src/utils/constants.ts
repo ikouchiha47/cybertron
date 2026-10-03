@@ -1,5 +1,5 @@
 // Detection thresholds
-export const PERSON_DETECTION_THRESHOLD = 0.45;
+export const PERSON_DETECTION_THRESHOLD = 0.5;
 // Minimum score for a detection to trigger capture/notification. Candidate
 // boxes below this still render in the UI, but are side-effect free.
 export const NOTIFY_MIN_SCORE = PERSON_DETECTION_THRESHOLD;
