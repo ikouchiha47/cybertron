@@ -56,6 +56,12 @@ object DoorCamEngine {
     // Inference cadence per camera when motion is present.
     private const val DEFAULT_INFERENCE_INTERVAL_MS = 500L
 
+    // Forced-keyframe cadence of the per-camera motion gate: the worst-case
+    // wait from "person appears but no motion" to the first inference.
+    private const val DEFAULT_KEYFRAME_INTERVAL_MS = 1000L
+    private const val MIN_KEYFRAME_INTERVAL_MS = 250
+    private const val MAX_KEYFRAME_INTERVAL_MS = 10000
+
     // Detector selection. Both implementations live behind PersonDetector;
     // "yolo11n" (LiteRT) is the default: smaller, faster, and better person
     // recall on our night frames. "efficientdet" (MediaPipe) stays as fallback.
@@ -82,6 +88,7 @@ object DoorCamEngine {
         val nearnessVeryClose: Float = DEFAULT_NEARNESS_VERY_CLOSE,
         val nearnessClose: Float = DEFAULT_NEARNESS_CLOSE,
         val inferenceIntervalMs: Long = DEFAULT_INFERENCE_INTERVAL_MS,
+        val keyframeIntervalMs: Long = DEFAULT_KEYFRAME_INTERVAL_MS,
         val detector: String = DEFAULT_DETECTOR,
     )
 
@@ -139,12 +146,12 @@ object DoorCamEngine {
         @Volatile var framesDropped = 0L
     }
 
-    private class CameraRuntime(config: CameraConfig) {
+    private class CameraRuntime(config: CameraConfig, keyframeIntervalMs: Long) {
         @Volatile var config: CameraConfig = config
         val state = CameraState()
         val metrics = CameraMetrics()
         val decoder = FrameDecoder()
-        val motion = MotionGate()
+        val motion = MotionGate(keyframeIntervalMs = keyframeIntervalMs)
 
         val queueLock = Any()
         val queue = ArrayDeque<FrameItem>()
@@ -575,8 +582,16 @@ object DoorCamEngine {
                 nearnessVeryClose = readFloat(map, "nearnessVeryClose", current.nearnessVeryClose),
                 nearnessClose = readFloat(map, "nearnessClose", current.nearnessClose),
                 inferenceIntervalMs = readInt(map, "inferenceIntervalMs", current.inferenceIntervalMs.toInt()).toLong(),
+                keyframeIntervalMs = readInt(
+                    map,
+                    "keyframeIntervalMs",
+                    current.keyframeIntervalMs.toInt(),
+                ).coerceIn(MIN_KEYFRAME_INTERVAL_MS, MAX_KEYFRAME_INTERVAL_MS).toLong(),
                 detector = normalizeDetectorId(readString(map, "detector", current.detector)),
             )
+            // Apply the (possibly changed) keyframe cadence to every existing
+            // per-camera gate so a live config change takes effect immediately.
+            runtimes.values.forEach { it.motion.setKeyframeIntervalMs(config.keyframeIntervalMs) }
             Log.i(TAG, "[engine] config applied $config")
         } catch (t: Throwable) {
             Log.w(TAG, "[engine] setDetectionConfig failed: ${t.message}")
@@ -717,7 +732,7 @@ object DoorCamEngine {
     private fun runtimeFor(streamId: String): CameraRuntime = runtimes.computeIfAbsent(streamId) {
         val cam = cameras[it]
             ?: CameraConfig(it, "", it, buildStreamUrl(""), buildCaptureUrl(""))
-        CameraRuntime(cam)
+        CameraRuntime(cam, config.keyframeIntervalMs)
     }
 
     private fun buildStreamUrl(ip: String): String {

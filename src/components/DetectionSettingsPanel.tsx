@@ -14,13 +14,15 @@ interface RowSpec {
   min: number;
   max: number;
   step: number;
+  /** Optional clarifying note shown under the label. */
+  note?: string;
   format: (v: number) => string;
 }
 
 /**
  * Global native detection-engine tuning. Values map 1:1 to the fields parsed by
  * `InferencePipeline.setDetectionConfig` (personScoreThreshold, kConfirm,
- * mWindow, emptyFramesBeforeReset, inferenceIntervalMs).
+ * mWindow, emptyFramesBeforeReset, inferenceIntervalMs, keyframeIntervalMs).
  */
 const ROWS: RowSpec[] = [
   {
@@ -30,6 +32,16 @@ const ROWS: RowSpec[] = [
     min: 100,
     max: 2000,
     step: 100,
+    format: v => `${v}`,
+  },
+  {
+    key: 'keyframeIntervalMs',
+    label: 'Keyframe (ms)',
+    unit: '',
+    min: 250,
+    max: 10000,
+    step: 250,
+    note: 'Max wait before inference when no motion',
     format: v => `${v}`,
   },
   {
@@ -106,8 +118,11 @@ export default function DetectionSettingsPanel({ value, onChange }: Props) {
             return (
               <View key={row.key} style={styles.row}>
                 <View style={styles.labelWrap}>
-                  <Text style={styles.label}>{row.label}</Text>
-                  {!!row.unit && <Text style={styles.unit}>{row.unit}</Text>}
+                  <View style={styles.labelRow}>
+                    <Text style={styles.label}>{row.label}</Text>
+                    {!!row.unit && <Text style={styles.unit}>{row.unit}</Text>}
+                  </View>
+                  {!!row.note && <Text style={styles.rowNote}>{row.note}</Text>}
                 </View>
                 <View style={styles.stepper}>
                   <TouchableOpacity
@@ -142,8 +157,10 @@ const styles = StyleSheet.create({
   chevron:     { color: '#aaa', fontSize: 14 },
   note:        { color: '#555', fontSize: 12, marginTop: 4, marginBottom: 4 },
   row:         { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: '#1a1a1a', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8, marginTop: 8 },
-  labelWrap:   { flex: 1, flexDirection: 'row', alignItems: 'center', marginRight: 12 },
+  labelWrap:   { flex: 1, marginRight: 12 },
+  labelRow:    { flexDirection: 'row', alignItems: 'center' },
   label:       { color: '#fff', fontSize: 14 },
+  rowNote:     { color: '#666', fontSize: 11, marginTop: 2 },
   unit:        { color: '#666', fontSize: 12, marginLeft: 6 },
   stepper:     { flexDirection: 'row', alignItems: 'center' },
   stepBtn:     { width: 32, height: 32, borderRadius: 16, backgroundColor: '#2a2a2a', alignItems: 'center', justifyContent: 'center' },

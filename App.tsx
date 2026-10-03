@@ -47,7 +47,8 @@ function makeDashboardId(): string {
  * Push global detection tuning to the native engine. Key names MUST match
  * `InferencePipeline.setDetectionConfig` in DoorCamEngine.kt
  * (personScoreThreshold, kConfirm, mWindow, emptyFramesBeforeReset,
- * inferenceIntervalMs). Fire-and-forget: never blocks or fails the UI.
+ * inferenceIntervalMs, keyframeIntervalMs). Fire-and-forget: never blocks or
+ * fails the UI.
  */
 function pushDetectionConfig(settings: DetectionSettings) {
   try {
@@ -57,6 +58,7 @@ function pushDetectionConfig(settings: DetectionSettings) {
       mWindow: settings.mWindow,
       emptyFramesBeforeReset: settings.emptyFramesBeforeReset,
       inferenceIntervalMs: settings.inferenceIntervalMs,
+      keyframeIntervalMs: settings.keyframeIntervalMs,
     });
   } catch (e) {
     // Native module may be unavailable (JS-only environments); ignore.

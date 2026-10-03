@@ -53,6 +53,8 @@ export const DEFAULT_CAMERA_SETTINGS: CameraSettings = {
 export interface DetectionSettings {
   /** Inference cadence per camera (ms). Lower = faster, more CPU. */
   inferenceIntervalMs: number;
+  /** Forced-keyframe cadence (ms): max wait for inference when no motion. */
+  keyframeIntervalMs: number;
   /** K-of-M temporal voting: confirm once K positives in the window. */
   kConfirm: number;
   /** Sliding window size (M) for temporal voting. */
@@ -65,6 +67,7 @@ export interface DetectionSettings {
 
 export const DEFAULT_DETECTION_SETTINGS: DetectionSettings = {
   inferenceIntervalMs: 200,
+  keyframeIntervalMs: 1000,
   kConfirm: 1,
   mWindow: 3,
   emptyFramesBeforeReset: 3,
@@ -199,6 +202,7 @@ export function normalizeDetection(raw: any): DetectionSettings {
   if (!raw || typeof raw !== 'object') return { ...d };
   return {
     inferenceIntervalMs: clampInt(raw.inferenceIntervalMs, 100, 2000, d.inferenceIntervalMs),
+    keyframeIntervalMs: clampInt(raw.keyframeIntervalMs, 250, 10000, d.keyframeIntervalMs),
     kConfirm: clampInt(raw.kConfirm, 1, 5, d.kConfirm),
     mWindow: clampInt(raw.mWindow, 1, 6, d.mWindow),
     emptyFramesBeforeReset: clampInt(raw.emptyFramesBeforeReset, 1, 10, d.emptyFramesBeforeReset),
