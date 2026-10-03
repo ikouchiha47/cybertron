@@ -75,9 +75,10 @@ TaskManager.defineTask(BACKGROUND_TASK_NAME, async () => {
           content: {
             title: 'Someone at the door',
             body: `Person detected (${nearness}) — ${(bestScore * 100).toFixed(0)}% confidence`,
+            sound: 'default',
             priority: Notifications.AndroidNotificationPriority.HIGH,
           },
-          trigger: null,
+          trigger: { channelId: 'doorcam-v2' },
         });
       }
       return BackgroundFetch.BackgroundFetchResult.NewData;
@@ -94,12 +95,20 @@ export async function registerBackgroundDetection() {
     android: { allowAlert: true, allowBadge: true, allowSound: true },
   } as any);
 
-  await Notifications.setNotificationChannelAsync('doorcam', {
+  await Notifications.setNotificationChannelAsync('doorcam-v2', {
     name: 'DoorCam Alerts',
     importance: Notifications.AndroidImportance.HIGH,
     sound: 'default',
     vibrationPattern: [0, 250, 250, 250],
+    enableVibrate: true,
+    audioAttributes: {
+      usage: Notifications.AndroidAudioUsage.NOTIFICATION,
+      contentType: Notifications.AndroidAudioContentType.SONIFICATION,
+      flags: { enforceAudibility: false, requestHardwareAudioVideoSynchronization: false },
+    },
   });
+  // Delete the old channel so Android doesn't keep the stale ringtone config
+  await Notifications.deleteNotificationChannelAsync('doorcam').catch(() => {});
 
   const status = await BackgroundFetch.getStatusAsync();
   if (status === BackgroundFetch.BackgroundFetchStatus.Restricted ||

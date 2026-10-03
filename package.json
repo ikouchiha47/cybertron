@@ -16,6 +16,7 @@
     "expo-file-system": "~19.0.21",
     "expo-image-manipulator": "~14.0.8",
     "expo-notifications": "~0.32.16",
+    "expo-sqlite": "~16.0.10",
     "expo-status-bar": "~3.0.9",
     "expo-task-manager": "~14.0.9",
     "jpeg-js": "^0.4.4",

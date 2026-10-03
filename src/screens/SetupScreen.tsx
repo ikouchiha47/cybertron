@@ -1,11 +1,14 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
-  View, Text, TextInput, TouchableOpacity, StyleSheet, Modal, FlatList, ActivityIndicator,
+  View, Text, TextInput, TouchableOpacity, StyleSheet, Modal, FlatList, ActivityIndicator, ScrollView,
 } from 'react-native';
 import { WebView } from 'react-native-webview';
 import { SafeAreaView } from 'react-native-safe-area-context';
+// @ts-ignore -- react-native-zeroconf ships no type declarations
 import Zeroconf from 'react-native-zeroconf';
-import { saveConfig } from '../utils/storage';
+import { Camera, CameraSettingsChange, DayNightMode, DetectionSettings, DEFAULT_CAMERA_SETTINGS, slugifyTag } from '../utils/storage';
+import CameraSettingsSheet from '../components/CameraSettingsSheet';
+import DetectionSettingsPanel from '../components/DetectionSettingsPanel';
 
 interface DiscoveredDevice {
   name: string;
@@ -15,15 +18,40 @@ interface DiscoveredDevice {
 }
 
 interface Props {
-  onSaved: (ip: string) => void;
-  currentIp?: string;
+  cameras: Camera[];
+  focusedId?: string;
+  detection: DetectionSettings;
+  onAddCamera: (camera: Camera) => void;
+  onRemoveCamera: (id: string) => void;
+  onUpdateSettings: (cameraId: string, change: CameraSettingsChange) => void;
+  onUpdateDetection: (patch: Partial<DetectionSettings>) => void;
+  onSetDayNight: (cameraId: string, mode: DayNightMode) => void;
+  onDone: () => void;
 }
 
-export default function SetupScreen({ onSaved, currentIp }: Props) {
-  const [ip, setIp] = useState(currentIp ?? '');
+/** Build a camera with fresh Day/Night profiles seeded from the defaults. */
+function newCamera(id: string, name: string, ip: string, host = '', tag = ''): Camera {
+  const settings = { ...DEFAULT_CAMERA_SETTINGS };
+  return {
+    id,
+    name,
+    tag: tag || slugifyTag(name || ip || id),
+    host,
+    ip,
+    settings,
+    day: { ...settings },
+    night: { ...settings },
+    dayNight: 'auto',
+  };
+}
+
+export default function SetupScreen({ cameras, focusedId, detection, onAddCamera, onRemoveCamera, onUpdateSettings, onUpdateDetection, onSetDayNight, onDone }: Props) {
+  const [ip, setIp] = useState('');
   const [showPortal, setShowPortal] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [devices, setDevices] = useState<DiscoveredDevice[]>([]);
+  const [settingsCameraId, setSettingsCameraId] = useState<string | undefined>();
+  const settingsCamera = cameras.find(c => c.id === settingsCameraId) ?? null;
   const zeroconf = useRef(new Zeroconf()).current;
 
   useEffect(() => {
@@ -66,21 +94,30 @@ export default function SetupScreen({ onSaved, currentIp }: Props) {
     setTimeout(() => setScanning(false), 5000);
   }
 
-  async function selectDevice(device: DiscoveredDevice) {
-    setIp(device.ip);
-    await saveConfig({ ip: device.ip });
-    onSaved(device.ip);
+  function selectDevice(device: DiscoveredDevice) {
+    const ip = device.ip;
+    const id = device.name || ip;
+    const name = device.name || ip;
+    setIp('');
+    // `id` is the stable mDNS service name; `host` enables dynamic IP resolution.
+    onAddCamera(newCamera(id, name, ip, device.host ?? '', slugifyTag(id) || id));
   }
 
-  async function handleSave() {
+  function handleAddManual() {
     const trimmed = ip.trim();
     if (!trimmed) return;
-    await saveConfig({ ip: trimmed });
-    onSaved(trimmed);
+    onAddCamera(newCamera(trimmed, trimmed, trimmed, '', slugifyTag(trimmed) || trimmed));
+    setIp('');
   }
 
   return (
     <SafeAreaView style={styles.container}>
+      <View style={styles.topBar}>
+        <TouchableOpacity onPress={onDone} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+          <Text style={styles.topBack}>‹ Back</Text>
+        </TouchableOpacity>
+      </View>
+      <ScrollView contentContainerStyle={styles.scrollContent}>
       <Text style={styles.title}>DoorCam Setup</Text>
 
       {/* Discovery */}
@@ -128,8 +165,46 @@ export default function SetupScreen({ onSaved, currentIp }: Props) {
         keyboardType="decimal-pad"
         autoCapitalize="none"
       />
-      <TouchableOpacity style={styles.button} onPress={handleSave}>
-        <Text style={styles.buttonText}>Save & Connect</Text>
+      <TouchableOpacity style={styles.button} onPress={handleAddManual}>
+        <Text style={styles.buttonText}>Add Camera</Text>
+      </TouchableOpacity>
+
+      <View style={styles.divider} />
+
+      {/* Current cameras */}
+      <Text style={styles.sectionTitle}>Cameras ({cameras.length})</Text>
+      {cameras.length === 0 ? (
+        <Text style={styles.hint}>No cameras added yet.</Text>
+      ) : (
+        cameras.map(camera => (
+          <View key={camera.id} style={styles.cameraRow}>
+            <View style={styles.cameraInfo}>
+              <Text style={styles.deviceName}>
+                {camera.name}{camera.id === focusedId ? '  (focused)' : ''}
+              </Text>
+              <Text style={styles.deviceIp}>{camera.ip}</Text>
+            </View>
+            <TouchableOpacity
+              style={styles.cameraSettingsBtn}
+              onPress={() => setSettingsCameraId(camera.id)}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+            >
+              <Text style={styles.cameraSettingsText}>⚙</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={() => onRemoveCamera(camera.id)}>
+              <Text style={styles.cameraRemove}>Remove</Text>
+            </TouchableOpacity>
+          </View>
+        ))
+      )}
+
+      <View style={styles.divider} />
+
+      {/* Global detection-engine tuning (app-wide, not per camera) */}
+      <DetectionSettingsPanel value={detection} onChange={onUpdateDetection} />
+
+      <TouchableOpacity style={styles.doneButton} onPress={onDone}>
+        <Text style={styles.doneButtonText}>Done</Text>
       </TouchableOpacity>
 
       <View style={styles.divider} />
@@ -154,12 +229,23 @@ export default function SetupScreen({ onSaved, currentIp }: Props) {
           <WebView source={{ uri: 'http://192.168.4.1' }} style={styles.webview} />
         </SafeAreaView>
       </Modal>
+
+      <CameraSettingsSheet
+        camera={settingsCamera}
+        onClose={() => setSettingsCameraId(undefined)}
+        onChange={onUpdateSettings}
+        onSetMode={onSetDayNight}
+      />
+      </ScrollView>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  container:        { flex: 1, backgroundColor: '#111', padding: 24 },
+  container:        { flex: 1, backgroundColor: '#111' },
+  scrollContent:    { padding: 24, paddingTop: 8 },
+  topBar:           { paddingHorizontal: 24, paddingTop: 12 },
+  topBack:          { color: '#e63', fontSize: 15, fontWeight: '600' },
   title:            { color: '#fff', fontSize: 24, fontWeight: '700', marginBottom: 24, marginTop: 8 },
   section:          { marginBottom: 8 },
   row:              { flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
@@ -170,6 +256,13 @@ const styles = StyleSheet.create({
   deviceName:       { color: '#fff', fontSize: 14, fontWeight: '600' },
   deviceIp:         { color: '#666', fontSize: 12, marginTop: 2 },
   deviceConnect:    { color: '#e63', fontSize: 13 },
+  cameraRow:        { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#1a1a1a', padding: 12, borderRadius: 8, marginTop: 8 },
+  cameraInfo:       { flex: 1, marginRight: 12 },
+  cameraSettingsBtn:  { paddingHorizontal: 10, paddingVertical: 4, marginRight: 12 },
+  cameraSettingsText: { color: '#aaa', fontSize: 20 },
+  cameraRemove:     { color: '#e63', fontSize: 13, fontWeight: '600' },
+  doneButton:       { backgroundColor: '#333', padding: 14, borderRadius: 8, alignItems: 'center', marginTop: 16 },
+  doneButtonText:   { color: '#fff', fontSize: 16, fontWeight: '600' },
   hint:             { color: '#555', fontSize: 12, marginBottom: 12 },
   highlight:        { color: '#e63' },
   divider:          { height: 1, backgroundColor: '#222', marginVertical: 20 },
