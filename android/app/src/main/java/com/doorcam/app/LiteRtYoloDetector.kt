@@ -26,15 +26,17 @@ import kotlin.math.roundToInt
  * (`{ detector: "yolo11n" }`). Neither replaces the other.
  *
  * Model I/O (the shape actually shipped in `assets/yolo11n.tflite`):
- *   input  : float32 [1, 320, 320, 3]  NHWC, RGB, values 0..1 (letterboxed)
- *   output : float32 [1, 84, 2100]     raw, one row per channel:
+ *   input  : float32 [1, 640, 640, 3]  NHWC, RGB, values 0..1 (letterboxed)
+ *   output : float32 [1, 84, 8400]     raw, one row per channel:
  *              rows 0..3   cx, cy, w, h in input pixels (no objectness row)
  *              row  4      person (COCO class 0) score, sigmoid applied
  *              rows 5..83  remaining COCO classes
  *
- * The layout is discovered from the interpreter's tensors at init, so NCHW
- * inputs ([1,3,H,W]) and a channel-last output ([1,2100,84]) are also handled;
- * the raw boxes/scores are decoded here and never rely on model metadata.
+ * All geometry is discovered from the interpreter's tensors at init — input
+ * width/height, output anchor count and channel order — so no input extent or
+ * grid size is hardcoded (a 320 export works the same as the shipped 640 one).
+ * NCHW inputs ([1,3,H,W]) and a channel-last output ([1,8400,84]) are also
+ * handled; the raw boxes/scores are decoded here and never rely on metadata.
  *
  * Thread affinity: [initialize] and [detect] MUST be called on the same single
  * thread (the engine's pipeline thread) — the interpreter and its scratch
@@ -59,8 +61,9 @@ class LiteRtYoloDetector(
         private const val TAG = "DoorCam"
         const val DEFAULT_MODEL_ASSET = "yolo11n.tflite"
 
-        /** Must match the exported model's input extent. */
-        const val DEFAULT_INPUT_SIZE = 320
+        // NOTE: the model input extent is discovered from the interpreter in
+        // initialize() (inputWidth/inputHeight) and is intentionally not
+        // hardcoded here, so the same code serves any export size.
 
         /**
          * Same defaults as [MediaPipePersonDetector] so both detectors are
@@ -83,6 +86,20 @@ class LiteRtYoloDetector(
 
         private const val PERSON_CLASS_INDEX = 0
         private const val BOX_CHANNELS = 4
+
+        /**
+         * COCO class indices treated as vehicles: bicycle, car, motorcycle,
+         * bus, truck. YOLO11n confuses parked cars / moving scooters with
+         * people at the class level, so a person candidate is rejected when a
+         * vehicle class on the *same anchor* scores at least as high.
+         */
+        private val VEHICLE_CLASS_INDICES = intArrayOf(1, 2, 3, 5, 7)
+
+        /**
+         * Reject a person candidate when `vehicleBest >= personScore * ratio`.
+         * Default 1.0 == strict "vehicle wins or ties" semantics.
+         */
+        private const val VEHICLE_REJECT_RATIO = 1.0f
 
         /** Hard cap before NMS to keep the O(n^2) pass bounded on bad frames. */
         private const val MAX_CANDIDATES = 400
@@ -292,8 +309,23 @@ class LiteRtYoloDetector(
     // ------------------------------------------------------------------
 
     private fun scoreAt(raw: FloatArray, anchor: Int): Float =
-        if (outputChannelLast) raw[anchor * outputChannels + BOX_CHANNELS + PERSON_CLASS_INDEX]
-        else raw[(BOX_CHANNELS + PERSON_CLASS_INDEX) * outputAnchors + anchor]
+        classScoreAt(raw, PERSON_CLASS_INDEX, anchor)
+
+    /** Raw class score for [classIndex] on [anchor], honoring the output layout. */
+    private fun classScoreAt(raw: FloatArray, classIndex: Int, anchor: Int): Float =
+        if (outputChannelLast) raw[anchor * outputChannels + BOX_CHANNELS + classIndex]
+        else raw[(BOX_CHANNELS + classIndex) * outputAnchors + anchor]
+
+    /** Best vehicle-class score for [anchor], or 0 if none are present. */
+    private fun bestVehicleScore(raw: FloatArray, anchor: Int): Float {
+        var best = 0f
+        for (vehicleClass in VEHICLE_CLASS_INDICES) {
+            if (BOX_CHANNELS + vehicleClass >= outputChannels) continue
+            val s = classScoreAt(raw, vehicleClass, anchor)
+            if (s > best) best = s
+        }
+        return best
+    }
 
     private fun boxAt(raw: FloatArray, channel: Int, anchor: Int): Float =
         if (outputChannelLast) raw[anchor * outputChannels + channel]
@@ -314,6 +346,17 @@ class LiteRtYoloDetector(
         while (anchor < outputAnchors) {
             val score = scoreAt(raw, anchor)
             if (score >= scoreThreshold) {
+                // NOTE: class-level vehicle rejection is currently DISABLED.
+                // It risked dropping real people standing near/overlapping a
+                // vehicle (a car class can score at the person's anchor). Keep
+                // for reference; re-enable only with a box-overlap + margin
+                // (fused) decision rather than this hard rule.
+                //
+                // val vehicleBest = bestVehicleScore(raw, anchor)
+                // if (vehicleBest >= score * VEHICLE_REJECT_RATIO) {
+                //     anchor++
+                //     continue
+                // }
                 val cx = boxAt(raw, 0, anchor)
                 val cy = boxAt(raw, 1, anchor)
                 val bw = boxAt(raw, 2, anchor)

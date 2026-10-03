@@ -15,7 +15,7 @@ import android.graphics.BitmapFactory
 class FrameDecoder(private val targetLongSide: Int = TARGET_LONG_SIDE) {
 
     companion object {
-        const val TARGET_LONG_SIDE = 320
+        const val TARGET_LONG_SIDE = 640
     }
 
     private var reusable: Bitmap? = null
