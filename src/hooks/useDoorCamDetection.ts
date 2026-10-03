@@ -3,6 +3,7 @@ import { DeviceEventEmitter, NativeModules } from 'react-native';
 import * as Notifications from 'expo-notifications';
 import { Camera } from '../utils/storage';
 import { insertEvent } from '../utils/db';
+import { NOTIFY_MIN_SCORE } from '../utils/constants';
 
 const { DoorCamModule } = NativeModules;
 
@@ -236,7 +237,15 @@ function onPersonDetected(event: PersonDetectedEvent) {
   }
   const stateChanged = !sameDetection(prevState, nextState);
 
-  if (nearness !== 'none') {
+  // Only a high-confidence detection may drive capture / notification / event
+  // creation. Lower-scoring "candidate" frames still updated the overlay state
+  // above (boxes, nearness, frame dims) so yellow boxes keep rendering, but
+  // they are otherwise side-effect free.
+  const rawScores = Array.isArray(event.scores) ? event.scores : [];
+  const maxScore = rawScores.length > 0 ? Math.max(0, ...rawScores) : 0;
+  const confident = maxScore >= NOTIFY_MIN_SCORE;
+
+  if (nearness !== 'none' && confident) {
     if (!activeEvents.has(cameraId)) {
       // Rising edge of a confirmed detection: start a capture + persist an event.
       const eventId = generateEventId();
@@ -259,12 +268,12 @@ function onPersonDetected(event: PersonDetectedEvent) {
       const rank: Record<Nearness, number> = { none: 0, far: 1, close: 2, very_close: 3 };
       if (rank[nearness] > rank[prev ?? 'none']) nearnessByCamera[cameraId] = nearness;
     }
-  } else {
+  } else if (nearness === 'none') {
     activeEvents.delete(cameraId);
   }
 
-  // Side effects (capture/event/notification) run above regardless; only the
-  // render is skipped when the visible detection state is unchanged.
+  // High-confidence side effects ran above independent of the render; only the
+  // subscriber notify is skipped when the visible detection state is unchanged.
   if (stateChanged) notifySubscribers();
 }
 
