@@ -36,9 +36,21 @@ yarn-error.*
 # typescript
 *.tsbuildinfo
 
-# generated native folders
+# generated native folders (iOS is generated; the Android native source is tracked)
 /ios
-/android
+
+# Android build artifacts (keep the native source, ignore the build junk)
+android/.gradle/
+android/build/
+android/app/build/
+android/.cxx/
+android/app/.cxx/
+android/captures/
+android/.idea/
+android/.kotlin/
+android/local.properties
+android/app/release/
+*.iml
 
 # Android module build artifacts
 modules/*/android/build/
