@@ -14,13 +14,19 @@ import {
   DEFAULT_DASHBOARD_ID,
   DEFAULT_DASHBOARD_NAME,
   DEFAULT_DETECTION_SETTINGS,
+  DEFAULT_NIGHT_SETTINGS,
   Dashboard,
   DefaultStoreSeed,
 } from '../utils/storage';
 
-/** Fresh copy of the firmware-matching defaults (never share references). */
-function preset() {
+/** Fresh copy of the firmware-matching day defaults (never share references). */
+function dayPreset() {
   return { ...DEFAULT_CAMERA_SETTINGS };
+}
+
+/** Fresh copy of the generic night baseline (never share references). */
+function nightPreset() {
+  return { ...DEFAULT_NIGHT_SETTINGS };
 }
 
 export const CAMERA_SEEDS: CameraSeed[] = [
@@ -29,16 +35,16 @@ export const CAMERA_SEEDS: CameraSeed[] = [
     name: '',
     host: 'cam1.local',
     dayNight: 'auto',
-    day: preset(),
-    night: preset(),
+    day: dayPreset(),
+    night: nightPreset(),
   },
   {
     tag: 'cam2',
     name: '',
     host: 'cam2.local',
     dayNight: 'auto',
-    day: preset(),
-    night: preset(),
+    day: dayPreset(),
+    night: nightPreset(),
   },
 ];
 

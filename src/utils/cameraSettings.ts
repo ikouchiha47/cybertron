@@ -2,6 +2,7 @@ import {
   Camera,
   CameraSettings,
   DEFAULT_CAMERA_SETTINGS,
+  activeProfileSlot,
   normalizeSettings,
 } from './storage';
 
@@ -234,23 +235,36 @@ export function isDefaultSettings(settings: CameraSettings): boolean {
   );
 }
 
+/** Local hour (0–23) used to resolve the active Day/Night slot. */
+export function currentLocalHour(): number {
+  return new Date().getHours();
+}
+
 /**
  * Fetch a camera's live `/status` and derive its settings. Returns the camera
  * unchanged when unreachable or when `/status` exposes no mapped fields.
- * Day and Night profiles are both seeded so the stored config mirrors hardware.
+ *
+ * Adoption is **slot-aware**: the fetched values are written only to the
+ * profile that is active for the camera at `hour` (defaults to the current
+ * local hour) and to the effective `settings`. The inactive profile is left
+ * untouched, so a daytime launch can never clobber the night baseline.
  */
-export async function adoptCameraStatus(camera: Camera): Promise<Camera> {
+export async function adoptCameraStatus(
+  camera: Camera,
+  hour: number = currentLocalHour(),
+): Promise<Camera> {
   if (!camera.ip) return camera;
   const status = await fetchStatus(camera.ip);
   if (!status || Object.keys(status).length === 0) return camera;
   const patch = settingsFromStatus(status);
   if (Object.keys(patch).length === 0) return camera;
-  return {
-    ...camera,
-    settings: { ...camera.settings, ...patch } as CameraSettings,
-    day: { ...camera.day, ...patch } as CameraSettings,
-    night: { ...camera.night, ...patch } as CameraSettings,
-  };
+  const slot = activeProfileSlot(camera, hour);
+  if (slot === 'day') {
+    const day = { ...camera.day, ...patch } as CameraSettings;
+    return { ...camera, settings: { ...day }, day };
+  }
+  const night = { ...camera.night, ...patch } as CameraSettings;
+  return { ...camera, settings: { ...night }, night };
 }
 
 // ---------------------------------------------------------------------------

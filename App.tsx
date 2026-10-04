@@ -196,7 +196,7 @@ export default function App() {
         for (let i = 0; i < current.length; i++) {
           const cam = current[i];
           if (cam.ip && isDefaultSettings(cam.settings)) {
-            const adopted = await adoptCameraStatus(cam);
+            const adopted = await adoptCameraStatus(cam, hour);
             if (adopted !== cam) mergeCamera(adopted);
           }
           await syncCamera(current[i]);
