@@ -179,7 +179,11 @@ class MjpegStreamView(context: Context) : TextureView(context), TextureView.Surf
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.SECONDS)
+        // Finite read timeout: a half-open/wedged ESP32 socket (stops sending but
+        // keeps the connection open) would otherwise block read() forever and the
+        // tile would freeze with no EOF and no reconnect. A timeout throws
+        // SocketTimeoutException, which the readStream loop catches and retries.
+        .readTimeout(10, TimeUnit.SECONDS)
         .build()
 
     private val batteryReceiver = object : BroadcastReceiver() {
@@ -323,8 +327,8 @@ class MjpegStreamView(context: Context) : TextureView(context), TextureView.Surf
                 Thread.currentThread().interrupt() // restore interrupt flag, exit cleanly
                 return
             } catch (e: Exception) {
-                if (BuildConfig.DEBUG && running.get()) {
-                    android.util.Log.d("DoorCam", "[native] stream error streamId=$streamId: $e")
+                if (running.get()) {
+                    android.util.Log.w("DoorCam", "[native] stream error streamId=$streamId: $e")
                 }
             } finally {
                 if (currentCall === call) currentCall = null
@@ -338,9 +342,7 @@ class MjpegStreamView(context: Context) : TextureView(context), TextureView.Surf
             reconnects++
             markOffline()
             val delayMs = nextBackoffDelay()
-            if (BuildConfig.DEBUG) {
-                android.util.Log.d("DoorCam", "[native] reconnecting streamId=$streamId in ${delayMs}ms (reconnects=$reconnects)")
-            }
+            android.util.Log.w("DoorCam", "[native] reconnecting streamId=$streamId in ${delayMs}ms (reconnects=$reconnects)")
             try {
                 Thread.sleep(delayMs)
             } catch (_: InterruptedException) {
@@ -383,8 +385,8 @@ class MjpegStreamView(context: Context) : TextureView(context), TextureView.Surf
         val reactContext = context as? ReactContext ?: return
         val now = System.currentTimeMillis()
         val lastFrameAgoMs = if (lastFrameAtMs > 0L) now - lastFrameAtMs else -1L
-        if (BuildConfig.DEBUG) {
-            android.util.Log.d(
+        if (running.get()) {
+            android.util.Log.w(
                 "DoorCam",
                 "[native] CameraStatus streamId=$streamId online=$online reconnects=$reconnects lastFrameAgoMs=$lastFrameAgoMs",
             )
