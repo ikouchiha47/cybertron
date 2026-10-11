@@ -24,9 +24,9 @@ class MediaPipePersonDetector(
     private val modelAssetPath: String = DEFAULT_MODEL_ASSET,
     private val scoreThreshold: Float = DEFAULT_SCORE_THRESHOLD,
     private val maxResults: Int = DEFAULT_MAX_RESULTS,
-    private val minBoxAreaFraction: Float = DEFAULT_MIN_BOX_AREA_FRACTION,
-    private val minAspect: Float = DEFAULT_MIN_ASPECT,
-    private val maxAspect: Float = DEFAULT_MAX_ASPECT,
+    minBoxAreaFraction: Float = DEFAULT_MIN_BOX_AREA_FRACTION,
+    minAspect: Float = DEFAULT_MIN_ASPECT,
+    maxAspect: Float = DEFAULT_MAX_ASPECT,
 ) : PersonDetector {
 
     companion object {
@@ -38,14 +38,52 @@ class MediaPipePersonDetector(
         /** Reject tiny blobs — box must cover at least 0.2% of the frame. */
         const val DEFAULT_MIN_BOX_AREA_FRACTION = 0.002f
 
-        /** Human-shaped boxes: height/width in [1.2, 6.0]. */
-        const val DEFAULT_MIN_ASPECT = 1.2f
+        /**
+         * Human-shaped boxes: height/width in [DEFAULT_MIN_ASPECT, DEFAULT_MAX_ASPECT].
+         * The floor is deliberately below 1.0 so squat/wide/partial/close-up
+         * boxes are not rejected.
+         */
+        const val DEFAULT_MIN_ASPECT = 0.8f
         const val DEFAULT_MAX_ASPECT = 6.0f
     }
 
     @Volatile
     override var ready: Boolean = false
         private set
+
+    /**
+     * Minimum normalized box area (fraction of the frame). Volatile so a live
+     * [setMinBoxAreaFraction] from the config path is visible to the pipeline
+     * thread without a lock.
+     */
+    @Volatile
+    var minBoxAreaFraction: Float = minBoxAreaFraction
+        private set
+
+    /** Minimum box height/width ratio accepted as a person. Volatile (live-tunable). */
+    @Volatile
+    var minAspect: Float = minAspect
+        private set
+
+    /** Maximum box height/width ratio accepted as a person. Volatile (live-tunable). */
+    @Volatile
+    var maxAspect: Float = maxAspect
+        private set
+
+    /** Applies a live min-box-area change; takes effect on the next frame. */
+    fun setMinBoxAreaFraction(fraction: Float) {
+        minBoxAreaFraction = fraction
+    }
+
+    /** Applies a live min-aspect change; takes effect on the next frame. */
+    fun setMinAspect(value: Float) {
+        minAspect = value
+    }
+
+    /** Applies a live max-aspect change; takes effect on the next frame. */
+    fun setMaxAspect(value: Float) {
+        maxAspect = value
+    }
 
     private var detector: ObjectDetector? = null
 

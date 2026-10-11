@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
+import { View, Text, TouchableOpacity, Switch, StyleSheet } from 'react-native';
 import { DetectionSettings } from '../utils/storage';
 
 interface Props {
@@ -7,8 +7,13 @@ interface Props {
   onChange: (patch: Partial<DetectionSettings>) => void;
 }
 
+/** Detection settings backed by a number (stepper rows); excludes booleans. */
+type NumericDetectionKey = {
+  [K in keyof DetectionSettings]: DetectionSettings[K] extends number ? K : never;
+}[keyof DetectionSettings];
+
 interface RowSpec {
-  key: keyof DetectionSettings;
+  key: NumericDetectionKey;
   label: string;
   unit: string;
   min: number;
@@ -22,7 +27,8 @@ interface RowSpec {
 /**
  * Global native detection-engine tuning. Values map 1:1 to the fields parsed by
  * `InferencePipeline.setDetectionConfig` (personScoreThreshold, kConfirm,
- * mWindow, emptyFramesBeforeReset, inferenceIntervalMs, keyframeIntervalMs).
+ * mWindow, emptyFramesBeforeReset, inferenceIntervalMs, baselineIntervalMs,
+ * keyframeIntervalMs).
  */
 const ROWS: RowSpec[] = [
   {
@@ -32,6 +38,16 @@ const ROWS: RowSpec[] = [
     min: 100,
     max: 2000,
     step: 100,
+    format: v => `${v}`,
+  },
+  {
+    key: 'baselineIntervalMs',
+    label: 'Idle interval',
+    unit: 'ms',
+    min: 100,
+    max: 5000,
+    step: 50,
+    note: "Baseline inference rate when there's no motion; motion boosts to the interval above.",
     format: v => `${v}`,
   },
   {
@@ -79,6 +95,36 @@ const ROWS: RowSpec[] = [
     max: 0.9,
     step: 0.05,
     format: v => `${(v * 100).toFixed(0)}%`,
+  },
+  {
+    key: 'minAspect',
+    label: 'Min height/width',
+    unit: '',
+    min: 0.3,
+    max: 3,
+    step: 0.1,
+    note: 'Lower = accept wider/partial/close people',
+    format: v => v.toFixed(1),
+  },
+  {
+    key: 'maxAspect',
+    label: 'Max height/width',
+    unit: '',
+    min: 1,
+    max: 10,
+    step: 0.5,
+    note: 'Upper bound on how tall/narrow a box may be',
+    format: v => v.toFixed(1),
+  },
+  {
+    key: 'minBoxArea',
+    label: 'Min box area',
+    unit: '',
+    min: 0.0005,
+    max: 0.1,
+    step: 0.0005,
+    note: 'Smallest accepted box as a fraction of the frame',
+    format: v => `${v}`,
   },
 ];
 
@@ -144,6 +190,24 @@ export default function DetectionSettingsPanel({ value, onChange }: Props) {
               </View>
             );
           })}
+
+          <View style={styles.row}>
+            <View style={styles.labelWrap}>
+              <View style={styles.labelRow}>
+                <Text style={styles.label}>Enhance low-contrast (CLAHE)</Text>
+              </View>
+              <Text style={styles.rowNote}>
+                Boost local contrast on the detection image only — helps black clothing and
+                backlit people.
+              </Text>
+            </View>
+            <Switch
+              value={value.contrastEnhance}
+              onValueChange={v => onChange({ contrastEnhance: v })}
+              trackColor={{ false: '#2a2a2a', true: '#e63' }}
+              thumbColor="#fff"
+            />
+          </View>
         </View>
       )}
     </View>

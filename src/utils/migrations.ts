@@ -22,6 +22,7 @@ import {
   DayNightMode,
   DetectionSettings,
   DEFAULT_NIGHT_SETTINGS,
+  LEGACY_TINY_FRAMESIZE,
   slugifyTag,
 } from './cameraConfig';
 
@@ -31,6 +32,13 @@ import {
  * longer carries it. The rollout itself now runs as migration v4.
  */
 export const NIGHT_PRESET_VERSION = 1;
+
+/**
+ * The migration that shipped the generic night-preset rollout. A legacy v3
+ * store carrying `nightPresetVersion` already had this applied, so it resumes
+ * at the next migration rather than being skipped to `CURRENT_VERSION`.
+ */
+const NIGHT_PRESET_ROLLOUT_VERSION = 4;
 
 function clampInt(value: any, min: number, max: number, fallback: number): number {
   const n = typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : fallback;
@@ -85,12 +93,27 @@ export function normalizeDetection(raw: any): DetectionSettings {
   if (!raw || typeof raw !== 'object') return { ...d };
   return {
     inferenceIntervalMs: clampInt(raw.inferenceIntervalMs, 100, 2000, d.inferenceIntervalMs),
+    baselineIntervalMs: clampInt(raw.baselineIntervalMs, 100, 5000, d.baselineIntervalMs),
     keyframeIntervalMs: clampInt(raw.keyframeIntervalMs, 250, 10000, d.keyframeIntervalMs),
     kConfirm: clampInt(raw.kConfirm, 1, 5, d.kConfirm),
     mWindow: clampInt(raw.mWindow, 1, 6, d.mWindow),
     emptyFramesBeforeReset: clampInt(raw.emptyFramesBeforeReset, 1, 10, d.emptyFramesBeforeReset),
     personScoreThreshold: clampFloat(raw.personScoreThreshold, 0.1, 0.9, d.personScoreThreshold),
+    contrastEnhance: coerceBool(raw.contrastEnhance, d.contrastEnhance),
+    minAspect: clampFloat(raw.minAspect, 0.3, 3, d.minAspect),
+    maxAspect: clampFloat(raw.maxAspect, 1, 10, d.maxAspect),
+    minBoxArea: clampFloat(raw.minBoxArea, 0.0005, 0.1, d.minBoxArea),
   };
+}
+
+/** Sanitize an optional install location; absent/invalid values stay undefined. */
+function normalizeLocation(raw: any): { lat: number; lng: number } | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const lat = typeof raw.lat === 'number' && Number.isFinite(raw.lat) ? raw.lat : undefined;
+  const lng = typeof raw.lng === 'number' && Number.isFinite(raw.lng) ? raw.lng : undefined;
+  if (lat === undefined || lng === undefined) return undefined;
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return undefined;
+  return { lat, lng };
 }
 
 function normalizeCamera(raw: any): Camera | null {
@@ -165,6 +188,7 @@ export function sanitizeStore(
   activeDashboardId: string | undefined,
   focusedId: string | undefined,
   detection: any,
+  location?: any,
 ): CameraStore {
   const cameraIds = cameras.map(c => c.id);
   const cameraIdSet = new Set(cameraIds);
@@ -202,6 +226,7 @@ export function sanitizeStore(
     activeDashboardId: active,
     focusedId: focus,
     detection: normalizeDetection(detection),
+    location: normalizeLocation(location),
   };
 }
 
@@ -225,6 +250,68 @@ function rollNightPreset(store: CameraStore): CameraStore {
         }
       }
       return { ...camera, night };
+    }),
+  };
+}
+
+/**
+ * The superseded night exposure value. The v4 night preset shipped `780`, which
+ * sits just past an OV2640 exposure cliff and blows the frame out to white; v5
+ * lowers only the cameras still holding it. See `DEFAULT_NIGHT_SETTINGS`.
+ */
+const BLOWN_NIGHT_AEC_VALUE = 780;
+
+/**
+ * The conditional DML of the v5 night-exposure correction. Any Night or
+ * effective profile field still at the blown-up preset value (`780`) is lowered
+ * to the current baseline; a value the user has tuned is left alone, the Day
+ * profile is never touched, and cameras already below the cliff are returned
+ * unchanged (same object) so untouched cameras stay byte-identical.
+ */
+function fixNightExposure(store: CameraStore): CameraStore {
+  const target = DEFAULT_NIGHT_SETTINGS.aecValue;
+  return {
+    ...store,
+    cameras: store.cameras.map(camera => {
+      const night =
+        camera.night.aecValue === BLOWN_NIGHT_AEC_VALUE
+          ? { ...camera.night, aecValue: target }
+          : camera.night;
+      const settings =
+        camera.settings.aecValue === BLOWN_NIGHT_AEC_VALUE
+          ? { ...camera.settings, aecValue: target }
+          : camera.settings;
+      if (night === camera.night && settings === camera.settings) return camera;
+      return { ...camera, night, settings };
+    }),
+  };
+}
+
+/**
+ * The conditional DML of the v6 resolution upgrade. The app previously shipped
+ * `framesize: 6` for both profiles; measured on the connected firmware that
+ * control value renders QVGA 320×240 — far smaller than the YOLO model's 640px
+ * input. Any Day, Night, or effective profile still on that legacy default is
+ * moved to `DEFAULT_CAMERA_SETTINGS.framesize` (VGA 640×480); any other value
+ * is an explicit user choice and is left untouched.
+ */
+function upgradeTinyFramesize(store: CameraStore): CameraStore {
+  const target = DEFAULT_CAMERA_SETTINGS.framesize;
+  const upgrade = (settings: CameraSettings): CameraSettings =>
+    settings.framesize === LEGACY_TINY_FRAMESIZE
+      ? { ...settings, framesize: target }
+      : settings;
+  return {
+    ...store,
+    cameras: store.cameras.map(camera => {
+      const day = upgrade(camera.day);
+      const night = upgrade(camera.night);
+      const settings = upgrade(camera.settings);
+      // Untouched cameras stay byte-identical (same object).
+      if (day === camera.day && night === camera.night && settings === camera.settings) {
+        return camera;
+      }
+      return { ...camera, day, night, settings };
     }),
   };
 }
@@ -290,6 +377,7 @@ export const MIGRATIONS: StoreMigration[] = [
         (store as any).activeDashboardId,
         focusedId,
         (store as any).detection,
+        (store as any).location,
       );
       return { ...sanitized, version: 3 };
     },
@@ -300,6 +388,38 @@ export const MIGRATIONS: StoreMigration[] = [
     apply(store) {
       const cameras = normalizeCameras(store.cameras);
       return { ...rollNightPreset({ ...store, cameras }), version: 4 };
+    },
+  },
+  {
+    // v5: lower the night baseline's locked exposure. The v4 preset used
+    // `aecValue: 780`, which sits just past an OV2640 exposure cliff and blows
+    // the night frame out to white; cameras still on that value adopt the
+    // corrected baseline, user edits and the Day profile are preserved.
+    version: 5,
+    apply(store) {
+      const cameras = normalizeCameras(store.cameras);
+      return { ...fixNightExposure({ ...store, cameras }), version: 5 };
+    },
+  },
+  {
+    // v6: upgrade the legacy tiny (QVGA 320×240) default to true VGA. The YOLO
+    // model input is 640px, so the old default produced frames smaller than the
+    // model expects; Day, Night, and effective profiles still on it adopt the
+    // new default while a resolution the user explicitly chose is preserved.
+    version: 6,
+    apply(store) {
+      const cameras = normalizeCameras(store.cameras);
+      return { ...upgradeTinyFramesize({ ...store, cameras }), version: 6 };
+    },
+  },
+  {
+    // v7: introduce the optional top-level `location` (lat/lng) used to compute
+    // real solar dusk/dawn for `auto` cameras. The field is deliberately left
+    // absent: a store without coordinates keeps the legacy 07:00/19:00 rule, so
+    // this migration is a no-op for existing installs.
+    version: 7,
+    apply(store) {
+      return { ...store, version: 7 };
     },
   },
 ];
@@ -313,32 +433,31 @@ export const CURRENT_VERSION = MIGRATIONS.reduce(
 /**
  * Detect the version a raw persisted payload starts at, from its shape.
  *  - no cameras (legacy `{ ip }`): 0
- *  - `version: 2` / `version: 3`: that version
- *  - `version: 3` with the legacy night-preset marker already set: 4, so the
- *    rollout is NOT re-run (those stores have already been rolled out)
+ *  - a recognised `version` (1..CURRENT-1): that version, so it runs forward
+ *    from exactly where it stopped (e.g. a v4 store still needs v5)
+ *  - `version: 3` with the legacy night-preset marker already set: resumes at
+ *    the v4 rollout version, so the v4 rollout is NOT re-run but later
+ *    migrations (v5, v6) still apply
  *  - already-current/newer: `CURRENT_VERSION`
  */
 export function detectRawVersion(raw: any): number {
   if (!raw || typeof raw !== 'object') return 0;
-  const hasCameras = Array.isArray(raw.cameras);
-  if (!hasCameras) return 0; // legacy `{ ip }`
+  if (!Array.isArray(raw.cameras)) return 0; // legacy `{ ip }`
 
   const version =
     typeof raw.version === 'number' && Number.isFinite(raw.version)
       ? Math.floor(raw.version)
       : undefined;
 
-  if (version !== undefined && version >= CURRENT_VERSION) return CURRENT_VERSION;
-  if (version === 3) {
-    // Existing on-device stores are `{ version: 3, nightPresetVersion: 1, ... }`
-    // and have already run the rollout — map them straight past v4.
-    if ((raw.nightPresetVersion ?? 0) >= NIGHT_PRESET_VERSION) return CURRENT_VERSION;
-    return 3;
+  if (version === undefined) return 1; // cameras present, no recognised version
+  if (version >= CURRENT_VERSION) return CURRENT_VERSION;
+  if (version === 3 && (raw.nightPresetVersion ?? 0) >= NIGHT_PRESET_VERSION) {
+    // The rollout already ran in an older build; resume just after it so newer
+    // migrations (e.g. the v6 resolution upgrade) are still applied.
+    return Math.min(NIGHT_PRESET_ROLLOUT_VERSION, CURRENT_VERSION);
   }
-  if (version === 2) return 2;
-  if (version === 1) return 1;
-  // Cameras present but no recognised version → earliest store shape.
-  return 1;
+  // Any other known intermediate version runs forward from where it is.
+  return version >= 1 ? version : 1;
 }
 
 /**
@@ -347,7 +466,10 @@ export function detectRawVersion(raw: any): number {
  *  - legacy `{ ip }` → single-camera store
  *  - v2 `{ version: 2, cameras, focusedId }` → adds dashboards
  *  - v3 `{ version: 3, cameras, dashboards, … }` → runs the night rollout
- *  - v3 + `nightPresetVersion >= 1` → already rolled out; not re-run
+ *  - v3 + `nightPresetVersion >= 1` → rollout already applied; resumes at v4 so
+ *    later migrations (v5, v6) still run
+ *  - v5 → the blown night exposure value is corrected
+ *  - v6 → the legacy tiny resolution default (QVGA 320×240) is upgraded to VGA
  */
 export function migrateStore(raw: any): CameraStore | null {
   if (!raw || typeof raw !== 'object') return null;
@@ -371,6 +493,7 @@ export function migrateStore(raw: any): CameraStore | null {
     store.activeDashboardId,
     store.focusedId,
     (store as any).detection,
+    (store as any).location,
   );
 }
 

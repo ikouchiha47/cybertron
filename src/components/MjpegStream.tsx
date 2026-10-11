@@ -1,12 +1,12 @@
 import React from 'react';
-import { requireNativeComponent, StyleSheet, ViewStyle } from 'react-native';
+import { requireNativeComponent, StyleProp, StyleSheet, ViewStyle } from 'react-native';
 
 interface Props {
   url: string;
   streamId?: string;
   inferenceIntervalMs?: number;
   detectionEnabled?: boolean;
-  style?: ViewStyle;
+  style?: StyleProp<ViewStyle>;
 }
 
 // @ts-ignore

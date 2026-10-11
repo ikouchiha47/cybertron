@@ -16,6 +16,7 @@
     "expo-camera": "~17.0.10",
     "expo-file-system": "~19.0.21",
     "expo-image-manipulator": "~14.0.8",
+    "expo-location": "~19.0.8",
     "expo-notifications": "~0.32.16",
     "expo-sqlite": "~16.0.10",
     "expo-status-bar": "~3.0.9",
@@ -27,7 +28,8 @@
     "react-native-safe-area-context": "^5.7.0",
     "react-native-vlc-media-player": "^1.0.98",
     "react-native-webview": "13.15.0",
-    "react-native-zeroconf": "^0.14.0"
+    "react-native-zeroconf": "^0.14.0",
+    "suncalc": "^2.1.1"
   },
   "devDependencies": {
     "@types/react": "~19.1.0",

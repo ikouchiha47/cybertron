@@ -27,6 +27,10 @@ interface Props {
   onUpdateDetection: (patch: Partial<DetectionSettings>) => void;
   onSetDayNight: (cameraId: string, mode: DayNightMode) => void;
   onDone: () => void;
+  /** Global install location (store-level); absent until one is set. */
+  location?: { lat: number; lng: number };
+  /** Persist/clear the install location through the app store save path. */
+  onSetLocation?: (location: { lat: number; lng: number } | undefined) => void;
 }
 
 /** Build a camera with fresh Day/Night profiles seeded from the defaults. */
@@ -45,7 +49,7 @@ function newCamera(id: string, name: string, ip: string, host = '', tag = ''): C
   };
 }
 
-export default function SetupScreen({ cameras, focusedId, detection, onAddCamera, onRemoveCamera, onUpdateSettings, onUpdateDetection, onSetDayNight, onDone }: Props) {
+export default function SetupScreen({ cameras, focusedId, detection, onAddCamera, onRemoveCamera, onUpdateSettings, onUpdateDetection, onSetDayNight, onDone, location, onSetLocation }: Props) {
   const [ip, setIp] = useState('');
   const [showPortal, setShowPortal] = useState(false);
   const [scanning, setScanning] = useState(false);
@@ -235,6 +239,8 @@ export default function SetupScreen({ cameras, focusedId, detection, onAddCamera
         onClose={() => setSettingsCameraId(undefined)}
         onChange={onUpdateSettings}
         onSetMode={onSetDayNight}
+        location={location}
+        onSetLocation={onSetLocation}
       />
       </ScrollView>
     </SafeAreaView>

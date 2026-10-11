@@ -27,6 +27,11 @@ export interface CameraEngineStat {
   queueDepth: number;
   /** Cumulative frames evicted from the camera's latest-wins queue. */
   framesDropped: number;
+  /**
+   * Most recent frame's Rec.601 mean luminance, 0–255 (same scale as the native
+   * `MotionGate.NIGHT_LUMA = 55`). `0` means no frame has been seen yet.
+   */
+  meanLuma: number;
 }
 
 export interface EngineMetrics {
@@ -50,6 +55,11 @@ interface NativeCameraMetrics {
   framesDropped?: number;
   /** Successful surface draws, merged in by DoorCamModule.getMetrics. */
   drawn?: number;
+  /**
+   * Most recent frame's Rec.601 mean luminance, 0–255. `0` means no frame seen
+   * yet (see `CameraEngineStat.meanLuma`).
+   */
+  meanLuma?: number;
 }
 
 interface NativeMetrics {
@@ -129,6 +139,7 @@ export function useEngineMetrics(enabled: boolean): EngineMetrics {
           detectionLatencyMs: num(c.detectionLatencyMs),
           queueDepth: num(c.queueDepth),
           framesDropped: num(c.framesDropped),
+          meanLuma: num(c.meanLuma),
         });
       }
 

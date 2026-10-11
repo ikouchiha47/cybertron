@@ -51,9 +51,9 @@ class LiteRtYoloDetector(
     private val iouThreshold: Float = DEFAULT_IOU_THRESHOLD,
     private val maxResults: Int = DEFAULT_MAX_RESULTS,
     private val numThreads: Int = DEFAULT_NUM_THREADS,
-    private val minBoxAreaFraction: Float = DEFAULT_MIN_BOX_AREA_FRACTION,
-    private val minAspect: Float = DEFAULT_MIN_ASPECT,
-    private val maxAspect: Float = DEFAULT_MAX_ASPECT,
+    minBoxAreaFraction: Float = DEFAULT_MIN_BOX_AREA_FRACTION,
+    minAspect: Float = DEFAULT_MIN_ASPECT,
+    maxAspect: Float = DEFAULT_MAX_ASPECT,
     private val padValue: Int = DEFAULT_PAD_VALUE,
 ) : PersonDetector {
 
@@ -72,7 +72,13 @@ class LiteRtYoloDetector(
         const val DEFAULT_SCORE_THRESHOLD = 0.30f
         const val DEFAULT_MAX_RESULTS = 5
         const val DEFAULT_MIN_BOX_AREA_FRACTION = 0.002f
-        const val DEFAULT_MIN_ASPECT = 1.2f
+
+        /**
+         * Human-shaped boxes: height/width in [DEFAULT_MIN_ASPECT, DEFAULT_MAX_ASPECT].
+         * The floor is intentionally below 1.0 so squat/wide/partial/close-up
+         * boxes (a person cut off by the frame edge, or seated) are not rejected.
+         */
+        const val DEFAULT_MIN_ASPECT = 0.8f
         const val DEFAULT_MAX_ASPECT = 6.0f
 
         /** Ultralytics default NMS IoU for the detection head. */
@@ -108,6 +114,40 @@ class LiteRtYoloDetector(
     @Volatile
     override var ready: Boolean = false
         private set
+
+    /**
+     * Minimum normalized box area (fraction of the frame). Volatile so a live
+     * [setMinBoxAreaFraction] from the config path is visible to the pipeline
+     * thread without a lock.
+     */
+    @Volatile
+    var minBoxAreaFraction: Float = minBoxAreaFraction
+        private set
+
+    /** Minimum box height/width ratio accepted as a person. Volatile (live-tunable). */
+    @Volatile
+    var minAspect: Float = minAspect
+        private set
+
+    /** Maximum box height/width ratio accepted as a person. Volatile (live-tunable). */
+    @Volatile
+    var maxAspect: Float = maxAspect
+        private set
+
+    /** Applies a live min-box-area change; takes effect on the next frame. */
+    fun setMinBoxAreaFraction(fraction: Float) {
+        minBoxAreaFraction = fraction
+    }
+
+    /** Applies a live min-aspect change; takes effect on the next frame. */
+    fun setMinAspect(value: Float) {
+        minAspect = value
+    }
+
+    /** Applies a live max-aspect change; takes effect on the next frame. */
+    fun setMaxAspect(value: Float) {
+        maxAspect = value
+    }
 
     private var interpreter: Interpreter? = null
 

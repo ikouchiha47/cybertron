@@ -45,6 +45,12 @@
         {
           "icon": "./assets/notification-icon.png"
         }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "DoorCam uses your location to estimate today's dusk and dawn so the camera can switch between day and night modes at the right time."
+        }
       ]
     ]
   }

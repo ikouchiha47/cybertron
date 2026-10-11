@@ -14,9 +14,10 @@ import {
   DEFAULT_DASHBOARD_NAME,
   DEFAULT_DETECTION_SETTINGS,
   DEFAULT_NIGHT_SETTINGS,
+  LEGACY_TINY_FRAMESIZE,
 } from './cameraConfig';
 import type { Camera, CameraSettings, CameraStore } from './cameraConfig';
-import { NIGHT_PRESET_VERSION, applyNightPresetRollout, migrateStore, normalizeSettings, sanitizeStore } from './migrations';
+import { NIGHT_PRESET_VERSION, applyNightPresetRollout, migrateStore, normalizeDetection, normalizeSettings, sanitizeStore } from './migrations';
 import { CURRENT_VERSION, MIGRATIONS, detectRawVersion } from './migrations';
 
 function makeCamera(overrides: Partial<Camera> = {}): Camera {
@@ -59,9 +60,9 @@ describe('Night preset rollout', () => {
     // The semantic outcome promised to the user.
     expect(night.exposureLock).toBe(true);
     expect(night.wbMode).toBe(1); // Sunny — fixed WB
-    expect(night.aecValue).toBe(780);
+    expect(night.aecValue).toBe(750); // below the OV2640 exposure cliff
     expect(night.agcGain).toBe(15);
-    expect(night.framesize).toBe(6); // HVGA
+    expect(night.framesize).toBe(10); // VGA 640x480
     // Whole profile lands on the generic night baseline.
     expect(night).toEqual(DEFAULT_NIGHT_SETTINGS);
   });
@@ -80,9 +81,9 @@ describe('Night preset rollout', () => {
     // ...while untouched night-critical fields adopt the new baseline.
     expect(night.exposureLock).toBe(true);
     expect(night.wbMode).toBe(1);
-    expect(night.aecValue).toBe(780);
+    expect(night.aecValue).toBe(750);
     expect(night.agcGain).toBe(15);
-    expect(night.framesize).toBe(6);
+    expect(night.framesize).toBe(10);
   });
 
   it('running the migration again does not undo the user\'s later edits (idempotent)', () => {
@@ -164,9 +165,10 @@ describe('Ordered config migrations', () => {
     expect(detectRawVersion({ ip: '192.168.1.50' })).toBe(0);
     expect(detectRawVersion({ version: 2, cameras: [] })).toBe(2);
     expect(detectRawVersion({ version: 3, cameras: [] })).toBe(3);
-    expect(detectRawVersion({ version: 3, cameras: [], nightPresetVersion: 1 })).toBe(
-      CURRENT_VERSION,
-    );
+    expect(detectRawVersion({ version: 4, cameras: [] })).toBe(4);
+    // A settled store carrying the legacy marker has already had the v4 rollout;
+    // it resumes at v4 so later migrations still run.
+    expect(detectRawVersion({ version: 3, cameras: [], nightPresetVersion: 1 })).toBe(4);
   });
 
   it('does NOT re-run the night rollout for a v3 store carrying nightPresetVersion:1', () => {
@@ -177,7 +179,8 @@ describe('Ordered config migrations', () => {
       JSON.stringify(makeStore(camera, { nightPresetVersion: 1 } as any)),
     );
     expect(raw.version).toBe(3);
-    expect(detectRawVersion(raw)).toBe(CURRENT_VERSION);
+    // Resumes after the already-applied v4 rollout rather than skipping ahead.
+    expect(detectRawVersion(raw)).toBe(4);
 
     const migrated = migrateStore(raw)!;
     expect(migrated.version).toBe(CURRENT_VERSION);
@@ -201,6 +204,106 @@ describe('Ordered config migrations', () => {
     // ...while the user's edit survives.
     expect(migrated.cameras[0].night.brightness).toBe(2);
   });
+
+  it('lowers a v4 store still on the blown night exposure to the corrected value', () => {
+    // A camera that already ran the v4 night rollout still holds the blown 780.
+    const camera = makeCamera({
+      night: { ...DEFAULT_NIGHT_SETTINGS, aecValue: 780 },
+      settings: { ...DEFAULT_NIGHT_SETTINGS, aecValue: 780 },
+    });
+    const raw: any = JSON.parse(JSON.stringify(makeStore(camera, { version: 4 } as any)));
+    expect(detectRawVersion(raw)).toBe(4);
+
+    const migrated = migrateStore(raw)!;
+    expect(migrated.cameras[0].night.aecValue).toBe(750);
+    expect(migrated.cameras[0].settings.aecValue).toBe(750);
+  });
+
+  it('preserves a night exposure the user tuned below the cliff', () => {
+    const camera = makeCamera({ night: { ...DEFAULT_NIGHT_SETTINGS, aecValue: 400 } });
+    const raw: any = JSON.parse(JSON.stringify(makeStore(camera, { version: 4 } as any)));
+
+    const migrated = migrateStore(raw)!;
+    expect(migrated.cameras[0].night.aecValue).toBe(400);
+  });
+
+  it('ships true VGA as the default resolution for both profiles', () => {
+    // VGA 640x480 matches the 640px YOLO model input; XGA stays opt-in.
+    expect(DEFAULT_CAMERA_SETTINGS.framesize).toBe(10);
+    expect(DEFAULT_NIGHT_SETTINGS.framesize).toBe(10);
+  });
+
+  it('upgrades the legacy tiny resolution default to VGA on every profile', () => {
+    const tiny = { ...DEFAULT_CAMERA_SETTINGS, framesize: LEGACY_TINY_FRAMESIZE };
+    const camera = makeCamera({
+      day: { ...tiny },
+      night: { ...DEFAULT_NIGHT_SETTINGS, framesize: LEGACY_TINY_FRAMESIZE },
+      settings: { ...tiny },
+    });
+    const raw: any = JSON.parse(JSON.stringify(makeStore(camera, { version: 5 } as any)));
+    expect(detectRawVersion(raw)).toBe(5);
+
+    const migrated = migrateStore(raw)!;
+    expect(migrated.cameras[0].day.framesize).toBe(10);
+    expect(migrated.cameras[0].night.framesize).toBe(10);
+    expect(migrated.cameras[0].settings.framesize).toBe(10);
+  });
+
+  it('preserves a resolution the user explicitly chose', () => {
+    // XGA 1024x768 (control value 12) is an opt-in the user made; the v6
+    // upgrade must not flatten it.
+    const chosen = { ...DEFAULT_CAMERA_SETTINGS, framesize: 12 };
+    const camera = makeCamera({
+      day: { ...chosen },
+      night: { ...DEFAULT_NIGHT_SETTINGS, framesize: 12 },
+      settings: { ...chosen },
+    });
+    const raw: any = JSON.parse(JSON.stringify(makeStore(camera, { version: 5 } as any)));
+
+    const migrated = migrateStore(raw)!;
+    expect(migrated.cameras[0].day.framesize).toBe(12);
+    expect(migrated.cameras[0].night.framesize).toBe(12);
+    expect(migrated.cameras[0].settings.framesize).toBe(12);
+  });
+
+  it('runs the resolution upgrade on a legacy store carrying the night-preset marker', () => {
+    // A settled v3 store skipped ahead by the legacy marker still traverses
+    // v5-v6 while its old (unrolled) night fields stay as-is.
+    const tiny = { ...DEFAULT_CAMERA_SETTINGS, framesize: LEGACY_TINY_FRAMESIZE };
+    const camera = makeCamera({
+      day: { ...tiny },
+      night: { ...tiny, brightness: 2 },
+      settings: { ...tiny },
+    });
+    const raw: any = JSON.parse(
+      JSON.stringify(makeStore(camera, { nightPresetVersion: 1 } as any)),
+    );
+
+    const migrated = migrateStore(raw)!;
+    expect(migrated.cameras[0].day.framesize).toBe(10);
+    expect(migrated.cameras[0].settings.framesize).toBe(10);
+    expect(migrated.cameras[0].night.framesize).toBe(10);
+    // The v4 rollout is still not re-run for this store.
+    expect(migrated.cameras[0].night.exposureLock).toBe(false);
+    expect(migrated.cameras[0].night.brightness).toBe(2);
+  });
+
+  it('keeps the v6 upgrade step (QVGA 6 -> VGA 10) intact', () => {
+    const tiny = { ...DEFAULT_CAMERA_SETTINGS, framesize: LEGACY_TINY_FRAMESIZE };
+    const camera = makeCamera({
+      day: { ...tiny },
+      night: { ...DEFAULT_NIGHT_SETTINGS, framesize: LEGACY_TINY_FRAMESIZE },
+      settings: { ...tiny },
+    });
+    const v6 = MIGRATIONS.find(m => m.version === 6)!;
+    const afterV6 = v6.apply(
+      JSON.parse(JSON.stringify(makeStore(camera, { version: 5 } as any))),
+    );
+
+    expect(afterV6.cameras[0].day.framesize).toBe(10);
+    expect(afterV6.cameras[0].night.framesize).toBe(10);
+    expect(afterV6.cameras[0].settings.framesize).toBe(10);
+  });
 });
 
 describe('Settings sanitisation / clamping', () => {
@@ -219,6 +322,46 @@ describe('Settings sanitisation / clamping', () => {
     const low = normalizeSettings({ ...DEFAULT_CAMERA_SETTINGS, quality: -100, brightness: -9 });
     expect(low.quality).toBe(10); // quality min
     expect(low.brightness).toBe(-2); // brightness min
+  });
+
+  it('defaults the idle baseline inference cadence and clamps it into 100..5000ms', () => {
+    // Missing on an older payload → the healthy idle default.
+    expect(normalizeDetection({}).baselineIntervalMs).toBe(
+      DEFAULT_DETECTION_SETTINGS.baselineIntervalMs,
+    );
+    expect(DEFAULT_DETECTION_SETTINGS.baselineIntervalMs).toBe(300);
+    // Out-of-range values are clamped, never pushed to the engine verbatim.
+    expect(normalizeDetection({ baselineIntervalMs: 0 }).baselineIntervalMs).toBe(100);
+    expect(normalizeDetection({ baselineIntervalMs: 99999 }).baselineIntervalMs).toBe(5000);
+  });
+
+  it('defaults CLAHE contrast enhancement on and coerces it to a boolean', () => {
+    // A fresh install (and any older payload without the field) enhances.
+    expect(DEFAULT_DETECTION_SETTINGS.contrastEnhance).toBe(true);
+    expect(normalizeDetection({}).contrastEnhance).toBe(true);
+    // An explicit off survives; a non-boolean falls back to the default.
+    expect(normalizeDetection({ contrastEnhance: false }).contrastEnhance).toBe(false);
+    expect(normalizeDetection({ contrastEnhance: 'yes' }).contrastEnhance).toBe(true);
+  });
+
+  it('defaults the box geometry filters to a relaxed aspect floor', () => {
+    // The relaxed floor admits squat/wide/partial/close boxes.
+    expect(DEFAULT_DETECTION_SETTINGS.minAspect).toBe(0.8);
+    expect(DEFAULT_DETECTION_SETTINGS.maxAspect).toBe(6.0);
+    expect(DEFAULT_DETECTION_SETTINGS.minBoxArea).toBe(0.002);
+    // Missing on an older payload → the same defaults.
+    expect(normalizeDetection({}).minAspect).toBe(0.8);
+    expect(normalizeDetection({}).maxAspect).toBe(6.0);
+    expect(normalizeDetection({}).minBoxArea).toBe(0.002);
+  });
+
+  it('clamps geometry filters into the engine ranges', () => {
+    expect(normalizeDetection({ minAspect: 0 }).minAspect).toBe(0.3);
+    expect(normalizeDetection({ minAspect: 99 }).minAspect).toBe(3);
+    expect(normalizeDetection({ maxAspect: 0 }).maxAspect).toBe(1);
+    expect(normalizeDetection({ maxAspect: 99 }).maxAspect).toBe(10);
+    expect(normalizeDetection({ minBoxArea: 0 }).minBoxArea).toBe(0.0005);
+    expect(normalizeDetection({ minBoxArea: 5 }).minBoxArea).toBe(0.1);
   });
 });
 

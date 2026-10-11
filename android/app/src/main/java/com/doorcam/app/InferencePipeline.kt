@@ -33,10 +33,12 @@ import java.util.concurrent.atomic.AtomicLong
  *    (no persistent socket). The poller yields automatically the moment a
  *    native view for that camera appears, and resumes when the last view goes.
  *
- * Every ingested frame is evaluated by a per-camera [MotionGate]; inference runs
- * at most every [DetectionConfig.inferenceIntervalMs] (default 500ms) per camera
- * on the single pipeline thread, which remains the sole [PersonDetector.detect]
- * caller. K-of-M voting, reset, and sticky nearness are kept per camera.
+ * Every ingested frame is evaluated by a per-camera [MotionGate]. Inference runs
+ * on the single pipeline thread (the sole [PersonDetector.detect] caller) with a
+ * two-tier per-camera cadence: motion present or an active track uses
+ * [DetectionConfig.inferenceIntervalMs] (the boost rate), otherwise the idle
+ * [DetectionConfig.baselineIntervalMs]. K-of-M voting, reset, and sticky
+ * nearness are kept per camera.
  */
 object DoorCamEngine {
 
@@ -53,8 +55,15 @@ object DoorCamEngine {
     private const val DEFAULT_K_CONFIRM = 2
     private const val DEFAULT_M_WINDOW = 3
 
-    // Inference cadence per camera when motion is present.
+    // Inference cadence per camera when motion is present (the "boost" tier).
     private const val DEFAULT_INFERENCE_INTERVAL_MS = 500L
+
+    // Idle baseline inference cadence per camera when there is no motion and no
+    // active track. Motion boosts the rate to DEFAULT_INFERENCE_INTERVAL_MS,
+    // but a still scene must still infer at this rate (subject to source fps).
+    private const val DEFAULT_BASELINE_INTERVAL_MS = 300L
+    private const val MIN_BASELINE_INTERVAL_MS = 100
+    private const val MAX_BASELINE_INTERVAL_MS = 5000
 
     // Forced-keyframe cadence of the per-camera motion gate: the worst-case
     // wait from "person appears but no motion" to the first inference.
@@ -68,6 +77,21 @@ object DoorCamEngine {
     private const val DETECTOR_EFFICIENTDET = "efficientdet"
     private const val DETECTOR_YOLO = "yolo11n"
     private const val DEFAULT_DETECTOR = DETECTOR_YOLO
+
+    // Geometry filters applied by BOTH detectors. Kept as live-tunable config so
+    // close-up / wide / partial people (which a strict aspect floor rejects) can
+    // be admitted without recompiling. Defaults match the detectors'.
+    private const val DEFAULT_MIN_ASPECT = 0.8f
+    private const val DEFAULT_MAX_ASPECT = 6.0f
+    private const val DEFAULT_MIN_BOX_AREA = 0.002f
+
+    // Defensive clamp ranges for values that cross the JS bridge.
+    private const val MIN_ASPECT_FLOOR = 0.3f
+    private const val MIN_ASPECT_CEIL = 3.0f
+    private const val MAX_ASPECT_FLOOR = 1.0f
+    private const val MAX_ASPECT_CEIL = 10.0f
+    private const val MIN_BOX_AREA_FLOOR = 0.0005f
+    private const val MIN_BOX_AREA_CEIL = 0.1f
 
     // Latest-wins per-camera queue depth (bounded memory; oldest dropped).
     private const val PER_CAMERA_QUEUE_CAPACITY = 4
@@ -88,8 +112,20 @@ object DoorCamEngine {
         val nearnessVeryClose: Float = DEFAULT_NEARNESS_VERY_CLOSE,
         val nearnessClose: Float = DEFAULT_NEARNESS_CLOSE,
         val inferenceIntervalMs: Long = DEFAULT_INFERENCE_INTERVAL_MS,
+        val baselineIntervalMs: Long = DEFAULT_BASELINE_INTERVAL_MS,
         val keyframeIntervalMs: Long = DEFAULT_KEYFRAME_INTERVAL_MS,
         val detector: String = DEFAULT_DETECTOR,
+        /**
+         * Pre-inference CLAHE on the detection bitmap. Helps dark/low-contrast
+         * subjects (black clothing, backlit silhouettes). Display is unaffected.
+         */
+        val contrastEnhance: Boolean = true,
+        /** Min box height/width ratio accepted as a person. Lower = wider/partial. */
+        val minAspect: Float = DEFAULT_MIN_ASPECT,
+        /** Max box height/width ratio accepted as a person. */
+        val maxAspect: Float = DEFAULT_MAX_ASPECT,
+        /** Min normalized box area (fraction of the frame) accepted as a person. */
+        val minBoxArea: Float = DEFAULT_MIN_BOX_AREA,
     )
 
     @Volatile
@@ -144,6 +180,10 @@ object DoorCamEngine {
 
         // Frames evicted from this camera's latest-wins queue (counter).
         @Volatile var framesDropped = 0L
+
+        // Most recent frame's mean luminance (Rec.601, 0-255). 0 until a frame
+        // has been processed; not a counter/EWMA.
+        @Volatile var meanLuma = 0.0
     }
 
     private class CameraRuntime(config: CameraConfig, keyframeIntervalMs: Long) {
@@ -354,30 +394,47 @@ object DoorCamEngine {
         m.decodeMsEwma = ewma(m.decodeMsEwma, decodeMs)
         globalDecodeMsEwma = ewma(globalDecodeMsEwma, decodeMs)
 
-        // Motion gate runs on EVERY ingested frame using the already-decoded bitmap.
+        // Motion gate runs on EVERY ingested frame using the already-decoded
+        // bitmap. It no longer gates inference: a head-on/slow subject with
+        // little frame-to-frame motion must still infer at a healthy baseline.
         val motionStart = System.nanoTime()
         val gate = rt.motion.process(frame, item.ts)
         val motionMs = (System.nanoTime() - motionStart) / 1_000_000.0
         m.motionMsEwma = ewma(m.motionMsEwma, motionMs)
         globalMotionMsEwma = ewma(globalMotionMsEwma, motionMs)
-        // Motion gate saves CPU only while nothing is being tracked. Once a
-        // track is active, keep evaluating the temporal/vote/reset path every
-        // (throttled) frame so the box follows the person and the loss path
-        // (emptyFramesBeforeReset -> empty-boxes emit) can fire promptly when
-        // they leave, even if the scene goes still underneath them.
-        if (!gate.motion && !rt.state.active) {
+        // Latest raw-frame mean luminance (Rec.601, 0-255), surfaced through
+        // getMetrics() so JS can make a luminance day/night decision. Detection
+        // and gating are unaffected.
+        m.meanLuma = gate.meanLuma
+        // Motion no longer blocks inference — every camera infers at least at
+        // the baseline rate. Keep counting no-motion frames for observability.
+        if (!gate.motion) {
             m.motionSkips += 1
             globalMotionSkips.incrementAndGet()
-            return
         }
 
+        // Two-tier cadence: motion present, or an active track (so the box
+        // follows the person and the loss path fires promptly), uses the fast
+        // interval; a still, untracked scene falls back to the idle baseline.
+        val boosted = gate.motion || rt.state.active
+        val interval = (if (boosted) cfg.inferenceIntervalMs else cfg.baselineIntervalMs)
+            .coerceAtLeast(0L)
         val now = System.currentTimeMillis()
-        val interval = cfg.inferenceIntervalMs.coerceAtLeast(0L)
         if (now - rt.lastInferenceAt < interval) return
         rt.lastInferenceAt = now
 
         // Queue depth sampled at inference time (latest-wins backlog).
         m.queueDepth = synchronized(rt.queueLock) { rt.queue.size.toLong() }
+
+        // CLAHE contrast enhancement is applied to the DETECTION bitmap only,
+        // here — after the motion gate and just before inference. Applying it
+        // after the gate deliberately leaves the gate's calibrated luma/noise
+        // floor and day-vs-night classification on the raw frame; the boosted
+        // frame is never displayed (only the detector reads its pixels). It is
+        // outside the `t0` window so inference metrics remain model-only.
+        if (cfg.contrastEnhance) {
+            ContrastEnhancer.enhance(frame)
+        }
 
         val t0 = System.nanoTime()
         val detections = detector?.detect(frame, frame.width, frame.height) ?: emptyList()
@@ -582,16 +639,31 @@ object DoorCamEngine {
                 nearnessVeryClose = readFloat(map, "nearnessVeryClose", current.nearnessVeryClose),
                 nearnessClose = readFloat(map, "nearnessClose", current.nearnessClose),
                 inferenceIntervalMs = readInt(map, "inferenceIntervalMs", current.inferenceIntervalMs.toInt()).toLong(),
+                baselineIntervalMs = readInt(
+                    map,
+                    "baselineIntervalMs",
+                    current.baselineIntervalMs.toInt(),
+                ).coerceIn(MIN_BASELINE_INTERVAL_MS, MAX_BASELINE_INTERVAL_MS).toLong(),
                 keyframeIntervalMs = readInt(
                     map,
                     "keyframeIntervalMs",
                     current.keyframeIntervalMs.toInt(),
                 ).coerceIn(MIN_KEYFRAME_INTERVAL_MS, MAX_KEYFRAME_INTERVAL_MS).toLong(),
                 detector = normalizeDetectorId(readString(map, "detector", current.detector)),
+                contrastEnhance = readBoolean(map, "contrastEnhance", current.contrastEnhance),
+                minAspect = readFloat(map, "minAspect", current.minAspect)
+                    .coerceIn(MIN_ASPECT_FLOOR, MIN_ASPECT_CEIL),
+                maxAspect = readFloat(map, "maxAspect", current.maxAspect)
+                    .coerceIn(MAX_ASPECT_FLOOR, MAX_ASPECT_CEIL),
+                minBoxArea = readFloat(map, "minBoxArea", current.minBoxArea)
+                    .coerceIn(MIN_BOX_AREA_FLOOR, MIN_BOX_AREA_CEIL),
             )
             // Apply the (possibly changed) keyframe cadence to every existing
             // per-camera gate so a live config change takes effect immediately.
             runtimes.values.forEach { it.motion.setKeyframeIntervalMs(config.keyframeIntervalMs) }
+            // Apply the geometry filters to the ACTIVE detector immediately so a
+            // live change takes effect without restarting the engine.
+            applyGeometryConfig(detector, config)
             Log.i(TAG, "[engine] config applied $config")
         } catch (t: Throwable) {
             Log.w(TAG, "[engine] setDetectionConfig failed: ${t.message}")
@@ -615,6 +687,7 @@ object DoorCamEngine {
                     putDouble("detectionLatencyMs", m.detectionLatencyMsEwma)
                     putDouble("queueDepth", m.queueDepth.toDouble())
                     putDouble("framesDropped", m.framesDropped.toDouble())
+                    putDouble("meanLuma", m.meanLuma)
                     putBoolean("active", activeIds.contains(id))
                     putBoolean("hasView", MjpegStreamView.get(id) != null)
                     putString("config", rt.config.name)
@@ -763,6 +836,17 @@ object DoorCamEngine {
     private fun readString(map: ReadableMap, key: String, fallback: String): String =
         if (map.hasKey(key) && !map.isNull(key)) map.getString(key) ?: fallback else fallback
 
+    private fun readBoolean(map: ReadableMap, key: String, fallback: Boolean): Boolean =
+        if (map.hasKey(key) && !map.isNull(key)) {
+            try {
+                map.getBoolean(key)
+            } catch (_: Throwable) {
+                fallback
+            }
+        } else {
+            fallback
+        }
+
     /** Maps any JS-facing detector value to one of the two canonical ids. */
     private fun normalizeDetectorId(raw: String?): String {
         val v = raw?.trim()?.lowercase() ?: return DETECTOR_EFFICIENTDET
@@ -776,8 +860,37 @@ object DoorCamEngine {
      */
     private fun createDetector(ctx: Context, id: String): PersonDetector =
         if (normalizeDetectorId(id) == DETECTOR_YOLO) {
-            LiteRtYoloDetector(ctx).also { it.initialize() }
+            LiteRtYoloDetector(ctx).also {
+                // Seed the live geometry config so a (re)start or detector
+                // switch honors the current tuning immediately.
+                applyGeometryConfig(it, config)
+                it.initialize()
+            }
         } else {
-            MediaPipePersonDetector(ctx).also { it.initialize() }
+            MediaPipePersonDetector(ctx).also {
+                applyGeometryConfig(it, config)
+                it.initialize()
+            }
         }
+
+    /**
+     * Pushes the live geometry filters onto whichever concrete detector is
+     * active. Called on every config apply and right after detector creation;
+     * the setters only assign @Volatile fields, so this is safe from the bridge
+     * thread while the pipeline thread reads them.
+     */
+    private fun applyGeometryConfig(target: PersonDetector?, cfg: DetectionConfig) {
+        when (target) {
+            is LiteRtYoloDetector -> {
+                target.setMinAspect(cfg.minAspect)
+                target.setMaxAspect(cfg.maxAspect)
+                target.setMinBoxAreaFraction(cfg.minBoxArea)
+            }
+            is MediaPipePersonDetector -> {
+                target.setMinAspect(cfg.minAspect)
+                target.setMaxAspect(cfg.maxAspect)
+                target.setMinBoxAreaFraction(cfg.minBoxArea)
+            }
+        }
+    }
 }

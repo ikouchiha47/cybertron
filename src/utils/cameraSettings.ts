@@ -5,6 +5,7 @@ import {
   activeProfileSlot,
   normalizeSettings,
 } from './storage';
+import { NightWindow } from './sunWindow';
 
 /**
  * Firmware semantics (see audrino/CameraWebServer/app_httpd.cpp):
@@ -62,6 +63,13 @@ export async function pushSetting(ip: string, v: string, val: number): Promise<v
 }
 
 /** The firmware variables this app owns. `ledOn`/`ledIntensity` share one. */
+/**
+ * Order matters. The manual exposure/gain values must be pushed BEFORE the
+ * `aec`/`agc` enable toggles: on this firmware `set_exposure_ctrl(0)` only takes
+ * effect once a valid `aec_value` is already set, otherwise the lock silently
+ * reverts to auto (the washout/flicker we were chasing). Keep `aec_value` /
+ * `agc_gain` ahead of `aec` / `agc`.
+ */
 export const MANAGED_VARS = [
   'quality',
   'brightness',
@@ -73,10 +81,10 @@ export const MANAGED_VARS = [
   'awb',
   'led_intensity',
   'framesize',
-  'aec',
-  'agc',
   'aec_value',
   'agc_gain',
+  'aec',
+  'agc',
 ] as const;
 
 export type ManagedVar = (typeof MANAGED_VARS)[number];
@@ -235,30 +243,27 @@ export function isDefaultSettings(settings: CameraSettings): boolean {
   );
 }
 
-/** Local hour (0–23) used to resolve the active Day/Night slot. */
-export function currentLocalHour(): number {
-  return new Date().getHours();
-}
-
 /**
  * Fetch a camera's live `/status` and derive its settings. Returns the camera
  * unchanged when unreachable or when `/status` exposes no mapped fields.
  *
  * Adoption is **slot-aware**: the fetched values are written only to the
- * profile that is active for the camera at `hour` (defaults to the current
- * local hour) and to the effective `settings`. The inactive profile is left
- * untouched, so a daytime launch can never clobber the night baseline.
+ * profile that is active for the camera at `now` (defaults to the current
+ * instant, with no solar window) and to the effective `settings`. The inactive
+ * profile is left untouched, so a daytime launch can never clobber the night
+ * baseline.
  */
 export async function adoptCameraStatus(
   camera: Camera,
-  hour: number = currentLocalHour(),
+  now: Date = new Date(),
+  window: NightWindow | null = null,
 ): Promise<Camera> {
   if (!camera.ip) return camera;
   const status = await fetchStatus(camera.ip);
   if (!status || Object.keys(status).length === 0) return camera;
   const patch = settingsFromStatus(status);
   if (Object.keys(patch).length === 0) return camera;
-  const slot = activeProfileSlot(camera, hour);
+  const slot = activeProfileSlot(camera, now, window);
   if (slot === 'day') {
     const day = { ...camera.day, ...patch } as CameraSettings;
     return { ...camera, settings: { ...day }, day };
@@ -286,14 +291,20 @@ export interface SettingDef {
 
 export const WB_MODES = ['Auto', 'Sunny', 'Cloudy', 'Office', 'Home'];
 
-/** ESP32 framesize enum values the UI exposes (see app_httpd.cpp /status). */
+/**
+ * Firmware `framesize` control values the UI exposes. Values/labels are the
+ * MEASURED mapping on the connected firmware (see `CameraSettings.framesize` in
+ * cameraConfig.ts), not the datasheet enum: 6=QVGA 320×240, 8=CIF 400×296,
+ * 9=HVGA 480×320, 10=VGA 640×480, 11=SVGA 800×600, 12=XGA 1024×768. The app
+ * default is 6 (QVGA); 10/11/12 are per-camera opt-ins.
+ */
 export const FRAMESIZE_MODES: { value: number; label: string }[] = [
-  { value: 4, label: 'QVGA 320×240' },
-  { value: 5, label: 'CIF 400×296' },
-  { value: 6, label: 'HVGA 480×320' },
-  { value: 7, label: 'VGA 640×480' },
-  { value: 8, label: 'SVGA 800×600' },
-  { value: 9, label: 'XGA 1024×768' },
+  { value: 6, label: 'QVGA 320×240' },
+  { value: 8, label: 'CIF 400×296' },
+  { value: 9, label: 'HVGA 480×320' },
+  { value: 10, label: 'VGA 640×480' },
+  { value: 11, label: 'SVGA 800×600' },
+  { value: 12, label: 'XGA 1024×768' },
 ];
 
 export const SETTING_DEFS: SettingDef[] = [

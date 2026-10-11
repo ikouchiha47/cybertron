@@ -29,11 +29,17 @@ interface Props {
   onSetDayNight: (cameraId: string, mode: DayNightMode) => void;
   /** Re-resolve camera IPs from mDNS (called on offline transition / manual). */
   onResolveCameras?: () => void;
+  /** Global install location (store-level); absent until one is set. */
+  location?: { lat: number; lng: number };
+  /** Persist/clear the install location through the app store save path. */
+  onSetLocation?: (location: { lat: number; lng: number } | undefined) => void;
 }
 
 /** Tiny resolved-profile label: "D", "N", or "A·D"/"A·N" in auto mode. */
 function dayNightLabel(camera: Camera): string {
-  const slot = activeProfileSlot(camera, new Date().getHours());
+  // The monitor label does not receive the install location, so it keeps the
+  // 07:00/19:00 fallback rule (null window). Cosmetic only.
+  const slot = activeProfileSlot(camera, new Date(), null);
   const letter = slot === 'day' ? 'D' : 'N';
   return camera.dayNight === 'auto' ? `A·${letter}` : letter;
 }
@@ -88,6 +94,8 @@ export default function MonitorScreen({
   onUpdateSettings,
   onSetDayNight,
   onResolveCameras,
+  location,
+  onSetLocation,
 }: Props) {
   const [gammaOn, setGammaOn] = useState(true); // firmware default: raw_gma=1
   const [dashboardModalOpen, setDashboardModalOpen] = useState(false);
@@ -325,6 +333,8 @@ export default function MonitorScreen({
         onClose={() => setSettingsId(null)}
         onChange={onUpdateSettings}
         onSetMode={onSetDayNight}
+        location={location}
+        onSetLocation={onSetLocation}
       />
 
       {/* Dashboard switcher */}

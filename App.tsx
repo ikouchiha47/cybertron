@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { NativeModules } from 'react-native';
+import { AppState, NativeModules } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import * as Notifications from 'expo-notifications';
 import {
@@ -28,7 +28,10 @@ import {
   ManagedVar,
 } from './src/utils/cameraSettings';
 import { resolveCameraIps } from './src/utils/resolveCameras';
+import { resolveNightWindow, NightWindow } from './src/utils/sunWindow';
 import { useDayNightSwitch } from './src/hooks/useDayNightSwitch';
+import { useEngineMetrics } from './src/hooks/useEngineMetrics';
+import { useLuminanceNightOverride } from './src/hooks/useLuminanceNightOverride';
 import { DEFAULT_STORE_SEED } from './src/config/defaultConfig';
 import { registerBackgroundDetection } from './src/utils/backgroundDetection';
 import SetupScreen from './src/screens/SetupScreen';
@@ -47,8 +50,9 @@ function makeDashboardId(): string {
  * Push global detection tuning to the native engine. Key names MUST match
  * `InferencePipeline.setDetectionConfig` in DoorCamEngine.kt
  * (personScoreThreshold, kConfirm, mWindow, emptyFramesBeforeReset,
- * inferenceIntervalMs, keyframeIntervalMs). Fire-and-forget: never blocks or
- * fails the UI.
+ * inferenceIntervalMs, baselineIntervalMs, keyframeIntervalMs, contrastEnhance,
+ * minAspect, maxAspect, minBoxArea).
+ * Fire-and-forget: never blocks or fails the UI.
  */
 function pushDetectionConfig(settings: DetectionSettings) {
   try {
@@ -58,7 +62,12 @@ function pushDetectionConfig(settings: DetectionSettings) {
       mWindow: settings.mWindow,
       emptyFramesBeforeReset: settings.emptyFramesBeforeReset,
       inferenceIntervalMs: settings.inferenceIntervalMs,
+      baselineIntervalMs: settings.baselineIntervalMs,
       keyframeIntervalMs: settings.keyframeIntervalMs,
+      contrastEnhance: settings.contrastEnhance,
+      minAspect: settings.minAspect,
+      maxAspect: settings.maxAspect,
+      minBoxArea: settings.minBoxArea,
     });
   } catch (e) {
     // Native module may be unavailable (JS-only environments); ignore.
@@ -71,6 +80,7 @@ export default function App() {
   const [activeDashboardId, setActiveDashboardIdState] = useState<string>(DEFAULT_DASHBOARD_ID);
   const [focusedId, setFocusedId] = useState<string | undefined>();
   const [detection, setDetection] = useState<DetectionSettings>(DEFAULT_DETECTION_SETTINGS);
+  const [location, setLocation] = useState<{ lat: number; lng: number } | undefined>();
   const [screen, setScreen] = useState<Screen>('monitor');
   const [loading, setLoading] = useState(true);
   const [galleryEventId, setGalleryEventId] = useState<string | undefined>();
@@ -82,11 +92,25 @@ export default function App() {
   const activeDashboardRef = useRef<string>(DEFAULT_DASHBOARD_ID);
   const focusedRef = useRef<string | undefined>(undefined);
   const detectionRef = useRef<DetectionSettings>(DEFAULT_DETECTION_SETTINGS);
+  const locationRef = useRef<{ lat: number; lng: number } | undefined>(undefined);
   useEffect(() => { camerasRef.current = cameras; }, [cameras]);
   useEffect(() => { dashboardsRef.current = dashboards; }, [dashboards]);
   useEffect(() => { activeDashboardRef.current = activeDashboardId; }, [activeDashboardId]);
   useEffect(() => { focusedRef.current = focusedId; }, [focusedId]);
   useEffect(() => { detectionRef.current = detection; }, [detection]);
+  useEffect(() => { locationRef.current = location; }, [location]);
+
+  /**
+   * Resolve the solar night window for the current instant from the install
+   * location, or null when no coordinates are set (legacy 07:00/19:00 fallback).
+   * Lazily re-derived at each call site so it never goes stale across midnight;
+   * the hook receives this resolver rather than a snapshot.
+   */
+  const getNightWindow = useCallback((): NightWindow | null => {
+    const loc = locationRef.current;
+    if (!loc) return null;
+    return resolveNightWindow(new Date(), loc.lat, loc.lng);
+  }, []);
 
   /** Persist the current camera list alongside the latest dashboard/focus state. */
   function persistRefs(nextCameras: Camera[]) {
@@ -97,7 +121,19 @@ export default function App() {
       activeDashboardId: activeDashboardRef.current,
       focusedId: focusedRef.current,
       detection: detectionRef.current,
+      location: locationRef.current,
     }).catch(e => console.warn('[DoorCam] failed to save cameras:', e));
+  }
+
+  /**
+   * Set or clear the global install location. The ref is updated first so the
+   * synchronous save below persists the new value through the existing path
+   * (which already includes `location`).
+   */
+  function handleSetLocation(loc: { lat: number; lng: number } | undefined) {
+    locationRef.current = loc;
+    setLocation(loc);
+    persistRefs(camerasRef.current);
   }
 
   /** Merge one camera (matched by id) into state and persist. */
@@ -134,8 +170,9 @@ export default function App() {
   }
 
   // In-session auto Day/Night switch: when an `auto` camera's active slot
-  // crosses 07:00/19:00 while the app is running, re-resolve its effective
-  // settings, persist, then reconcile the hardware (fire-and-forget).
+  // crosses the solar dusk/dawn (or the 07:00/19:00 fallback while the app is
+  // running), re-resolve its effective settings, persist, then reconcile the
+  // hardware (fire-and-forget).
   const handleAutoProfileSwitch = useCallback((nextCam: Camera) => {
     setCameras(prev => {
       const next = prev.map(c => (c.id === nextCam.id ? nextCam : c));
@@ -146,16 +183,44 @@ export default function App() {
     void syncCamera(nextCam);
   }, []);
 
-  const { noteApplied } = useDayNightSwitch(cameras, handleAutoProfileSwitch);
+  // Phase 2 (ADR 0001): spend the engine's per-frame luminance to pull night in
+  // earlier than dusk on `auto` cameras. Enabled while any auto camera exists;
+  // native `meanLuma` is 0 (ignored) until a frame has been seen, so this is
+  // inert and Phase 1 behaviour is unchanged when there is no luma data.
+  const hasAutoCamera = cameras.some(c => c.dayNight === 'auto');
+  const metrics = useEngineMetrics(hasAutoCamera);
+  const lumaNight = useLuminanceNightOverride(cameras, metrics, getNightWindow);
+
+  const { noteApplied, recheck } = useDayNightSwitch(
+    cameras,
+    getNightWindow,
+    handleAutoProfileSwitch,
+    lumaNight,
+  );
+
+  // Re-check the Day/Night slot whenever the app returns to the foreground. The
+  // boundary timer is a JS setTimeout, which is suspended while backgrounded
+  // (screen off), so a 07:00/19:00 boundary crossed during sleep would otherwise
+  // leave `auto` cameras on a stale profile until the *next* boundary — e.g. a
+  // night exposure lock still running at 11am, blowing the frame out to white.
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', state => {
+      if (state === 'active') recheck();
+    });
+    return () => sub.remove();
+  }, [recheck]);
 
   useEffect(() => {
     // Seed from the shipped default config only when there is no store / no cameras.
     loadCameras(DEFAULT_STORE_SEED).then(store => {
       // Resolve each camera's effective settings from its Day/Night profile.
-      const hour = new Date().getHours();
+      const now = new Date();
+      const window = store.location
+        ? resolveNightWindow(now, store.location.lat, store.location.lng)
+        : null;
       const resolved = store.cameras.map(cam => ({
         ...cam,
-        settings: { ...resolveProfile(cam, hour) },
+        settings: { ...resolveProfile(cam, now, window) },
       }));
       const initialFocus = resolved.length > 1 ? undefined : store.focusedId;
       setCameras(resolved);
@@ -166,6 +231,8 @@ export default function App() {
       activeDashboardRef.current = store.activeDashboardId;
       setDetection(store.detection);
       detectionRef.current = store.detection;
+      setLocation(store.location);
+      locationRef.current = store.location;
       // Grid is home for multi-camera: ignore any persisted focus when there's more than one camera.
       setFocusedId(initialFocus);
       focusedRef.current = initialFocus;
@@ -196,7 +263,7 @@ export default function App() {
         for (let i = 0; i < current.length; i++) {
           const cam = current[i];
           if (cam.ip && isDefaultSettings(cam.settings)) {
-            const adopted = await adoptCameraStatus(cam, hour);
+            const adopted = await adoptCameraStatus(cam, now, window);
             if (adopted !== cam) mergeCamera(adopted);
           }
           await syncCamera(current[i]);
@@ -240,6 +307,7 @@ export default function App() {
       activeDashboardId: nextActiveDashboardId,
       focusedId: nextFocusedId,
       detection: detectionRef.current,
+      location: locationRef.current,
     }).catch(e => console.warn('[DoorCam] failed to save cameras:', e));
   }
 
@@ -258,6 +326,7 @@ export default function App() {
         activeDashboardId: activeDashboardRef.current,
         focusedId: focusedRef.current,
         detection: next,
+        location: locationRef.current,
       }).catch(e => console.warn('[DoorCam] failed to save detection settings:', e));
       pushDetectionConfig(next);
       return next;
@@ -268,7 +337,7 @@ export default function App() {
   function seedFromStatus(camera: Camera) {
     if (!camera.ip) return;
     void (async () => {
-      const adopted = await adoptCameraStatus(camera);
+      const adopted = await adoptCameraStatus(camera, new Date(), getNightWindow());
       if (adopted !== camera) mergeCamera(adopted);
     })();
   }
@@ -337,7 +406,7 @@ export default function App() {
   function handleUpdateCameraSettings(id: string, change: CameraSettingsChange) {
     const cam = cameras.find(c => c.id === id);
     if (!cam) return;
-    const activeSlot = activeProfileSlot(cam, new Date().getHours());
+    const activeSlot = activeProfileSlot(cam, new Date(), getNightWindow());
 
     if (change.kind === 'copy') {
       const copied: CameraSettings = { ...(change.from === 'day' ? cam.day : cam.night) };
@@ -392,7 +461,7 @@ export default function App() {
     const nextCam: Camera = {
       ...cam,
       dayNight: mode,
-      settings: { ...resolveProfile({ ...cam, dayNight: mode }, new Date().getHours()) },
+      settings: { ...resolveProfile({ ...cam, dayNight: mode }, new Date(), getNightWindow()) },
     };
     const next = cameras.map(c => (c.id === id ? nextCam : c));
     setCameras(next);
@@ -460,6 +529,8 @@ export default function App() {
           onUpdateSettings={handleUpdateCameraSettings}
           onUpdateDetection={handleUpdateDetection}
           onSetDayNight={handleSetDayNightMode}
+          location={location}
+          onSetLocation={handleSetLocation}
           onDone={() => setScreen('monitor')}
         />
       </SafeAreaProvider>
@@ -493,6 +564,8 @@ export default function App() {
         onUpdateSettings={handleUpdateCameraSettings}
         onSetDayNight={handleSetDayNightMode}
         onResolveCameras={handleResolveCameras}
+        location={location}
+        onSetLocation={handleSetLocation}
       />
     </SafeAreaProvider>
   );

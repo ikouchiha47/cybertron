@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import {
   View,
   Text,
+  TextInput,
   TouchableOpacity,
   Switch,
   ScrollView,
@@ -14,14 +15,25 @@ import {
   CameraSettingsChange,
   DayNightMode,
   ProfileSlot,
+  activeProfileSlot,
 } from '../utils/storage';
 import { FRAMESIZE_MODES, SETTING_DEFS, SettingDef, WB_MODES } from '../utils/cameraSettings';
+import { requestInstallLocation } from '../utils/deviceLocation';
+import { Country, findCountries } from '../data/countries';
+import { resolveNightWindow, valid } from '../utils/sunWindow';
 
 interface Props {
   camera: Camera | null;
   onClose: () => void;
   onChange: (cameraId: string, change: CameraSettingsChange) => void;
   onSetMode: (cameraId: string, mode: DayNightMode) => void;
+  /** Global install location (store-level); absent until one is set. */
+  location?: { lat: number; lng: number };
+  /**
+   * Persist the install location through the app's existing store save path.
+   * `undefined` clears it. Optional so the sheet still renders standalone.
+   */
+  onSetLocation?: (location: { lat: number; lng: number } | undefined) => void;
 }
 
 const MODES: { value: DayNightMode; label: string }[] = [
@@ -30,20 +42,80 @@ const MODES: { value: DayNightMode; label: string }[] = [
   { value: 'night', label: 'Night' },
 ];
 
-function slotForNow(camera: Camera): ProfileSlot {
-  if (camera.dayNight === 'day') return 'day';
-  if (camera.dayNight === 'night') return 'night';
-  const hour = new Date().getHours();
-  return hour >= 7 && hour < 19 ? 'day' : 'night';
+/** How many country rows a search shows at once. */
+const MAX_COUNTRY_MATCHES = 6;
+
+/** Parse a user-entered coordinate; null when blank or not a finite number. */
+function parseCoord(text: string): number | null {
+  if (!text.trim()) return null;
+  const value = Number(text.trim());
+  return Number.isFinite(value) ? value : null;
 }
 
-export default function CameraSettingsSheet({ camera, onClose, onChange, onSetMode }: Props) {
+/** Round to ~11 m and drop trailing noise so the field reads cleanly. */
+function formatCoord(value: number): string {
+  return String(Math.round(value * 10000) / 10000);
+}
+
+/** Local "HH:MM" for a solar instant. */
+function formatClock(date: Date): string {
+  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+}
+
+/**
+ * "Tonight's dusk HH:MM · Tomorrow's dawn HH:MM" for the entered coordinates.
+ * Dusk comes from today's solar day; dawn from the next day's, so the pair
+ * reads as the coming night.
+ */
+function formatReadout(lat: number, lng: number): string {
+  const now = new Date();
+  const today = resolveNightWindow(now, lat, lng);
+  if (today.alwaysUp) return 'The sun stays up here today.';
+  if (today.alwaysDown) return 'The sun stays down here today.';
+  const tomorrow = resolveNightWindow(new Date(now.getTime() + 24 * 60 * 60 * 1000), lat, lng);
+  const dusk = valid(today.dusk) ? formatClock(today.dusk) : null;
+  const dawn = valid(tomorrow.dawn) ? formatClock(tomorrow.dawn) : null;
+  const duskPart = dusk ? `Tonight's dusk ${dusk}` : 'No dusk today';
+  const dawnPart = dawn ? `Tomorrow's dawn ${dawn}` : 'no dawn tomorrow';
+  return `${duskPart} · ${dawnPart}`;
+}
+
+function slotForNow(camera: Camera): ProfileSlot {
+  // Initial tab only; the solar window is supplied elsewhere (App/hook), so the
+  // shared fallback rule (null window) is used here.
+  return activeProfileSlot(camera, new Date(), null);
+}
+
+export default function CameraSettingsSheet({
+  camera,
+  onClose,
+  onChange,
+  onSetMode,
+  location,
+  onSetLocation,
+}: Props) {
   const [slot, setSlot] = useState<ProfileSlot>('day');
+
+  // Location fields are held as text so they stay editable/validated; they are
+  // committed (persisted) only once both parse to an in-range pair.
+  const [latText, setLatText] = useState('');
+  const [lngText, setLngText] = useState('');
+  const [countryQuery, setCountryQuery] = useState('');
+  const [locating, setLocating] = useState(false);
+  const [locationNote, setLocationNote] = useState<string | null>(null);
 
   // When a different camera is opened, start on whichever profile is active now.
   useEffect(() => {
     if (camera) setSlot(slotForNow(camera));
   }, [camera?.id]);
+
+  // Reflect the persisted location into the fields when it changes.
+  useEffect(() => {
+    if (location) {
+      setLatText(formatCoord(location.lat));
+      setLngText(formatCoord(location.lng));
+    }
+  }, [location?.lat, location?.lng]);
 
   const profile: CameraSettings | null = camera
     ? slot === 'day' ? camera.day : camera.night
@@ -69,6 +141,58 @@ export default function CameraSettingsSheet({ camera, onClose, onChange, onSetMo
     const to: ProfileSlot = slot === 'day' ? 'night' : 'day';
     onChange(camera.id, { kind: 'copy', from: slot, to });
     setSlot(to);
+  }
+
+  // --- Location -----------------------------------------------------------
+
+  const parsedLat = parseCoord(latText);
+  const parsedLng = parseCoord(lngText);
+  const latOutOfRange = parsedLat !== null && (parsedLat < -90 || parsedLat > 90);
+  const lngOutOfRange = parsedLng !== null && (parsedLng < -180 || parsedLng > 180);
+  const latBad = latText.trim() !== '' && parsedLat === null;
+  const lngBad = lngText.trim() !== '' && parsedLng === null;
+
+  const countryMatches = countryQuery.trim()
+    ? findCountries(countryQuery).slice(0, MAX_COUNTRY_MATCHES)
+    : [];
+
+  const readout =
+    parsedLat === null || parsedLng === null
+      ? 'Enter coordinates to see dawn and dusk.'
+      : latOutOfRange || lngOutOfRange
+        ? 'Coordinates are out of range.'
+        : formatReadout(parsedLat, parsedLng);
+
+  /** Persist the pair only when both fields parse to in-range values. */
+  function commitCoords() {
+    if (parsedLat === null || parsedLng === null) return;
+    if (latOutOfRange || lngOutOfRange) return;
+    onSetLocation?.({ lat: parsedLat, lng: parsedLng });
+  }
+
+  function applyCoords(lat: number, lng: number) {
+    setLatText(formatCoord(lat));
+    setLngText(formatCoord(lng));
+    setLocationNote(null);
+    onSetLocation?.({ lat, lng });
+  }
+
+  async function useMyLocation() {
+    if (locating) return;
+    setLocating(true);
+    setLocationNote(null);
+    const coords = await requestInstallLocation();
+    setLocating(false);
+    if (!coords) {
+      setLocationNote('Location unavailable. Enter coordinates or pick a country.');
+      return;
+    }
+    applyCoords(coords.lat, coords.lng);
+  }
+
+  function pickCountry(country: Country) {
+    setCountryQuery('');
+    applyCoords(country.lat, country.lng);
   }
 
   return (
@@ -237,6 +361,96 @@ export default function CameraSettingsSheet({ camera, onClose, onChange, onSetMo
                 </View>
               );
             })}
+
+            {camera && (
+              <View style={styles.locationSection}>
+                <View style={styles.locationHeader}>
+                  <Text style={styles.label}>Location</Text>
+                  <TouchableOpacity
+                    style={styles.locBtn}
+                    onPress={useMyLocation}
+                    disabled={locating}
+                  >
+                    <Text style={styles.locBtnText}>
+                      {locating ? 'Locating…' : 'Use my location'}
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+                <Text style={styles.note}>
+                  Sets today's dawn and dusk for auto day/night.
+                </Text>
+
+                <View style={styles.coordRow}>
+                  <View style={styles.coordField}>
+                    <Text style={styles.coordLabel}>Latitude</Text>
+                    <TextInput
+                      style={styles.coordInput}
+                      value={latText}
+                      onChangeText={setLatText}
+                      onBlur={commitCoords}
+                      keyboardType="numbers-and-punctuation"
+                      placeholder="0"
+                      placeholderTextColor="#444"
+                      underlineColorAndroid="transparent"
+                    />
+                  </View>
+                  <View style={styles.coordField}>
+                    <Text style={styles.coordLabel}>Longitude</Text>
+                    <TextInput
+                      style={styles.coordInput}
+                      value={lngText}
+                      onChangeText={setLngText}
+                      onBlur={commitCoords}
+                      keyboardType="numbers-and-punctuation"
+                      placeholder="0"
+                      placeholderTextColor="#444"
+                      underlineColorAndroid="transparent"
+                    />
+                  </View>
+                </View>
+                {(latBad || lngBad || latOutOfRange || lngOutOfRange) && (
+                  <Text style={styles.errorNote}>
+                    Enter a latitude -90 to 90 and a longitude -180 to 180.
+                  </Text>
+                )}
+
+                <Text style={styles.countryLabel}>Country</Text>
+                <TextInput
+                  style={[styles.coordInput, styles.countryInput]}
+                  value={countryQuery}
+                  onChangeText={setCountryQuery}
+                  placeholder="Search countries"
+                  placeholderTextColor="#444"
+                  autoCorrect={false}
+                  autoCapitalize="none"
+                  underlineColorAndroid="transparent"
+                />
+                <Text style={styles.note}>
+                  Starting point for a region — fine-tune the fields above.
+                </Text>
+                {countryMatches.length > 0 && (
+                  <View style={styles.countryList}>
+                    {countryMatches.map(c => (
+                      <TouchableOpacity
+                        key={c.code}
+                        style={styles.countryItem}
+                        onPress={() => pickCountry(c)}
+                      >
+                        <Text style={styles.countryName}>{c.name}</Text>
+                        <Text style={styles.countryCode}>{c.code}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                )}
+                {countryQuery.trim() !== '' && countryMatches.length === 0 && (
+                  <Text style={styles.note}>No matching countries.</Text>
+                )}
+
+                {locationNote ? <Text style={styles.note}>{locationNote}</Text> : null}
+
+                <Text style={styles.readout}>{readout}</Text>
+              </View>
+            )}
           </ScrollView>
         </View>
       </View>
@@ -283,4 +497,20 @@ const styles = StyleSheet.create({
   fsItemActive:       { backgroundColor: '#e63', borderColor: '#e63' },
   fsText:             { color: '#888', fontSize: 12, fontWeight: '700' },
   fsTextActive:       { color: '#fff' },
+  locationSection:    { paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: '#1c1c1c' },
+  locationHeader:     { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  locBtn:             { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8, backgroundColor: '#1a1a1a', borderWidth: 1, borderColor: '#2a2a2a' },
+  locBtnText:         { color: '#e63', fontSize: 12, fontWeight: '600' },
+  coordRow:           { flexDirection: 'row', gap: 10, marginTop: 10 },
+  coordField:         { flex: 1 },
+  coordLabel:         { color: '#888', fontSize: 12, fontWeight: '600', marginBottom: 6 },
+  countryLabel:       { color: '#888', fontSize: 12, fontWeight: '600', marginTop: 16, marginBottom: 6 },
+  coordInput:         { backgroundColor: '#1a1a1a', borderWidth: 1, borderColor: '#2a2a2a', borderRadius: 8, color: '#fff', fontSize: 14, paddingHorizontal: 12, paddingVertical: 10 },
+  countryInput:       { marginTop: 0 },
+  countryList:        { marginTop: 8, backgroundColor: '#1a1a1a', borderRadius: 8, borderWidth: 1, borderColor: '#2a2a2a', overflow: 'hidden' },
+  countryItem:        { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 12, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#222' },
+  countryName:        { color: '#fff', fontSize: 13, fontWeight: '600' },
+  countryCode:        { color: '#666', fontSize: 12, fontWeight: '600' },
+  errorNote:          { color: '#e63', fontSize: 11, marginTop: 6 },
+  readout:            { color: '#aaa', fontSize: 12, marginTop: 12 },
 });
