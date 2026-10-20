@@ -9,6 +9,7 @@ import {
   StyleSheet,
   Modal,
 } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   Camera,
   CameraSettings,
@@ -94,6 +95,7 @@ export default function CameraSettingsSheet({
   location,
   onSetLocation,
 }: Props) {
+  const insets = useSafeAreaInsets();
   const [slot, setSlot] = useState<ProfileSlot>('day');
 
   // Location fields are held as text so they stay editable/validated; they are
@@ -203,7 +205,7 @@ export default function CameraSettingsSheet({
       onRequestClose={onClose}
     >
       <View style={styles.backdrop}>
-        <View style={styles.sheet}>
+        <View style={[styles.sheet, { paddingBottom: 24 + insets.bottom }]}>
           <View style={styles.header}>
             <View style={styles.headerText}>
               <Text style={styles.title}>Camera settings</Text>
@@ -262,7 +264,96 @@ export default function CameraSettingsSheet({
             </View>
           )}
 
-          <ScrollView contentContainerStyle={styles.body}>
+          <ScrollView style={styles.bodyScroll} contentContainerStyle={styles.body} removeClippedSubviews={false}>
+            {camera && (
+              <View style={styles.locationSection}>
+                <View style={styles.locationHeader}>
+                  <Text style={styles.label}>Location</Text>
+                  <TouchableOpacity
+                    style={styles.locBtn}
+                    onPress={useMyLocation}
+                    disabled={locating}
+                  >
+                    <Text style={styles.locBtnText}>
+                      {locating ? 'Locating…' : 'Use my location'}
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+                <Text style={styles.note}>
+                  Sets today's dawn and dusk for auto day/night.
+                </Text>
+
+                <View style={styles.coordRow}>
+                  <View style={styles.coordField}>
+                    <Text style={styles.coordLabel}>Latitude</Text>
+                    <TextInput
+                      style={styles.coordInput}
+                      value={latText}
+                      onChangeText={setLatText}
+                      onBlur={commitCoords}
+                      keyboardType="numbers-and-punctuation"
+                      placeholder="0"
+                      placeholderTextColor="#444"
+                      underlineColorAndroid="transparent"
+                    />
+                  </View>
+                  <View style={styles.coordField}>
+                    <Text style={styles.coordLabel}>Longitude</Text>
+                    <TextInput
+                      style={styles.coordInput}
+                      value={lngText}
+                      onChangeText={setLngText}
+                      onBlur={commitCoords}
+                      keyboardType="numbers-and-punctuation"
+                      placeholder="0"
+                      placeholderTextColor="#444"
+                      underlineColorAndroid="transparent"
+                    />
+                  </View>
+                </View>
+                {(latBad || lngBad || latOutOfRange || lngOutOfRange) && (
+                  <Text style={styles.errorNote}>
+                    Enter a latitude -90 to 90 and a longitude -180 to 180.
+                  </Text>
+                )}
+
+                <Text style={styles.countryLabel}>Country</Text>
+                <TextInput
+                  style={[styles.coordInput, styles.countryInput]}
+                  value={countryQuery}
+                  onChangeText={setCountryQuery}
+                  placeholder="Search countries"
+                  placeholderTextColor="#444"
+                  autoCorrect={false}
+                  autoCapitalize="none"
+                  underlineColorAndroid="transparent"
+                />
+                <Text style={styles.note}>
+                  Starting point for a region — fine-tune the fields above.
+                </Text>
+                {countryMatches.length > 0 && (
+                  <View style={styles.countryList}>
+                    {countryMatches.map(c => (
+                      <TouchableOpacity
+                        key={c.code}
+                        style={styles.countryItem}
+                        onPress={() => pickCountry(c)}
+                      >
+                        <Text style={styles.countryName}>{c.name}</Text>
+                        <Text style={styles.countryCode}>{c.code}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                )}
+                {countryQuery.trim() !== '' && countryMatches.length === 0 && (
+                  <Text style={styles.note}>No matching countries.</Text>
+                )}
+
+                {locationNote ? <Text style={styles.note}>{locationNote}</Text> : null}
+
+                <Text style={styles.readout}>{readout}</Text>
+              </View>
+            )}
             {camera && profile && SETTING_DEFS.map(def => {
               const value = profile[def.key];
 
@@ -362,95 +453,6 @@ export default function CameraSettingsSheet({
               );
             })}
 
-            {camera && (
-              <View style={styles.locationSection}>
-                <View style={styles.locationHeader}>
-                  <Text style={styles.label}>Location</Text>
-                  <TouchableOpacity
-                    style={styles.locBtn}
-                    onPress={useMyLocation}
-                    disabled={locating}
-                  >
-                    <Text style={styles.locBtnText}>
-                      {locating ? 'Locating…' : 'Use my location'}
-                    </Text>
-                  </TouchableOpacity>
-                </View>
-                <Text style={styles.note}>
-                  Sets today's dawn and dusk for auto day/night.
-                </Text>
-
-                <View style={styles.coordRow}>
-                  <View style={styles.coordField}>
-                    <Text style={styles.coordLabel}>Latitude</Text>
-                    <TextInput
-                      style={styles.coordInput}
-                      value={latText}
-                      onChangeText={setLatText}
-                      onBlur={commitCoords}
-                      keyboardType="numbers-and-punctuation"
-                      placeholder="0"
-                      placeholderTextColor="#444"
-                      underlineColorAndroid="transparent"
-                    />
-                  </View>
-                  <View style={styles.coordField}>
-                    <Text style={styles.coordLabel}>Longitude</Text>
-                    <TextInput
-                      style={styles.coordInput}
-                      value={lngText}
-                      onChangeText={setLngText}
-                      onBlur={commitCoords}
-                      keyboardType="numbers-and-punctuation"
-                      placeholder="0"
-                      placeholderTextColor="#444"
-                      underlineColorAndroid="transparent"
-                    />
-                  </View>
-                </View>
-                {(latBad || lngBad || latOutOfRange || lngOutOfRange) && (
-                  <Text style={styles.errorNote}>
-                    Enter a latitude -90 to 90 and a longitude -180 to 180.
-                  </Text>
-                )}
-
-                <Text style={styles.countryLabel}>Country</Text>
-                <TextInput
-                  style={[styles.coordInput, styles.countryInput]}
-                  value={countryQuery}
-                  onChangeText={setCountryQuery}
-                  placeholder="Search countries"
-                  placeholderTextColor="#444"
-                  autoCorrect={false}
-                  autoCapitalize="none"
-                  underlineColorAndroid="transparent"
-                />
-                <Text style={styles.note}>
-                  Starting point for a region — fine-tune the fields above.
-                </Text>
-                {countryMatches.length > 0 && (
-                  <View style={styles.countryList}>
-                    {countryMatches.map(c => (
-                      <TouchableOpacity
-                        key={c.code}
-                        style={styles.countryItem}
-                        onPress={() => pickCountry(c)}
-                      >
-                        <Text style={styles.countryName}>{c.name}</Text>
-                        <Text style={styles.countryCode}>{c.code}</Text>
-                      </TouchableOpacity>
-                    ))}
-                  </View>
-                )}
-                {countryQuery.trim() !== '' && countryMatches.length === 0 && (
-                  <Text style={styles.note}>No matching countries.</Text>
-                )}
-
-                {locationNote ? <Text style={styles.note}>{locationNote}</Text> : null}
-
-                <Text style={styles.readout}>{readout}</Text>
-              </View>
-            )}
           </ScrollView>
         </View>
       </View>
@@ -476,6 +478,7 @@ const styles = StyleSheet.create({
   tabTextActive:      { color: '#fff' },
   copyBtn:            { marginLeft: 'auto', paddingHorizontal: 10, paddingVertical: 8 },
   copyText:           { color: '#e63', fontSize: 12, fontWeight: '600' },
+  bodyScroll:         { flexShrink: 1 },
   body:               { paddingHorizontal: 20, paddingTop: 8 },
   row:                { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: '#1c1c1c' },
   block:              { paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: '#1c1c1c' },

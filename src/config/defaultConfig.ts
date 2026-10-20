@@ -10,7 +10,7 @@
  */
 import {
   CameraSeed,
-  DEFAULT_CAMERA_SETTINGS,
+  DEFAULT_DAY_SETTINGS,
   DEFAULT_DASHBOARD_ID,
   DEFAULT_DASHBOARD_NAME,
   DEFAULT_DETECTION_SETTINGS,
@@ -19,9 +19,9 @@ import {
   DefaultStoreSeed,
 } from '../utils/storage';
 
-/** Fresh copy of the firmware-matching day defaults (never share references). */
+/** Fresh copy of the app-governed day baseline (never share references). */
 function dayPreset() {
-  return { ...DEFAULT_CAMERA_SETTINGS };
+  return { ...DEFAULT_DAY_SETTINGS };
 }
 
 /** Fresh copy of the generic night baseline (never share references). */

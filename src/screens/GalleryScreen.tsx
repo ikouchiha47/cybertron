@@ -4,7 +4,7 @@ import {
   Alert, StatusBar, ActivityIndicator,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { VLCPlayer } from 'react-native-vlc-media-player';
+import { VideoView, useVideoPlayer } from 'expo-video';
 import * as FileSystem from 'expo-file-system/legacy';
 import {
   CamEvent, DayGroup, MonthGroup,
@@ -28,6 +28,15 @@ function toFileUri(path: string): string {
 
 function formatTime(ts: number): string {
   return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+/** Looping autoplay player for one event video. Mounted fresh per event. */
+function EventPlayer({ uri }: { uri: string }) {
+  const player = useVideoPlayer(uri, p => {
+    p.loop = true;
+    p.play();
+  });
+  return <VideoView style={styles.playerImage} player={player} contentFit="contain" />;
 }
 
 export default function GalleryScreen({ initialEventId, onClose }: Props) {
@@ -200,12 +209,7 @@ export default function GalleryScreen({ initialEventId, onClose }: Props) {
         />
         <View style={styles.playerFrame}>
           {videoUri ? (
-            <VLCPlayer
-              source={{ uri: videoUri }}
-              style={styles.playerImage}
-              repeat={true}
-              paused={false}
-            />
+            <EventPlayer key={videoUri} uri={videoUri} />
           ) : (
             frame && <Image source={{ uri: frame }} style={styles.playerImage} resizeMode="contain" />
           )}

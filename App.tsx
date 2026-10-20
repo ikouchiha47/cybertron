@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { AppState, NativeModules } from 'react-native';
+import { AppState, DeviceEventEmitter, NativeModules } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import * as Notifications from 'expo-notifications';
 import {
@@ -29,6 +29,7 @@ import {
 } from './src/utils/cameraSettings';
 import { resolveCameraIps } from './src/utils/resolveCameras';
 import { resolveNightWindow, NightWindow } from './src/utils/sunWindow';
+import { requestInstallLocation } from './src/utils/deviceLocation';
 import { useDayNightSwitch } from './src/hooks/useDayNightSwitch';
 import { useEngineMetrics } from './src/hooks/useEngineMetrics';
 import { useLuminanceNightOverride } from './src/hooks/useLuminanceNightOverride';
@@ -41,6 +42,28 @@ import GalleryScreen from './src/screens/GalleryScreen';
 import './src/utils/backgroundDetection';
 
 type Screen = 'monitor' | 'setup' | 'gallery';
+
+const SETTINGS_KEYS: (keyof CameraSettings)[] = [
+  'quality',
+  'brightness',
+  'contrast',
+  'saturation',
+  'hmirror',
+  'vflip',
+  'wbMode',
+  'awb',
+  'ledOn',
+  'ledIntensity',
+  'framesize',
+  'exposureLock',
+  'aecValue',
+  'agcGain',
+];
+
+/** Full, exact comparison of two camera profiles. */
+function settingsEqual(a: CameraSettings, b: CameraSettings): boolean {
+  return SETTINGS_KEYS.every(k => a[k] === b[k]);
+}
 
 function makeDashboardId(): string {
   return `dash_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
@@ -191,6 +214,66 @@ export default function App() {
   const metrics = useEngineMetrics(hasAutoCamera);
   const lumaNight = useLuminanceNightOverride(cameras, metrics, getNightWindow);
 
+  // Safety net that does not trust in-memory slot bookkeeping: recompute every
+  // auto camera's slot from the current time + location, write it to the store,
+  // and reconcile the hardware. Covers the cases the in-session timer misses:
+  // a frozen/backgrounded timer at dawn/dusk, a silently-failed push, and an
+  // ESP that rebooted back to its boot defaults.
+  const reconcileAll = useCallback(() => {
+    const now = new Date();
+    const window = getNightWindow();
+    const prev = camerasRef.current;
+    let changed = false;
+    const next = prev.map(cam => {
+      if (cam.dayNight !== 'auto') return cam;
+      const target =
+        activeProfileSlot(cam, now, window) === 'night' ? cam.night : cam.day;
+      if (settingsEqual(cam.settings, target)) return cam;
+      changed = true;
+      return { ...cam, settings: { ...target } };
+    });
+    if (changed) {
+      camerasRef.current = next;
+      setCameras(next);
+      persistRefs(next);
+    }
+    for (const cam of next) {
+      if (cam.ip) void syncCamera(cam);
+    }
+  }, [getNightWindow]);
+
+  // Keep the process alive with a foreground service: the OS otherwise freezes
+  // the app overnight and the day/night timer never fires at dawn.
+  useEffect(() => {
+    try {
+      NativeModules?.DoorCamModule?.startForegroundService?.();
+    } catch (e) {
+      console.warn('[DoorCam] failed to start foreground service:', e);
+    }
+  }, []);
+
+  // Reconcile on start, every 30 minutes, and whenever a camera reconnects
+  // (throttled: a flapping camera must not trigger a push storm).
+  useEffect(() => {
+    reconcileAll();
+    let lastOnlineAt = 0;
+    const timer = setInterval(reconcileAll, 30 * 60 * 1000);
+    const sub = DeviceEventEmitter.addListener(
+      'CameraStatus',
+      (e: { streamId?: string; online?: boolean }) => {
+        if (e?.online !== true) return;
+        const now = Date.now();
+        if (now - lastOnlineAt < 60_000) return;
+        lastOnlineAt = now;
+        reconcileAll();
+      },
+    );
+    return () => {
+      clearInterval(timer);
+      sub.remove();
+    };
+  }, [reconcileAll]);
+
   const { noteApplied, recheck } = useDayNightSwitch(
     cameras,
     getNightWindow,
@@ -233,6 +316,16 @@ export default function App() {
       detectionRef.current = store.detection;
       setLocation(store.location);
       locationRef.current = store.location;
+      // Acquire the install location at launch when it is still unset and an
+      // `auto` camera exists, so the solar day/night switch has real dusk/dawn
+      // without a manual trip to the settings sheet. Prompts for the foreground
+      // permission once; a denial (or timeout) leaves the store untouched and the
+      // 07:00/19:00 clock fallback stays in effect.
+      if (!store.location && resolved.some(c => c.dayNight === 'auto')) {
+        void requestInstallLocation().then(coords => {
+          if (coords) handleSetLocation(coords);
+        });
+      }
       // Grid is home for multi-camera: ignore any persisted focus when there's more than one camera.
       setFocusedId(initialFocus);
       focusedRef.current = initialFocus;

@@ -18,6 +18,7 @@ import {
   DEFAULT_CAMERA_SETTINGS,
   DEFAULT_DASHBOARD_ID,
   DEFAULT_DASHBOARD_NAME,
+  DEFAULT_DAY_SETTINGS,
   DEFAULT_DETECTION_SETTINGS,
   DayNightMode,
   DetectionSettings,
@@ -317,6 +318,108 @@ function upgradeTinyFramesize(store: CameraStore): CameraStore {
 }
 
 /**
+ * The conditional DML of the v8 night-resolution revert. The pinned night
+ * exposure (aec=0, agc=0) over-exposes at VGA 640×480 (~18% of the frame blown)
+ * but is clean at QVGA 320×240 (~1.7% blown), so any Night profile still on VGA
+ * is moved back to `LEGACY_TINY_FRAMESIZE`. The effective `settings` is lowered
+ * for cameras that can be night (`dayNight !== 'day'`) so the applied profile
+ * matches what gets pushed; a camera pinned to `day` keeps its VGA settings. The
+ * Day profile is never touched, and untouched cameras stay byte-identical.
+ */
+function revertNightFramesize(store: CameraStore): CameraStore {
+  const target = LEGACY_TINY_FRAMESIZE;
+  const vga = DEFAULT_CAMERA_SETTINGS.framesize;
+  return {
+    ...store,
+    cameras: store.cameras.map(camera => {
+      const night =
+        camera.night.framesize === vga
+          ? { ...camera.night, framesize: target }
+          : camera.night;
+      const settings =
+        camera.dayNight !== 'day' && camera.settings.framesize === vga
+          ? { ...camera.settings, framesize: target }
+          : camera.settings;
+      // Untouched cameras stay byte-identical (same object).
+      if (night === camera.night && settings === camera.settings) return camera;
+      return { ...camera, night, settings };
+    }),
+  };
+}
+
+/**
+ * The conditional DML of the v9 day-exposure lock. The Day profile shipped with
+ * the camera's free-running AEC (`exposureLock:false`), which hunts and blows the
+ * frame out near the OV2640 cliff. Untouched Day profiles adopt the app-governed
+ * `DEFAULT_DAY_SETTINGS` (locked, seeded exposure); a Day profile the user tuned
+ * is preserved. The effective `settings` is switched for cameras that can be day
+ * so the pushed profile matches; the Night profile already locks exposure and is
+ * never touched. Untouched cameras stay byte-identical.
+ */
+function lockDayExposure(store: CameraStore): CameraStore {
+  return {
+    ...store,
+    cameras: store.cameras.map(camera => {
+      const day = isFactoryDefaultSettings(camera.day)
+        ? { ...DEFAULT_DAY_SETTINGS }
+        : camera.day;
+      const settings =
+        camera.dayNight !== 'night' && isFactoryDefaultSettings(camera.settings)
+          ? { ...DEFAULT_DAY_SETTINGS }
+          : camera.settings;
+      if (day === camera.day && settings === camera.settings) return camera;
+      return { ...camera, day, settings };
+    }),
+  };
+}
+
+/**
+ * The night baseline before the manually proven low-light recipe. Frozen so the
+ * v10 recipe migration can tell an untouched Night profile apart from one the
+ * user tuned: only a profile still exactly on these values adopts the new
+ * `DEFAULT_NIGHT_SETTINGS`.
+ */
+const PREVIOUS_NIGHT_BASELINE: CameraSettings = {
+  ...DEFAULT_CAMERA_SETTINGS,
+  exposureLock: true,
+  aecValue: 750,
+  agcGain: 15,
+  wbMode: 1,
+  framesize: LEGACY_TINY_FRAMESIZE,
+};
+
+function isPreviousNightBaseline(settings: CameraSettings): boolean {
+  return (Object.keys(PREVIOUS_NIGHT_BASELINE) as (keyof CameraSettings)[]).every(
+    key => settings[key] === PREVIOUS_NIGHT_BASELINE[key],
+  );
+}
+
+/**
+ * The conditional DML of the v10 night-recipe rollout. Any Night (or effective)
+ * profile still on the previous baseline adopts the validated low-light values
+ * (`aecValue: 719`, `agcGain: 2`, `brightness: 1`, `contrast: 1`,
+ * `saturation: -1`, Cloudy WB with AWB on, locked exposure). A
+ * tuned profile is preserved, the Day profile is never touched, and the LED
+ * fields are left exactly as they were. Untouched cameras stay byte-identical.
+ */
+function applyNightRecipe(store: CameraStore): CameraStore {
+  return {
+    ...store,
+    cameras: store.cameras.map(camera => {
+      const night = isPreviousNightBaseline(camera.night)
+        ? { ...DEFAULT_NIGHT_SETTINGS }
+        : camera.night;
+      const settings =
+        camera.dayNight !== 'day' && isPreviousNightBaseline(camera.settings)
+          ? { ...DEFAULT_NIGHT_SETTINGS }
+          : camera.settings;
+      if (night === camera.night && settings === camera.settings) return camera;
+      return { ...camera, night, settings };
+    }),
+  };
+}
+
+/**
  * One ordered, forward-only migration: transforms a store at `version - 1`
  * into a store at `version`. `apply` must be pure and total.
  */
@@ -420,6 +523,39 @@ export const MIGRATIONS: StoreMigration[] = [
     version: 7,
     apply(store) {
       return { ...store, version: 7 };
+    },
+  },
+  {
+    // v8: revert the Night profile to QVGA. v6 moved every profile to VGA, but
+    // the pinned night exposure over-exposes at 640×480 while it is clean at
+    // 320×240; Day stays VGA for detection. The effective `settings` is lowered
+    // for cameras that can be night so the pushed profile matches.
+    version: 8,
+    apply(store) {
+      const cameras = normalizeCameras(store.cameras);
+      return { ...revertNightFramesize({ ...store, cameras }), version: 8 };
+    },
+  },
+  {
+    // v9: lock the Day profile's exposure. The camera's free-running AEC hunts
+    // and blows the frame out near the exposure cliff and cannot be capped
+    // while auto. Untouched Day profiles adopt DEFAULT_DAY_SETTINGS (fixed
+    // manual exposure); a tuned Day profile is preserved.
+    version: 9,
+    apply(store) {
+      const cameras = normalizeCameras(store.cameras);
+      return { ...lockDayExposure({ ...store, cameras }), version: 9 };
+    },
+  },
+  {
+    // v10: roll out the manually proven low-light night recipe. The previous
+    // baseline's exposure no longer matches the connected camera in low light;
+    // untouched Night profiles adopt the fixed recipe values while a tuned
+    // profile (or a night-pinned camera's custom setup) is preserved.
+    version: 10,
+    apply(store) {
+      const cameras = normalizeCameras(store.cameras);
+      return { ...applyNightRecipe({ ...store, cameras }), version: 10 };
     },
   },
 ];

@@ -32,8 +32,9 @@ export interface CameraSettings {
    * 11=SVGA 800×600, 12=XGA 1024×768. The measured mapping is authoritative —
    * the UI labels in `cameraSettings.ts` follow it, not the datasheet enum.
    *
-   * Both profiles ship VGA 640×480, matching the 640px YOLO model input;
-   * larger modes (XGA 12, …) remain per-camera opt-ins in the settings sheet.
+   * The Day profile ships VGA 640×480, matching the 640px YOLO model input; the
+   * Night profile ships QVGA 320×240 (its pinned exposure over-exposes at VGA).
+   * Larger modes (XGA 12, …) remain per-camera opt-ins in the settings sheet.
    */
   framesize: number;
   /** When true the firmware runs with fixed exposure/gain (aec=0, agc=0). */
@@ -68,25 +69,44 @@ export const DEFAULT_CAMERA_SETTINGS: CameraSettings = {
 
 /**
  * Generic night baseline (not a firmware boot default). At night we lock the
- * exposure (→ aec=0, agc=0) and fix the white balance so AEC/AGC/AWB stop
- * hunting in low light, then push a moderate exposure value and gain. Locking
- * (rather than auto) is deliberate: it keeps the image steady — no brightness
- * pumping/flicker — while auto-exposing these scenes.
+ * exposure (→ aec=0, agc=0) so AEC/AGC stop hunting in low light, then push
+ * fixed exposure and gain values. Locking (rather than auto) is deliberate: it
+ * keeps the image steady — no brightness pumping/flicker.
  *
- * `aecValue` must stay below the OV2640's exposure cliff: ~760 renders fine but
- * 780 blows the whole frame to white (the sensor jumps exposure registers),
- * which is exactly the washout the original 780 produced. 750 sits safely below
- * it. Everything else matches the day defaults. Intended as a starting point to be tuned per camera; `night` is only
+ * These are the manually validated low-light values pulled from the connected
+ * camera: `aecValue: 719` with `agcGain: 2`, `brightness: 1`, `contrast: 1`,
+ * `saturation: -1`, AWB left on with the Cloudy preset. `framesize` is HVGA.
+ * Intended as a starting point to be tuned per camera; `night` is only
  * (re)seeded from this when it is missing or still untouched day defaults,
- * never once customized.
+ * never once customized. LED and quality are deliberately left at the app
+ * defaults (off / high quality), and mirror/flip are untouched.
  */
 export const DEFAULT_NIGHT_SETTINGS: CameraSettings = {
   ...DEFAULT_CAMERA_SETTINGS,
+  brightness: 1,
+  contrast: 1,
+  saturation: -1,
   exposureLock: true, // → aec=0, agc=0
-  aecValue: 750,
+  aecValue: 719,
+  agcGain: 2,
+  wbMode: 2, // Cloudy, with AWB on — as validated live
+  awb: true,
+  framesize: 9, // HVGA 480x320
+};
+
+/**
+ * Day profile. The camera's own free-running AEC hunts and blows the frame out
+ * near the sensor's exposure cliff, and cannot be capped while auto — so the
+ * day exposure is **locked** (`exposureLock: true` → aec=0, agc=0) with a fixed
+ * `aecValue` seed. No background loop adjusts it; any future auto-adjustment
+ * has to prove itself before it ships.
+ */
+export const DEFAULT_DAY_SETTINGS: CameraSettings = {
+  ...DEFAULT_CAMERA_SETTINGS,
+  exposureLock: true, // manual fixed exposure
+  aecValue: 500, // fixed day exposure seed
   agcGain: 15,
-  wbMode: 1, // Sunny — fixed WB
-  framesize: 10, // VGA 640x480
+  framesize: 6, // QVGA 320x240
 };
 
 /**

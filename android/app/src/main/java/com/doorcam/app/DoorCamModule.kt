@@ -17,6 +17,15 @@ class DoorCamModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
 
     override fun getName() = "DoorCamModule"
 
+    /**
+     * Start the always-on foreground service so the OS does not freeze the app
+     * (and stop the JS day/night schedule) while the screen is off.
+     */
+    @ReactMethod
+    fun startForegroundService() {
+        DoorCamForegroundService.start(reactApplicationContext)
+    }
+
     @ReactMethod
     fun saveEvent(streamId: String, eventId: String) {
         MjpegStreamView.get(streamId)?.startCapture(eventId)

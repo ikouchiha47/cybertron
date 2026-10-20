@@ -422,7 +422,8 @@ export default function MonitorScreen({
             const s = cameraStats.get(c.id);
             return (
               <Text key={c.id} style={styles.statsRow} numberOfLines={1}>
-                {c.name} · src {(s?.srcFps ?? 0).toFixed(1)}fps · draw {(s?.drawnFps ?? 0).toFixed(1)}fps
+                {c.name} · Y {(s?.meanLuma ?? 0).toFixed(0)}
+                {' · src '}{(s?.srcFps ?? 0).toFixed(1)}fps · draw {(s?.drawnFps ?? 0).toFixed(1)}fps
                 {' · inf '}{(s?.infPerSec ?? 0).toFixed(1)}/s {(s?.inferenceMsEwma ?? 0).toFixed(1)}ms
                 {' · '}{s?.detectionsConfirmed ?? 0} det
                 {' · lat '}{(s?.detectionLatencyMs ?? 0).toFixed(1)}ms

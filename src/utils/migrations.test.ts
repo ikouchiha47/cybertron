@@ -10,6 +10,7 @@ import { describe, it, expect } from 'vitest';
 
 import {
   DEFAULT_CAMERA_SETTINGS,
+  DEFAULT_DAY_SETTINGS,
   DEFAULT_DASHBOARD_ID,
   DEFAULT_DASHBOARD_NAME,
   DEFAULT_DETECTION_SETTINGS,
@@ -59,10 +60,10 @@ describe('Night preset rollout', () => {
 
     // The semantic outcome promised to the user.
     expect(night.exposureLock).toBe(true);
-    expect(night.wbMode).toBe(1); // Sunny — fixed WB
-    expect(night.aecValue).toBe(750); // below the OV2640 exposure cliff
-    expect(night.agcGain).toBe(15);
-    expect(night.framesize).toBe(10); // VGA 640x480
+    expect(night.wbMode).toBe(2); // Cloudy, with AWB on — as validated live
+    expect(night.aecValue).toBe(719); // validated low-light exposure
+    expect(night.agcGain).toBe(2);
+    expect(night.framesize).toBe(9); // HVGA 480x320
     // Whole profile lands on the generic night baseline.
     expect(night).toEqual(DEFAULT_NIGHT_SETTINGS);
   });
@@ -80,10 +81,10 @@ describe('Night preset rollout', () => {
     expect(night.saturation).toBe(1);
     // ...while untouched night-critical fields adopt the new baseline.
     expect(night.exposureLock).toBe(true);
-    expect(night.wbMode).toBe(1);
-    expect(night.aecValue).toBe(750);
-    expect(night.agcGain).toBe(15);
-    expect(night.framesize).toBe(10);
+    expect(night.wbMode).toBe(2);
+    expect(night.aecValue).toBe(719);
+    expect(night.agcGain).toBe(2);
+    expect(night.framesize).toBe(9);
   });
 
   it('running the migration again does not undo the user\'s later edits (idempotent)', () => {
@@ -156,7 +157,7 @@ describe('Ordered config migrations', () => {
     expect(store).not.toBeNull();
     expect(store!.version).toBe(CURRENT_VERSION);
     expect(store!.cameras).toHaveLength(1);
-    expect(store!.cameras[0].day).toEqual(DEFAULT_CAMERA_SETTINGS);
+    expect(store!.cameras[0].day).toEqual(DEFAULT_DAY_SETTINGS);
     expect(store!.cameras[0].night).toEqual(DEFAULT_NIGHT_SETTINGS);
     expect(store!.dashboards.some(d => d.id === DEFAULT_DASHBOARD_ID)).toBe(true);
   });
@@ -200,7 +201,7 @@ describe('Ordered config migrations', () => {
     const migrated = migrateStore(raw)!;
     // v4 ran: untouched night-critical fields adopt the new baseline...
     expect(migrated.cameras[0].night.exposureLock).toBe(true);
-    expect(migrated.cameras[0].night.wbMode).toBe(1);
+    expect(migrated.cameras[0].night.wbMode).toBe(2);
     // ...while the user's edit survives.
     expect(migrated.cameras[0].night.brightness).toBe(2);
   });
@@ -215,8 +216,8 @@ describe('Ordered config migrations', () => {
     expect(detectRawVersion(raw)).toBe(4);
 
     const migrated = migrateStore(raw)!;
-    expect(migrated.cameras[0].night.aecValue).toBe(750);
-    expect(migrated.cameras[0].settings.aecValue).toBe(750);
+    expect(migrated.cameras[0].night.aecValue).toBe(719);
+    expect(migrated.cameras[0].settings.aecValue).toBe(719);
   });
 
   it('preserves a night exposure the user tuned below the cliff', () => {
@@ -227,13 +228,14 @@ describe('Ordered config migrations', () => {
     expect(migrated.cameras[0].night.aecValue).toBe(400);
   });
 
-  it('ships true VGA as the default resolution for both profiles', () => {
-    // VGA 640x480 matches the 640px YOLO model input; XGA stays opt-in.
-    expect(DEFAULT_CAMERA_SETTINGS.framesize).toBe(10);
-    expect(DEFAULT_NIGHT_SETTINGS.framesize).toBe(10);
+  it('ships QVGA for Day and HVGA for Night by default', () => {
+    // Day QVGA 320x240 keeps the day stream light; Night ships HVGA 480x320,
+    // the visibly better compromise for night detail.
+    expect(DEFAULT_DAY_SETTINGS.framesize).toBe(6);
+    expect(DEFAULT_NIGHT_SETTINGS.framesize).toBe(9);
   });
 
-  it('upgrades the legacy tiny resolution default to VGA on every profile', () => {
+  it('upgrades the legacy tiny default, ending at QVGA for Day and Night', () => {
     const tiny = { ...DEFAULT_CAMERA_SETTINGS, framesize: LEGACY_TINY_FRAMESIZE };
     const camera = makeCamera({
       day: { ...tiny },
@@ -244,9 +246,11 @@ describe('Ordered config migrations', () => {
     expect(detectRawVersion(raw)).toBe(5);
 
     const migrated = migrateStore(raw)!;
-    expect(migrated.cameras[0].day.framesize).toBe(10);
-    expect(migrated.cameras[0].night.framesize).toBe(10);
-    expect(migrated.cameras[0].settings.framesize).toBe(10);
+    // v6 upgrades everything to VGA, v9 moves an untouched Day profile to the
+    // QVGA day default, and v8 returns the Night profile to QVGA.
+    expect(migrated.cameras[0].day.framesize).toBe(6);
+    expect(migrated.cameras[0].night.framesize).toBe(LEGACY_TINY_FRAMESIZE);
+    expect(migrated.cameras[0].settings.framesize).toBe(LEGACY_TINY_FRAMESIZE);
   });
 
   it('preserves a resolution the user explicitly chose', () => {
@@ -266,9 +270,9 @@ describe('Ordered config migrations', () => {
     expect(migrated.cameras[0].settings.framesize).toBe(12);
   });
 
-  it('runs the resolution upgrade on a legacy store carrying the night-preset marker', () => {
+  it('runs the resolution migrations on a legacy store carrying the night-preset marker', () => {
     // A settled v3 store skipped ahead by the legacy marker still traverses
-    // v5-v6 while its old (unrolled) night fields stay as-is.
+    // v5-v8 while its old (unrolled) night fields stay as-is.
     const tiny = { ...DEFAULT_CAMERA_SETTINGS, framesize: LEGACY_TINY_FRAMESIZE };
     const camera = makeCamera({
       day: { ...tiny },
@@ -280,9 +284,10 @@ describe('Ordered config migrations', () => {
     );
 
     const migrated = migrateStore(raw)!;
-    expect(migrated.cameras[0].day.framesize).toBe(10);
-    expect(migrated.cameras[0].settings.framesize).toBe(10);
-    expect(migrated.cameras[0].night.framesize).toBe(10);
+    expect(migrated.cameras[0].day.framesize).toBe(6);
+    // Night ends at QVGA after v8; the effective settings follows it.
+    expect(migrated.cameras[0].settings.framesize).toBe(LEGACY_TINY_FRAMESIZE);
+    expect(migrated.cameras[0].night.framesize).toBe(LEGACY_TINY_FRAMESIZE);
     // The v4 rollout is still not re-run for this store.
     expect(migrated.cameras[0].night.exposureLock).toBe(false);
     expect(migrated.cameras[0].night.brightness).toBe(2);
@@ -303,6 +308,156 @@ describe('Ordered config migrations', () => {
     expect(afterV6.cameras[0].day.framesize).toBe(10);
     expect(afterV6.cameras[0].night.framesize).toBe(10);
     expect(afterV6.cameras[0].settings.framesize).toBe(10);
+  });
+
+  it('reverts a VGA Night profile to QVGA (v8) while leaving Day at VGA', () => {
+    const camera = makeCamera({
+      day: { ...DEFAULT_CAMERA_SETTINGS, framesize: 10 },
+      night: { ...DEFAULT_NIGHT_SETTINGS, framesize: 10 },
+      settings: { ...DEFAULT_NIGHT_SETTINGS, framesize: 10 },
+      dayNight: 'auto',
+    });
+    const v8 = MIGRATIONS.find(m => m.version === 8)!;
+    const after = v8.apply(
+      JSON.parse(JSON.stringify(makeStore(camera, { version: 7 } as any))),
+    );
+
+    expect(after.cameras[0].day.framesize).toBe(10); // Day untouched
+    expect(after.cameras[0].night.framesize).toBe(LEGACY_TINY_FRAMESIZE);
+    expect(after.cameras[0].settings.framesize).toBe(LEGACY_TINY_FRAMESIZE);
+  });
+
+  it('leaves a day-pinned camera\'s effective settings at VGA (v8)', () => {
+    const vga = { ...DEFAULT_CAMERA_SETTINGS, framesize: 10 };
+    const camera = makeCamera({
+      day: { ...vga },
+      night: { ...DEFAULT_NIGHT_SETTINGS, framesize: 10 },
+      settings: { ...vga },
+      dayNight: 'day',
+    });
+    const v8 = MIGRATIONS.find(m => m.version === 8)!;
+    const after = v8.apply(
+      JSON.parse(JSON.stringify(makeStore(camera, { version: 7 } as any))),
+    );
+
+    expect(after.cameras[0].night.framesize).toBe(LEGACY_TINY_FRAMESIZE);
+    // Effective `settings` is not lowered because the active profile is Day.
+    expect(after.cameras[0].settings.framesize).toBe(10);
+    expect(after.cameras[0].day.framesize).toBe(10);
+  });
+
+  it('does not touch a resolution the user chose for Night (v8)', () => {
+    const camera = makeCamera({
+      night: { ...DEFAULT_NIGHT_SETTINGS, framesize: 12 },
+      settings: { ...DEFAULT_CAMERA_SETTINGS, framesize: 12 },
+    });
+    const v8 = MIGRATIONS.find(m => m.version === 8)!;
+    const after = v8.apply(
+      JSON.parse(JSON.stringify(makeStore(camera, { version: 7 } as any))),
+    );
+
+    expect(after.cameras[0].night.framesize).toBe(12);
+    expect(after.cameras[0].settings.framesize).toBe(12);
+  });
+
+  it('locks a factory-default Day exposure and seeds the governor (v9)', () => {
+    const camera = makeCamera({
+      day: { ...DEFAULT_CAMERA_SETTINGS },
+      night: { ...DEFAULT_NIGHT_SETTINGS },
+      settings: { ...DEFAULT_CAMERA_SETTINGS },
+      dayNight: 'auto',
+    });
+    const v9 = MIGRATIONS.find(m => m.version === 9)!;
+    const after = v9.apply(
+      JSON.parse(JSON.stringify(makeStore(camera, { version: 8 } as any))),
+    );
+
+    expect(after.cameras[0].day).toEqual(DEFAULT_DAY_SETTINGS);
+    expect(after.cameras[0].day.exposureLock).toBe(true);
+    // The effective profile follows so the pushed settings match.
+    expect(after.cameras[0].settings).toEqual(DEFAULT_DAY_SETTINGS);
+    // Night already locks and is never touched.
+    expect(after.cameras[0].night).toEqual(DEFAULT_NIGHT_SETTINGS);
+  });
+
+  it('preserves a Day profile the user tuned (v9)', () => {
+    const tuned = { ...DEFAULT_CAMERA_SETTINGS, brightness: 2, exposureLock: false };
+    const camera = makeCamera({
+      day: { ...tuned },
+      night: { ...DEFAULT_NIGHT_SETTINGS },
+      settings: { ...tuned },
+      dayNight: 'day',
+    });
+    const v9 = MIGRATIONS.find(m => m.version === 9)!;
+    const after = v9.apply(
+      JSON.parse(JSON.stringify(makeStore(camera, { version: 8 } as any))),
+    );
+
+    expect(after.cameras[0].day.brightness).toBe(2);
+    expect(after.cameras[0].day.exposureLock).toBe(false);
+  });
+
+  it('does not lock the effective settings of a night-pinned camera (v9)', () => {
+    const camera = makeCamera({
+      day: { ...DEFAULT_CAMERA_SETTINGS },
+      night: { ...DEFAULT_NIGHT_SETTINGS },
+      settings: { ...DEFAULT_CAMERA_SETTINGS },
+      dayNight: 'night',
+    });
+    const v9 = MIGRATIONS.find(m => m.version === 9)!;
+    const after = v9.apply(
+      JSON.parse(JSON.stringify(makeStore(camera, { version: 8 } as any))),
+    );
+
+    expect(after.cameras[0].day).toEqual(DEFAULT_DAY_SETTINGS);
+    // Night-pinned camera keeps its (night) effective settings.
+    expect(after.cameras[0].settings).toEqual(DEFAULT_CAMERA_SETTINGS);
+  });
+
+  it('adopts the night recipe for a previous-baseline Night profile (v10)', () => {
+    const previous = {
+      ...DEFAULT_CAMERA_SETTINGS,
+      exposureLock: true,
+      aecValue: 750,
+      agcGain: 15,
+      wbMode: 1,
+      framesize: LEGACY_TINY_FRAMESIZE,
+    };
+    const camera = makeCamera({
+      day: { ...DEFAULT_DAY_SETTINGS },
+      night: { ...previous },
+      settings: { ...previous },
+      dayNight: 'auto',
+    });
+    const v10 = MIGRATIONS.find(m => m.version === 10)!;
+    const after = v10.apply(
+      JSON.parse(JSON.stringify(makeStore(camera, { version: 9 } as any))),
+    );
+
+    expect(after.cameras[0].night).toEqual(DEFAULT_NIGHT_SETTINGS);
+    expect(after.cameras[0].night.brightness).toBe(1);
+    expect(after.cameras[0].night.aecValue).toBe(719);
+    expect(after.cameras[0].night.agcGain).toBe(2);
+    expect(after.cameras[0].settings).toEqual(DEFAULT_NIGHT_SETTINGS);
+    // Day profile and LED fields are never touched by the recipe.
+    expect(after.cameras[0].day).toEqual(DEFAULT_DAY_SETTINGS);
+    expect(after.cameras[0].night.ledOn).toBe(false);
+    expect(after.cameras[0].night.ledIntensity).toBe(0);
+  });
+
+  it('preserves a Night profile the user tuned (v10)', () => {
+    const tuned = { ...DEFAULT_NIGHT_SETTINGS, aecValue: 400 };
+    const camera = makeCamera({
+      night: { ...tuned },
+      settings: { ...tuned },
+    });
+    const v10 = MIGRATIONS.find(m => m.version === 10)!;
+    const after = v10.apply(
+      JSON.parse(JSON.stringify(makeStore(camera, { version: 9 } as any))),
+    );
+
+    expect(after.cameras[0].night.aecValue).toBe(400);
+    expect(after.cameras[0].settings.aecValue).toBe(400);
   });
 });
 
@@ -374,7 +529,7 @@ describe('Store migration', () => {
 
     const camera = store!.cameras[0];
     expect(camera.ip).toBe('192.168.1.50');
-    expect(camera.day).toEqual(DEFAULT_CAMERA_SETTINGS);
+    expect(camera.day).toEqual(DEFAULT_DAY_SETTINGS);
     expect(camera.night).toEqual(DEFAULT_NIGHT_SETTINGS);
     expect(camera.dayNight).toBe('auto');
 

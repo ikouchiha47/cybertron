@@ -42,6 +42,15 @@ function at(hour: number, minute = 0): Date {
   return new Date(2026, 0, 15, hour, minute, 0, 0);
 }
 
+describe('Profile resolution defaults', () => {
+  it('keeps the base default at VGA but ships Night at HVGA', () => {
+    // The firmware-matching base stays VGA 640x480; Night ships HVGA 480x320,
+    // the visibly better compromise for night detail.
+    expect(DEFAULT_CAMERA_SETTINGS.framesize).toBe(10);
+    expect(DEFAULT_NIGHT_SETTINGS.framesize).toBe(9);
+  });
+});
+
 describe('Day/Night profile selection (no solar window fallback)', () => {
   it('uses the Day profile during waking hours (07:00–18:59)', () => {
     const camera = makeCamera();
